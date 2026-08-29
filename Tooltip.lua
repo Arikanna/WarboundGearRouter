@@ -607,6 +607,15 @@ local function BuildTooltipRecommendation(
             return
         end
 
+        if WGRItemIsCosmetic
+            and WGRItemIsCosmetic(
+                itemLink
+            )
+        then
+            Resolve(nil)
+            return
+        end
+
         local newItemLevel =
             GetItemLevel(itemLink)
 
@@ -826,6 +835,14 @@ function WGRBuildLoadedItemRecommendation(
         or not equipLoc
     then
         return nil, "not_loaded"
+    end
+
+    if WGRItemIsCosmetic
+        and WGRItemIsCosmetic(
+            itemLink
+        )
+    then
+        return nil, "unsupported"
     end
 
     local newItemLevel =
@@ -3880,6 +3897,17 @@ local function EvaluateBagnonButton(button, generation)
         return
     end
 
+    -- A Removed character and that character's Bags/PBK are outside WBGR.
+    -- Keep shared Warband Bank handling above available, but never classify
+    -- or overlay character-local inventory while logged into a Removed alt.
+    local currentName = UnitName("player")
+    if currentName
+        and WGRIsCharacterRemoved
+        and WGRIsCharacterRemoved(currentName)
+    then
+        return
+    end
+
     if not IsCurrentCharacterBagnonButton(button) then return end
 
     local bagID = button.bag
@@ -4375,6 +4403,15 @@ function ProcessTooltip(tooltip)
         tooltip:GetItem()
 
     if not itemLink then
+        return
+    end
+
+    local currentName = UnitName("player")
+    if currentName
+        and WGRIsCharacterRemoved
+        and WGRIsCharacterRemoved(currentName)
+        and not IsWarbankTooltip(tooltip)
+    then
         return
     end
 

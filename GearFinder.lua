@@ -571,6 +571,14 @@ end
 local function WGRGearFinderScanBags()
     local items = {}
 
+    local currentName = WGRGearFinderCurrentName()
+    if currentName
+        and WGRIsCharacterRemoved
+        and WGRIsCharacterRemoved(currentName)
+    then
+        return items
+    end
+
     for bagID = 0, 4 do
         local slots =
             C_Container.GetContainerNumSlots(
@@ -735,6 +743,15 @@ end
 
 local function WGRGearFinderScanPersonalBank()
     local items = {}
+
+    local currentName = WGRGearFinderCurrentName()
+    if currentName
+        and WGRIsCharacterRemoved
+        and WGRIsCharacterRemoved(currentName)
+    then
+        return items
+    end
+
     local tabIDs =
         WGRGearFinderGetPersonalBankTabIDs()
 

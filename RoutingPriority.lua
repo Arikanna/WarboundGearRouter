@@ -111,7 +111,8 @@ local function WGRBuildInitialRoutingPriority()
 end
 
 
-local WGRIsCharacterRemoved
+-- Cross-module removed-character check. Other modules intentionally call this.
+WGRIsCharacterRemoved = nil
 
 local function WGRNormalizeRoutingPriority(
     list
@@ -313,6 +314,12 @@ function WGRRemoveCharacter(characterName)
             == true,
         removedAt = time(),
     }
+
+    -- Removed characters and their personal Bags/Bank are outside WBGR.
+    -- Purge any cached held-gear snapshot immediately.
+    if WarboundGearRouterDB.heldGearSnapshots then
+        WarboundGearRouterDB.heldGearSnapshots[key] = nil
+    end
 
     WarboundGearRouterDB.ignoredCharacters[key] =
         nil

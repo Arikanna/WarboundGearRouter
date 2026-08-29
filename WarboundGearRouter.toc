@@ -2,7 +2,7 @@
 ## Title: Warbound Gear Router
 ## Notes: Routes Warbound gear through a prioritized alt roster.
 ## Author: Arikanna (Silvermoon)
-## Version: 0.63i
+## Version: 0.63n
 ## IconTexture: Interface\AddOns\WarboundGearRouter\WBGRIcon
 ## Dependencies: DataStore, DataStore_Characters, DataStore_Inventory
 ## OptionalDeps: DataStore_Containers

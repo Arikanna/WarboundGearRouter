@@ -419,6 +419,78 @@ function WGRBindingAllowed(
         or (isBoE and settings.boe)
 end
 
+function WGRItemIsCosmetic(
+    item
+)
+    if not item then
+        return false
+    end
+
+    -- Blizzard exposes an explicit cosmetic predicate. This catches
+    -- appearance-only weapon/armor items that still report ordinary
+    -- weapon/armor class, subtype, and equip-location metadata.
+    if C_Item
+        and C_Item.IsCosmeticItem
+    then
+        local isCosmetic =
+            C_Item.IsCosmeticItem(
+                item
+            )
+
+        if isCosmetic then
+            return true
+        end
+    end
+
+    -- Keep the metadata checks as a fallback for older/unusual items.
+    local info =
+        GetInstantItemInfo(
+            item
+        )
+
+    if not info then
+        return false
+    end
+
+    local itemType =
+        string.lower(
+            tostring(
+                info.itemType
+                or ""
+            )
+        )
+
+    local itemSubType =
+        string.lower(
+            tostring(
+                info.itemSubType
+                or ""
+            )
+        )
+
+    if info.equipLoc == "INVTYPE_COSMETIC"
+        or itemType == "cosmetic"
+        or itemSubType == "cosmetic"
+    then
+        return true
+    end
+
+    local armorClassID =
+        Enum
+        and Enum.ItemClass
+        and Enum.ItemClass.Armor
+        or 4
+
+    local cosmeticSubclassID =
+        Enum
+        and Enum.ItemArmorSubclass
+        and Enum.ItemArmorSubclass.Cosmetic
+        or 5
+
+    return info.classID == armorClassID
+        and info.subclassID == cosmeticSubclassID
+end
+
 function WGRQualityAllowed(
     itemLink
 )
@@ -427,6 +499,17 @@ function WGRQualityAllowed(
     if WGRItemIsIgnored(
         itemLink
     )
+    then
+        return false
+    end
+
+    -- Cosmetic-only items are collection pieces, not gearing candidates.
+    -- Exclude them centrally so Gear Finder, Gear Search snapshots, mail
+    -- routing, tooltips, and overlays all agree on the same eligibility.
+    if WGRItemIsCosmetic
+        and WGRItemIsCosmetic(
+            itemLink
+        )
     then
         return false
     end
