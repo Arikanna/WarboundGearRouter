@@ -1,0 +1,10 @@
+Warbound Gear Router (WBGR)
+Copyright (C) 2026 Arikanna (Silvermoon)
+
+Project creator and author: Arikanna (Silvermoon)
+
+Warbound Gear Router is licensed under the GNU General Public License, version 3.
+See the LICENSE file included with this distribution.
+
+Third-party addons and dependencies, including DataStore and its modules, are not
+part of Warbound Gear Router and remain subject to their own authors' licenses.
