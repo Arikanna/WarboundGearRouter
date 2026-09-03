@@ -4436,15 +4436,25 @@ function ProcessTooltip(tooltip)
         return
     end
 
-    if not IsTransferableGearTooltip(
-        tooltip,
-        itemLink
-    )
-    then
-        WGRScheduleTooltipRetry(
+    local transferable, transferReason =
+        IsTransferableGearTooltip(
             tooltip,
             itemLink
         )
+
+    if not transferable then
+        -- Soulbound is a final answer. Retrying by forcing Blizzard to
+        -- RefreshData() can create a rapid tooltip-refresh loop and taint
+        -- errors on some complex Soulbound item tooltips. Only retain the
+        -- legacy retry behavior for unresolved/non-definitive failures.
+        if transferReason ~= "SOULBOUND" then
+            WGRScheduleTooltipRetry(
+                tooltip,
+                itemLink
+            )
+        else
+            tooltip.__WGRRetryItemLink = nil
+        end
         return
     end
 

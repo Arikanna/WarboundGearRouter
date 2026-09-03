@@ -640,7 +640,10 @@ function IsTransferableGearTooltip(
                     if CheckText(text)
                         == "SOULBOUND"
                     then
-                        return false
+                        -- Soulbound is a definitive routing exclusion, not a
+                        -- temporary tooltip-data miss. Return a reason so the
+                        -- tooltip layer does not schedule RefreshData retries.
+                        return false, "SOULBOUND"
                     end
                 end
             end
@@ -690,7 +693,8 @@ function IsTransferableGearTooltip(
             if CheckText(text)
                 == "SOULBOUND"
             then
-                return false
+                -- Same definitive exclusion for compatibility tooltip parsing.
+                return false, "SOULBOUND"
             end
         end
     end
