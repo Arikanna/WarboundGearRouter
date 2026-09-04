@@ -414,6 +414,7 @@ local function WGRMailDestination(result)
     if result.kind ~= "upgrade"
         and result.kind ~= "future_upgrade"
         and result.kind ~= "holder"
+        and result.kind ~= "unknown"
     then
         return nil
     end

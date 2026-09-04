@@ -3928,15 +3928,39 @@ local function WGRMailCreateTrackerFrame()
     WGRMailTracker.frame =
         frame
 
-    frame:SetSize(
-        950,
-        470
-    )
-
     InitializeDatabase()
 
     local savedPosition =
         WarboundGearRouterDB.mainWindow
+
+    local minimumWindowHeight = 470
+    local maximumWindowHeight = math.max(
+        minimumWindowHeight,
+        math.floor((UIParent:GetHeight() or 900) - 40)
+    )
+    local savedHeight = tonumber(savedPosition.height) or minimumWindowHeight
+    savedHeight = math.max(
+        minimumWindowHeight,
+        math.min(maximumWindowHeight, savedHeight)
+    )
+
+    frame:SetSize(
+        950,
+        savedHeight
+    )
+
+    frame:SetResizable(true)
+    if frame.SetResizeBounds then
+        frame:SetResizeBounds(
+            950,
+            minimumWindowHeight,
+            950,
+            maximumWindowHeight
+        )
+    else
+        frame:SetMinResize(950, minimumWindowHeight)
+        frame:SetMaxResize(950, maximumWindowHeight)
+    end
 
     frame:SetPoint(
         savedPosition.point
@@ -4218,7 +4242,7 @@ local function WGRMailCreateTrackerFrame()
                 "Master WBGR Toggle"
             )
             GameTooltip:AddLine(
-                "Pause routing, Gear Finder, and Mail Router. Passive roster and database collection remains active.",
+                "Pause routing, Gear Finder, Mail Router, and live inventory evaluation.",
                 1.00,
                 1.00,
                 1.00,
@@ -4302,22 +4326,142 @@ local function WGRMailCreateTrackerFrame()
                     1
                 )
 
-            WarboundGearRouterDB.mainWindow = {
-                point =
-                    point
-                    or "CENTER",
-                relativePoint =
-                    relativePoint
-                    or "CENTER",
-                x =
-                    xOfs
-                    or 0,
-                y =
-                    yOfs
-                    or 0,
-            }
+            -- Update only the position fields so user-selected window
+            -- height and any future window preferences are preserved.
+            WarboundGearRouterDB.mainWindow.point =
+                point or "CENTER"
+            WarboundGearRouterDB.mainWindow.relativePoint =
+                relativePoint or "CENTER"
+            WarboundGearRouterDB.mainWindow.x =
+                xOfs or 0
+            WarboundGearRouterDB.mainWindow.y =
+                yOfs or 0
+            WarboundGearRouterDB.mainWindow.height =
+                frame:GetHeight() or minimumWindowHeight
         end
     )
+
+    -- Vertical resize grip.  The window can grow downward/upward from its
+    -- original 470px height, but cannot be made smaller than the established
+    -- layout.  Width remains fixed so approved page layouts do not shift.
+    local resizeGrip =
+        CreateFrame(
+            "Button",
+            nil,
+            frame
+        )
+
+    resizeGrip:SetSize(
+        22,
+        22
+    )
+    resizeGrip:SetPoint(
+        "BOTTOMRIGHT",
+        frame,
+        "BOTTOMRIGHT",
+        -5,
+        5
+    )
+    resizeGrip:SetFrameLevel(
+        frame:GetFrameLevel() + 20
+    )
+
+    -- Draw a compact corner-connected resize grip.  Each diagonal spans
+    -- between the bottom and right edges so the control reads as part of the
+    -- window frame instead of as three floating slash marks.
+    local gripLines = {}
+    local gripInsets = { 5, 9, 13 }
+
+    for index, inset in ipairs(gripInsets) do
+        local line = resizeGrip:CreateTexture(nil, "OVERLAY")
+        line:SetTexture("Interface\\Buttons\\WHITE8X8")
+        line:SetSize(inset * 1.4142, 1.0)
+        line:SetRotation(math.rad(45))
+        line:SetPoint(
+            "CENTER",
+            resizeGrip,
+            "BOTTOMRIGHT",
+            -(inset / 2),
+            inset / 2
+        )
+        line:SetVertexColor(
+            0.48,
+            0.45,
+            0.36,
+            0.85
+        )
+        gripLines[index] = line
+    end
+
+    local function SetResizeGripHighlight(highlighted)
+        local r, g, b, a
+
+        if highlighted then
+            r, g, b, a = 0.82, 0.68, 0.24, 1.00
+        else
+            r, g, b, a = 0.48, 0.45, 0.36, 0.85
+        end
+
+        for _, line in ipairs(gripLines) do
+            line:SetVertexColor(r, g, b, a)
+        end
+    end
+
+    resizeGrip:SetScript(
+        "OnEnter",
+        function(self)
+            SetResizeGripHighlight(true)
+            GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+            GameTooltip:SetText("Resize WBGR")
+            GameTooltip:AddLine(
+                "Drag to make the window taller or return it to its original height.",
+                1.00,
+                1.00,
+                1.00,
+                true
+            )
+            GameTooltip:Show()
+        end
+    )
+    resizeGrip:SetScript(
+        "OnLeave",
+        function()
+            SetResizeGripHighlight(false)
+            GameTooltip:Hide()
+        end
+    )
+
+    resizeGrip:SetScript(
+        "OnMouseDown",
+        function(_, button)
+            if button ~= "LeftButton" then
+                return
+            end
+
+            frame:StartSizing("BOTTOM")
+        end
+    )
+
+    resizeGrip:SetScript(
+        "OnMouseUp",
+        function()
+            frame:StopMovingOrSizing()
+
+            -- Defensive clamp for clients where SetResizeBounds is unavailable
+            -- or behaves differently under UI scaling.
+            local height = math.max(
+                minimumWindowHeight,
+                math.min(
+                    maximumWindowHeight,
+                    frame:GetHeight() or minimumWindowHeight
+                )
+            )
+            frame:SetHeight(height)
+            WarboundGearRouterDB.mainWindow.height = height
+        end
+    )
+
+    frame.resizeGrip = resizeGrip
 
     local function CreateWGRDropdown(parent, width, height)
         local button =
@@ -12729,6 +12873,7 @@ function WGRIsMainWindowShown()
 end
 
 function WGRRefreshRosterIfOpen()
+    local perfStart = WGRPerfNow and WGRPerfNow() or 0
     local frame =
         WGRMailTracker.frame
 
@@ -12740,6 +12885,13 @@ function WGRRefreshRosterIfOpen()
     end
 
     frame.UpdateRoster()
+
+    if perfStart > 0 and WGRPerfNow and WGRPerfRecord then
+        WGRPerfRecord(
+            "roster_refresh",
+            WGRPerfNow() - perfStart
+        )
+    end
 end
 
 function WGRMailShowTracker()

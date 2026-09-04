@@ -2293,6 +2293,7 @@ local function WGRGetMultiSpecWeaponBaseline(
 
     local foundUsableSpec = false
     local sawUnknown = false
+    local sawIncompleteUsefulSetup = false
     local lowestBaseline = nil
 
     for _, specID
@@ -2478,6 +2479,7 @@ function WGRGetIncomingWeaponUpgradeForSpecificSpec(
     local bestUsesAverage = false
     local bestIsOverAverage = false
     local sawMatchingConfig = false
+    local sawIncompleteUsefulSetup = false
 
     for _, config in ipairs(
         WGRGetAllowedSpecWeaponConfigs(characterName, specID) or {}
@@ -2495,6 +2497,76 @@ function WGRGetIncomingWeaponUpgradeForSpecificSpec(
 
             local main = tonumber(known and known.mainHandLevel) or 0
             local off = tonumber(known and known.offHandLevel) or 0
+
+            -- A freshly equipped half of an otherwise uninitialized paired
+            -- setup is intentionally not written into the authoritative saved
+            -- baseline until the setup is complete. For routing the current
+            -- character's active spec, however, use a compatible live piece
+            -- transiently when that known side is missing. This lets equal-ilvl
+            -- duplicates reroute instead of remaining false incomplete upgrades.
+            local playerName =
+                UnitName
+                and UnitName("player")
+
+            local currentSpec =
+                GetCurrentSpecInfo
+                and GetCurrentSpecInfo()
+
+            if playerName
+                and characterName
+                and string.lower(playerName) == string.lower(characterName)
+                and currentSpec
+                and tonumber(currentSpec.id) == tonumber(specID)
+            then
+                local _, _, playerClassID = UnitClass("player")
+
+                if main <= 0 then
+                    local liveMain = GetInventoryItemLink("player", 16)
+                    local liveMainFit =
+                        liveMain
+                        and playerClassID
+                        and WGRLiveEquippedItemFitsSpec
+                        and WGRLiveEquippedItemFitsSpec(
+                            liveMain,
+                            playerClassID,
+                            specID
+                        )
+
+                    if liveMainFit == true
+                        and WGRItemMatchesWeaponConfig(
+                            liveMain,
+                            config,
+                            "WEAPON"
+                        )
+                    then
+                        main = tonumber(GetItemLevel(liveMain)) or 0
+                    end
+                end
+
+                if off <= 0 then
+                    local liveOff = GetInventoryItemLink("player", 17)
+                    local liveOffFit =
+                        liveOff
+                        and playerClassID
+                        and WGRLiveEquippedItemFitsSpec
+                        and WGRLiveEquippedItemFitsSpec(
+                            liveOff,
+                            playerClassID,
+                            specID
+                        )
+
+                    if liveOffFit == true
+                        and WGRItemMatchesWeaponConfig(
+                            liveOff,
+                            config,
+                            "OFFHAND"
+                        )
+                    then
+                        off = tonumber(GetItemLevel(liveOff)) or 0
+                    end
+                end
+            end
+
             local candidateScore = nil
             local improvesComponent = false
 
@@ -2543,17 +2615,24 @@ function WGRGetIncomingWeaponUpgradeForSpecificSpec(
                 end
             end
 
+            local pairedConfig =
+                config == "ONE_HAND_PLUS_OFFHAND"
+                or config == "ONE_HAND_PLUS_SHIELD"
+                or config == "DUAL_1H"
+                or config == "DUAL_2H"
+
+            if pairedConfig and overallBaseline <= 0 and improvesComponent then
+                sawIncompleteUsefulSetup = true
+                candidateScore = nil
+            end
+
             if improvesComponent and candidateScore then
                 local upgrade = candidateScore - overallBaseline
                 if upgrade > 0
                     and (bestUpgrade == nil or upgrade > bestUpgrade)
                 then
                     bestUpgrade = upgrade
-                    bestUsesAverage =
-                        config == "ONE_HAND_PLUS_OFFHAND"
-                        or config == "ONE_HAND_PLUS_SHIELD"
-                        or config == "DUAL_1H"
-                        or config == "DUAL_2H"
+                    bestUsesAverage = pairedConfig
 
                     -- A 2H/ranged item is not itself averaged.  But when it
                     -- replaces a paired baseline, the displayed +X is measured
@@ -2579,7 +2658,8 @@ function WGRGetIncomingWeaponUpgradeForSpecificSpec(
         return nil, "not_usable"
     end
 
-    return bestUpgrade or 0, "known", bestUsesAverage, bestIsOverAverage
+    return bestUpgrade or 0, "known", bestUsesAverage, bestIsOverAverage,
+        (bestUpgrade == nil and sawIncompleteUsefulSetup) or false
 end
 
 function WGRGetIncomingWeaponUpgradeForMode(
@@ -2601,9 +2681,10 @@ function WGRGetIncomingWeaponUpgradeForMode(
     local bestIsOverAverage = false
     local foundUsableSpec = false
     local sawUnknown = false
+    local sawIncompleteUsefulSetup = false
 
     for _, specID in ipairs(specIDs) do
-        local upgrade, status, usesAverage, isOverAverage =
+        local upgrade, status, usesAverage, isOverAverage, setupIncomplete =
             WGRGetIncomingWeaponUpgradeForSpecificSpec(
                 characterName,
                 character,
@@ -2615,6 +2696,9 @@ function WGRGetIncomingWeaponUpgradeForMode(
 
         if status == "known" then
             foundUsableSpec = true
+            if setupIncomplete == true then
+                sawIncompleteUsefulSetup = true
+            end
             upgrade = tonumber(upgrade) or 0
             if bestUpgrade == nil or upgrade > bestUpgrade then
                 bestUpgrade = upgrade
@@ -2633,7 +2717,8 @@ function WGRGetIncomingWeaponUpgradeForMode(
         return nil, "not_usable"
     end
 
-    return bestUpgrade or 0, "known", bestUsesAverage, bestIsOverAverage
+    return bestUpgrade or 0, "known", bestUsesAverage, bestIsOverAverage,
+        ((bestUpgrade == nil or bestUpgrade <= 0) and sawIncompleteUsefulSetup) or false
 end
 
 function WGRGetWeaponComparisonLevelForMode(
@@ -2651,6 +2736,54 @@ function WGRGetOffhandComparisonLevelForMode(
     itemLink
 )
     return WGRGetMultiSpecWeaponBaseline(characterName, character, itemLink, "OFFHAND")
+end
+
+
+local function WGRItemFitsAnyClassSpec(
+    itemLink,
+    classID
+)
+    if not classID
+        or type(WGRClassSpecIDs) ~= "table"
+    then
+        return nil
+    end
+
+    local specIDs =
+        WGRClassSpecIDs[classID]
+
+    if type(specIDs) ~= "table"
+        or #specIDs == 0
+    then
+        return nil
+    end
+
+    local sawUnknown = false
+
+    for _, specID
+        in ipairs(specIDs)
+    do
+        local result =
+            WGRItemFitsSpecificSpec(
+                itemLink,
+                classID,
+                specID
+            )
+
+        if result == true then
+            return true
+        end
+
+        if result == nil then
+            sawUnknown = true
+        end
+    end
+
+    if sawUnknown then
+        return nil
+    end
+
+    return false
 end
 
 
@@ -2713,6 +2846,25 @@ function DoesItemFitRememberedSpec(
         )
 
     if #specIDs == 0 then
+        -- A missing remembered spec should only block routing when the item
+        -- could genuinely fit at least one spec of the known class. This
+        -- prevents false CHECK results for technically equippable but
+        -- spec-inappropriate weapons (for example, an Intellect staff on a
+        -- Hunter whose current spec has not been initialized yet).
+        local couldFitAnySpec =
+            WGRItemFitsAnyClassSpec(
+                itemLink,
+                classID
+            )
+
+        if couldFitAnySpec == false then
+            return false, "known"
+        end
+
+        if couldFitAnySpec == nil then
+            return nil, "api_error"
+        end
+
         return nil, "unknown_spec"
     end
 
@@ -2790,25 +2942,10 @@ function CouldItemFitUnknownCharacter(
         return false
     end
 
-    if not C_Item
-        or not
-        C_Item.DoesItemContainSpec
-    then
-        return nil
-    end
-
-    local ok, result =
-        pcall(
-            C_Item.DoesItemContainSpec,
-            itemLink,
-            classID
-        )
-
-    if not ok then
-        return nil
-    end
-
-    return result == true
+    return WGRItemFitsAnyClassSpec(
+        itemLink,
+        classID
+    )
 end
 
 
@@ -3269,38 +3406,22 @@ end
 function IsDaggerSpecialistSpec(
     characterName
 )
-    local remembered =
-        GetRememberedSpec(characterName)
+    local character = FindCharacterByName(characterName)
+    local classID = GetCharacterClassID(characterName, character)
 
-    if not remembered
-        or remembered.class ~= "ROGUE"
-    then
+    -- Rogue class ID. The preference is intentionally limited to
+    -- Assassination and Subtlety, the specs that depend on daggers.
+    if classID ~= 4 then
         return false
     end
 
-    local mode =
-        WGRGetEffectiveSpecMode(
-            characterName
-        )
+    local specIDs = WGRGetRoutingSpecIDs(characterName, character)
 
-    if mode == "ALL" then
-        return true
+    for _, specID in ipairs(specIDs or {}) do
+        if specID == 259 or specID == 261 then
+            return true
+        end
     end
 
-    if mode == "CUSTOM" then
-        local selected =
-            WGRGetCustomSpecs(
-                characterName
-            )
-
-        return selected
-            and (
-                selected["259"]
-                or selected["261"]
-            )
-            or false
-    end
-
-    return remembered.specName == "Subtlety"
-        or remembered.specName == "Assassination"
+    return false
 end

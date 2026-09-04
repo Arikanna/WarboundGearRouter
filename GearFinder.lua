@@ -1492,6 +1492,38 @@ local function WGRGearFinderMakeOwnedWeaponRecord(itemLink, itemLevel, slotRole)
     }
 end
 
+local function WGRGearFinderGetLiveEquippedItemLevel(slotID, itemLink)
+    if ItemLocation
+        and ItemLocation.CreateFromEquipmentSlot
+        and C_Item
+        and C_Item.GetCurrentItemLevel
+    then
+        local okLocation, itemLocation =
+            pcall(
+                ItemLocation.CreateFromEquipmentSlot,
+                ItemLocation,
+                slotID
+            )
+
+        if okLocation and itemLocation then
+            local okLevel, currentLevel =
+                pcall(
+                    C_Item.GetCurrentItemLevel,
+                    itemLocation
+                )
+
+            if okLevel
+                and currentLevel
+                and currentLevel > 0
+            then
+                return tonumber(currentLevel)
+            end
+        end
+    end
+
+    return WGRGearFinderGetItemLevel(itemLink)
+end
+
 local function WGRGearFinderWeaponPieceFitsConfig(record, config, role)
     if not record or not record.itemLink then return false end
     local weaponKind = GetWeaponKind(record.itemLink)
@@ -1514,6 +1546,75 @@ local function WGRGearFinderWeaponPieceFitsConfig(record, config, role)
     end
 
     return false
+end
+
+local function WGRGearFinderMakeLiveOwnedWeaponRecord(
+    slotID,
+    slotRole,
+    specID,
+    config
+)
+    local itemLink =
+        GetInventoryItemLink(
+            "player",
+            slotID
+        )
+
+    if not itemLink then
+        return nil
+    end
+
+    local _, _, classID = UnitClass("player")
+    if not classID
+        or not WGRLiveEquippedItemFitsSpec
+    then
+        return nil
+    end
+
+    local fitsSpec =
+        WGRLiveEquippedItemFitsSpec(
+            itemLink,
+            classID,
+            specID
+        )
+
+    if fitsSpec ~= true then
+        return nil
+    end
+
+    local itemLevel =
+        WGRGearFinderGetLiveEquippedItemLevel(
+            slotID,
+            itemLink
+        )
+
+    if not itemLevel
+        or itemLevel <= 0
+    then
+        return nil
+    end
+
+    local record = {
+        itemLink = itemLink,
+        itemLevel = itemLevel,
+        source = "EQUIPPED",
+        bagID = nil,
+        slotID = slotID,
+        ownedBaseline = true,
+        slotRole = slotRole,
+        classification = "OWNED",
+        livePartial = true,
+    }
+
+    if not WGRGearFinderWeaponPieceFitsConfig(
+        record,
+        config,
+        slotRole
+    ) then
+        return nil
+    end
+
+    return record
 end
 
 local function WGRGearFinderWeaponRecordKey(record)
@@ -1682,6 +1783,51 @@ local function WGRGearFinderBuildWeaponDisplay(characterName, character, specID,
             if ownedMain then pieces[#pieces + 1] = ownedMain end
             if ownedOff then pieces[#pieces + 1] = ownedOff end
         end
+
+        -- A freshly equipped half of a paired setup is intentionally not
+        -- written into the authoritative saved baseline until the setup is
+        -- complete. Gear Finder may still use that live current-spec piece
+        -- transiently as KEEP so the other half recalculates immediately.
+        local currentSpec =
+            GetCurrentSpecInfo
+            and GetCurrentSpecInfo()
+
+        if WGRGearFinderSameCharacter(
+                characterName,
+                UnitName("player")
+            )
+            and currentSpec
+            and tonumber(currentSpec.id) == tonumber(specID)
+        then
+            if not ownedMain then
+                ownedMain =
+                    WGRGearFinderMakeLiveOwnedWeaponRecord(
+                        16,
+                        "MAIN",
+                        specID,
+                        config
+                    )
+
+                if ownedMain then
+                    pieces[#pieces + 1] = ownedMain
+                end
+            end
+
+            if not ownedOff then
+                ownedOff =
+                    WGRGearFinderMakeLiveOwnedWeaponRecord(
+                        17,
+                        "OFF",
+                        specID,
+                        config
+                    )
+
+                if ownedOff then
+                    pieces[#pieces + 1] = ownedOff
+                end
+            end
+        end
+
         for _, candidate in ipairs(routedCandidates) do
             pieces[#pieces + 1] = candidate
         end
@@ -1941,6 +2087,7 @@ local function WGRGearFinderClassify(
                 recommendation.kind == "upgrade"
                 or recommendation.kind == "future_upgrade"
                 or recommendation.kind == "holder"
+                or recommendation.kind == "unknown"
             )
         then
             record.classification =
@@ -6954,9 +7101,16 @@ function WGRScheduleGearFinderRefresh(
                 and currentFrame.gearFinderPage
                 and currentFrame.gearFinderPage:IsShown()
             then
+                local perfStart = WGRPerfNow and WGRPerfNow() or 0
                 WGRRefreshGearFinder(
                     currentFrame
                 )
+                if perfStart > 0 and WGRPerfNow and WGRPerfRecord then
+                    WGRPerfRecord(
+                        "gear_finder_refresh",
+                        WGRPerfNow() - perfStart
+                    )
+                end
             end
         end
     )
@@ -8016,6 +8170,9 @@ function WGRGearFinderSetMasterPaused(
     end
 end
 
+local WGRIgnoredLocationRefreshSerial =
+    0
+
 local WGRIgnoredLocationEventFrame =
     CreateFrame(
         "Frame"
@@ -8037,12 +8194,42 @@ WGRIgnoredLocationEventFrame:RegisterEvent(
 WGRIgnoredLocationEventFrame:SetScript(
     "OnEvent",
     function()
-        if WGRRefreshIgnoredItemLocations then
-            C_Timer.After(
-                0.10,
-                WGRRefreshIgnoredItemLocations
-            )
+        if not WGRRefreshIgnoredItemLocations then
+            return
         end
+
+        if WGRRoutingIsPaused
+            and WGRRoutingIsPaused()
+        then
+            return
+        end
+
+        if WGRIsMainWindowShown
+            and not WGRIsMainWindowShown()
+        then
+            return
+        end
+
+        WGRIgnoredLocationRefreshSerial =
+            WGRIgnoredLocationRefreshSerial + 1
+
+        local serial =
+            WGRIgnoredLocationRefreshSerial
+
+        C_Timer.After(
+            0.35,
+            function()
+                if serial
+                    ~= WGRIgnoredLocationRefreshSerial
+                then
+                    return
+                end
+
+                if WGRRefreshIgnoredItemLocations then
+                    WGRRefreshIgnoredItemLocations()
+                end
+            end
+        )
     end
 )
 

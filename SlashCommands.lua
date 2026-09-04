@@ -87,6 +87,55 @@ SlashCmdList[
         return
     end
 
+    if command == "perf" then
+        local lowerRest = string.lower(rest or "")
+
+        if lowerRest == "reset" then
+            if WGRPerfReset then
+                WGRPerfReset()
+            end
+            print("|cff00ff00WBGR PERF:|r counters reset.")
+            return
+        end
+
+        print("|cff00ff00=== WBGR PERFORMANCE ===|r")
+        if not WGRPerfStats or not next(WGRPerfStats) then
+            print("No performance samples recorded yet.")
+            print("Move an item in/out of the bank, wait a moment, then run |cffffff00/wbgr perf|r again.")
+            return
+        end
+
+        local order = {
+            "inventory_refresh_total",
+            "held_snapshot_total",
+            "held_bags_scan",
+            "held_bags_scan_routing",
+            "held_bank_scan",
+            "held_bank_scan_routing",
+            "warband_snapshot_total",
+            "warband_scan",
+            "warband_scan_routing",
+            "roster_refresh",
+            "bagnon_overlays",
+            "gear_finder_refresh",
+        }
+
+        for _, name in ipairs(order) do
+            local stat = WGRPerfStats[name]
+            if stat then
+                local avg = stat.count > 0 and (stat.total / stat.count) or 0
+                local detail = stat.details and ("  " .. stat.details) or ""
+                print(string.format(
+                    "|cffffff00%-25s|r last=%7.1fms  avg=%7.1fms  max=%7.1fms  n=%d%s",
+                    name, stat.last or 0, avg, stat.max or 0, stat.count or 0, detail
+                ))
+            end
+        end
+
+        print("Use |cffffff00/wbgr perf reset|r before a clean test if needed.")
+        return
+    end
+
     if command == "pause" then
         WGRSetRoutingPaused(
             true

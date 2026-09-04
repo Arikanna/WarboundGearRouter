@@ -33,13 +33,12 @@ function PreloadItems(
 
         if character then
             local level =
-                DataStore:GetCharacterLevel(
-                    character
-                ) or 0
+                WGRGetCharacterLevel(character)
 
-            if level < WGR_MAX_LEVEL then
-                break
-            end
+            -- Routing priority can mix max-level and leveling characters.
+            -- Do not stop preloading at the first lower-level character, or
+            -- later max-level candidates may be evaluated before their
+            -- equipped-item data is ready.
 
             for _, slotID
                 in ipairs(slotIDs)

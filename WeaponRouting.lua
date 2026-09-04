@@ -10,397 +10,192 @@ function BuildWeaponRecommendation(
     newItemLevel,
     itemMinLevel
 )
-    local isLevelingItem =
-        itemMinLevel
-        and itemMinLevel > 0
-        and itemMinLevel < WGR_MAX_LEVEL
+    local isDaggerOverride = IsDaggerItem(itemLink)
 
-    local isDagger =
-        IsDaggerItem(itemLink)
-
-    local firstAnyUpgrade = nil
     local firstThresholdUpgrade = nil
-    local firstSpecialistAnyUpgrade = nil
-    local firstSpecialistThresholdUpgrade = nil
-
-    local firstLevelingUpgrade = nil
-    local firstLevelingThresholdUpgrade = nil
-    local firstLevelingSpecialistUpgrade = nil
-    local firstLevelingSpecialistThresholdUpgrade = nil
-
-    -- Leveling-item routing needs to distinguish an upgrade the character
-    -- can equip NOW from a future-level upgrade.  A real current upgrade
-    -- (even below threshold) must beat parking the item on a character who
-    -- cannot equip it yet.
-    local firstLevelingCurrentUpgrade = nil
-    local firstLevelingCurrentThresholdUpgrade = nil
-    local firstLevelingCurrentSpecialistUpgrade = nil
-    local firstLevelingCurrentSpecialistThresholdUpgrade = nil
-
+    local firstAnyUpgrade = nil
     local holder = nil
+
+    local firstSpecialistThresholdUpgrade = nil
+    local firstSpecialistAnyUpgrade = nil
     local specialistHolder = nil
+
     local unresolvedHolder = nil
     local unknownIndexes = {}
+
+    local function CanEquipNow(level)
+        return not itemMinLevel
+            or itemMinLevel <= 0
+            or level >= itemMinLevel
+    end
 
     for priorityIndex, characterName
         in ipairs(GetActiveRoutingPriority())
     do
-        local character =
-            FindCharacterByName(characterName)
+        local character = FindCharacterByName(characterName)
 
         if character then
-            local level =
-                DataStore:GetCharacterLevel(character) or 0
+            local level = WGRGetCharacterLevel(character)
+            local specIDs = WGRGetRoutingSpecIDs(characterName, character)
+            local specialist =
+                isDaggerOverride
+                and IsDaggerSpecialistSpec(characterName)
 
-            if level < WGR_MAX_LEVEL then
-                if isLevelingItem then
-                    -- A sub-90 weapon must be equipable NOW and
-                    -- improve the character's CURRENT weapon setup.
-                    if true then
-                        local remembered =
-                            GetRememberedSpec(characterName)
+            if #specIDs > 0 then
+                local fits, fitStatus =
+                    FutureHolderWeaponMatchesSpec(characterName, itemLink)
 
-                        if remembered and remembered.specID then
-                            local configFits =
-                                FutureHolderWeaponMatchesSpec(
-                                    characterName,
-                                    itemLink
-                                )
-
-                            if configFits == true then
-                                local config =
-                                    GetCurrentWeaponConfiguration(
-                                        character
-                                    )
-
-                                if WeaponMatchesCurrentConfiguration(
-                                    config,
-                                    itemLink,
-                                    characterName,
-                                    character
-                                ) then
-                                    local comparisonSlots =
-                                        GetWeaponComparisonSlots(
-                                            config,
-                                            itemLink,
-                                            characterName,
-                                            character
-                                        )
-
-                                    if comparisonSlots then
-                                        local upgrade, status, usesAverage, isOverAverage =
-                                            WGRGetIncomingWeaponUpgradeForMode(
-                                                characterName,
-                                                character,
-                                                itemLink,
-                                                newItemLevel,
-                                                "WEAPON"
-                                            )
-
-                                        if status ~= "unknown" then
-                                            upgrade = tonumber(upgrade) or 0
-
-                                            if upgrade > 0 then
-                                                local result = {
-                                                    kind =
-                                                        level >= itemMinLevel
-                                                        and "upgrade"
-                                                        or "future_upgrade",
-                                                    requiredLevel = itemMinLevel,
-                                                    name = characterName,
-                                                    upgrade = upgrade,
-                                                    weaponAverage = usesAverage == true,
-                                                    weaponOverAverage = isOverAverage == true,
-                                                    priorityIndex = priorityIndex,
-                                    threshold =
-                                        WGRGetCharacterThreshold(characterName),
-                                    meetsThreshold =
-                                                        upgrade
-                                                        >= WGRGetCharacterThreshold(characterName),
-                                                }
-
-                                                local specialist =
-                                                    isDagger
-                                                    and
-                                                    IsDaggerSpecialistSpec(
-                                                        characterName
-                                                    )
-
-                                                if specialist then
-                                                    if not
-                                                        firstLevelingSpecialistUpgrade
-                                                    then
-                                                        firstLevelingSpecialistUpgrade =
-                                                            result
-                                                    end
-
-                                                    if result.meetsThreshold
-                                                        and not
-                                                        firstLevelingSpecialistThresholdUpgrade
-                                                    then
-                                                        firstLevelingSpecialistThresholdUpgrade =
-                                                            result
-                                                    end
-
-                                                    if result.kind == "upgrade" then
-                                                        if not firstLevelingCurrentSpecialistUpgrade then
-                                                            firstLevelingCurrentSpecialistUpgrade = result
-                                                        end
-                                                        if result.meetsThreshold
-                                                            and not firstLevelingCurrentSpecialistThresholdUpgrade
-                                                        then
-                                                            firstLevelingCurrentSpecialistThresholdUpgrade = result
-                                                        end
-                                                    end
-                                                else
-                                                    if not
-                                                        firstLevelingUpgrade
-                                                    then
-                                                        firstLevelingUpgrade =
-                                                            result
-                                                    end
-
-                                                    if result.meetsThreshold
-                                                        and not
-                                                        firstLevelingThresholdUpgrade
-                                                    then
-                                                        firstLevelingThresholdUpgrade =
-                                                            result
-                                                    end
-
-                                                    if result.kind == "upgrade" then
-                                                        if not firstLevelingCurrentUpgrade then
-                                                            firstLevelingCurrentUpgrade = result
-                                                        end
-                                                        if result.meetsThreshold
-                                                            and not firstLevelingCurrentThresholdUpgrade
-                                                        then
-                                                            firstLevelingCurrentThresholdUpgrade = result
-                                                        end
-                                                    end
-                                                end
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end
+                if fitStatus == "rule_unknown"
+                    or fitStatus == "stat_rule_unknown"
+                then
+                    if CanEquipNow(level) then
+                        table.insert(unknownIndexes, {
+                            name = characterName,
+                            priorityIndex = priorityIndex,
+                        })
+                    elseif not unresolvedHolder then
+                        unresolvedHolder = {
+                            kind = "unresolved",
+                            name = characterName,
+                            level = level,
+                            priorityIndex = priorityIndex,
+                        }
                     end
-                else
-                    local remembered =
-                        GetRememberedSpec(characterName)
 
-                    if remembered and remembered.specID then
-                        local configFits, configStatus =
-                            FutureHolderWeaponMatchesSpec(
+                elseif fits == true then
+                    if CanEquipNow(level) then
+                        local upgrade, status, usesAverage, isOverAverage, setupIncomplete =
+                            WGRGetIncomingWeaponUpgradeForMode(
                                 characterName,
-                                itemLink
+                                character,
+                                itemLink,
+                                newItemLevel,
+                                "WEAPON"
                             )
 
-                        if configStatus == "rule_unknown"
-                            or configStatus
-                                == "stat_rule_unknown"
-                        then
-                            if not unresolvedHolder then
-                                unresolvedHolder = {
-                                    kind = "unresolved",
-                                    name = characterName,
-                                    level = level,
-                                    priorityIndex = priorityIndex,
-                                }
-                            end
-
-                        elseif configFits == true then
-                            local candidate = {
-                                kind = "holder",
+                        if status == "unknown" then
+                            table.insert(unknownIndexes, {
                                 name = characterName,
-                                level = level,
                                 priorityIndex = priorityIndex,
-                            }
+                            })
+                        elseif status == "known" then
+                            upgrade = tonumber(upgrade) or 0
 
-                            if isDagger
-                                and IsDaggerSpecialistSpec(
-                                    characterName
-                                )
-                            then
-                                if not specialistHolder then
-                                    specialistHolder = candidate
+                            if upgrade > 0 then
+                                local threshold =
+                                    WGRGetCharacterThreshold(characterName)
+
+                                local result = {
+                                    kind = "upgrade",
+                                    name = characterName,
+                                    upgrade = upgrade,
+                                    weaponAverage = usesAverage == true,
+                                    weaponOverAverage = isOverAverage == true,
+                                    priorityIndex = priorityIndex,
+                                    threshold = threshold,
+                                    meetsThreshold = upgrade >= threshold,
+                                }
+
+                                if specialist then
+                                    if not firstSpecialistAnyUpgrade then
+                                        firstSpecialistAnyUpgrade = result
+                                    end
+                                    if result.meetsThreshold
+                                        and not firstSpecialistThresholdUpgrade
+                                    then
+                                        firstSpecialistThresholdUpgrade = result
+                                    end
+                                else
+                                    if not firstAnyUpgrade then
+                                        firstAnyUpgrade = result
+                                    end
+                                    if result.meetsThreshold
+                                        and not firstThresholdUpgrade
+                                    then
+                                        firstThresholdUpgrade = result
+                                    end
                                 end
-                            elseif not holder then
-                                holder = candidate
+                            elseif setupIncomplete == true then
+                                local result = {
+                                    kind = "upgrade", name = characterName, upgrade = 0,
+                                    setupIncomplete = true, priorityIndex = priorityIndex,
+                                    threshold = WGRGetCharacterThreshold(characterName),
+                                    meetsThreshold = false,
+                                }
+                                if specialist then
+                                    if not firstSpecialistAnyUpgrade then firstSpecialistAnyUpgrade = result end
+                                elseif not firstAnyUpgrade then
+                                    firstAnyUpgrade = result
+                                end
                             end
                         end
                     else
-                        local couldUse =
-                            CouldItemFitUnknownCharacter(
-                                itemLink,
-                                characterName,
-                                character
-                            )
+                        local candidate = {
+                            kind = "holder",
+                            name = characterName,
+                            level = level,
+                            requiredLevel = itemMinLevel,
+                            priorityIndex = priorityIndex,
+                        }
 
-                        if couldUse == true
-                            and not unresolvedHolder
-                        then
-                            unresolvedHolder = {
-                                kind = "unresolved",
-                                name = characterName,
-                                level = level,
-                                priorityIndex = priorityIndex,
-                            }
+                        if specialist then
+                            if not specialistHolder then
+                                specialistHolder = candidate
+                            end
+                        elseif not holder then
+                            holder = candidate
                         end
                     end
                 end
-
             else
-                local fitsSpec, specStatus =
-                    DoesItemFitRememberedSpec(
-                        itemLink,
-                        characterName,
-                        character
-                    )
+                local couldUse = CouldItemFitUnknownCharacter(
+                    itemLink,
+                    characterName,
+                    character
+                )
 
-                if specStatus == "unknown_spec" then
-                    table.insert(unknownIndexes, {
-                        name = characterName,
-                        priorityIndex = priorityIndex,
-                    })
-
-                elseif fitsSpec == true then
-                    local config =
-                        GetCurrentWeaponConfiguration(character)
-
-                    if WeaponMatchesCurrentConfiguration(
-                                    config,
-                                    itemLink,
-                                    characterName,
-                                    character
-                                ) then
-                        local comparisonSlots =
-                            GetWeaponComparisonSlots(
-                                            config,
-                                            itemLink,
-                                            characterName,
-                                            character
-                                        )
-
-                        if comparisonSlots then
-                            local upgrade, status, usesAverage, isOverAverage =
-                                WGRGetIncomingWeaponUpgradeForMode(
-                                    characterName,
-                                    character,
-                                    itemLink,
-                                    newItemLevel,
-                                    "WEAPON"
-                                )
-
-                            if status == "unknown" then
-                                table.insert(unknownIndexes, {
-                                    name = characterName,
-                                    priorityIndex = priorityIndex,
-                                })
-                            else
-                                upgrade = tonumber(upgrade) or 0
-
-                                if upgrade > 0 then
-                                    local result = {
-                                        kind = "upgrade",
-                                        name = characterName,
-                                        upgrade = upgrade,
-                                        weaponAverage = usesAverage == true,
-                                                    weaponOverAverage = isOverAverage == true,
-                                        priorityIndex = priorityIndex,
-                                    threshold =
-                                        WGRGetCharacterThreshold(characterName),
-                                    meetsThreshold =
-                                            upgrade >= WGRGetCharacterThreshold(characterName),
-                                    }
-
-                                    local specialist =
-                                        isDagger
-                                        and IsDaggerSpecialistSpec(
-                                            characterName
-                                        )
-
-                                    if specialist then
-                                        if not
-                                            firstSpecialistAnyUpgrade
-                                        then
-                                            firstSpecialistAnyUpgrade =
-                                                result
-                                        end
-
-                                        if result.meetsThreshold
-                                            and not
-                                            firstSpecialistThresholdUpgrade
-                                        then
-                                            firstSpecialistThresholdUpgrade =
-                                                result
-                                        end
-                                    else
-                                        if not firstAnyUpgrade then
-                                            firstAnyUpgrade = result
-                                        end
-
-                                        if result.meetsThreshold
-                                            and not firstThresholdUpgrade
-                                        then
-                                            firstThresholdUpgrade = result
-                                        end
-                                    end
-                                end
-                            end
-                        end
+                if couldUse == true then
+                    if CanEquipNow(level) then
+                        table.insert(unknownIndexes, {
+                            name = characterName,
+                            priorityIndex = priorityIndex,
+                        })
+                    elseif not unresolvedHolder then
+                        unresolvedHolder = {
+                            kind = "unresolved",
+                            name = characterName,
+                            level = level,
+                            priorityIndex = priorityIndex,
+                        }
                     end
                 end
             end
         end
     end
 
-    local recommendation = nil
+    local recommendation
 
-    if isDagger then
+    if isDaggerOverride then
+        -- Explicit Rogue-dagger preference is a true override. Within the
+        -- specialist pool, preserve the normal threshold -> any upgrade ->
+        -- future HOLD order before considering flexible users.
         recommendation =
             firstSpecialistThresholdUpgrade
             or firstSpecialistAnyUpgrade
+            or specialistHolder
             or firstThresholdUpgrade
             or firstAnyUpgrade
+            or holder
     else
         recommendation =
             firstThresholdUpgrade
             or firstAnyUpgrade
-    end
-
-    -- Max-level upgrades still have first claim.  Among leveling
-    -- characters, prefer someone who can equip a genuine upgrade NOW
-    -- before any future-level recipient, even when the current upgrade is
-    -- below threshold.
-    if not recommendation
-        and isLevelingItem
-    then
-        if isDagger then
-            recommendation =
-                firstLevelingCurrentSpecialistThresholdUpgrade
-                or firstLevelingCurrentSpecialistUpgrade
-                or firstLevelingCurrentThresholdUpgrade
-                or firstLevelingCurrentUpgrade
-                or firstLevelingSpecialistThresholdUpgrade
-                or firstLevelingSpecialistUpgrade
-                or firstLevelingThresholdUpgrade
-                or firstLevelingUpgrade
-        else
-            recommendation =
-                firstLevelingCurrentThresholdUpgrade
-                or firstLevelingCurrentUpgrade
-                or firstLevelingThresholdUpgrade
-                or firstLevelingUpgrade
-        end
+            or holder
     end
 
     for _, unknown in ipairs(unknownIndexes) do
         if recommendation then
-            if unknown.priorityIndex
-                < recommendation.priorityIndex
-            then
+            if unknown.priorityIndex < recommendation.priorityIndex then
                 return {
                     kind = "unknown",
                     name = unknown.name,
@@ -416,18 +211,6 @@ function BuildWeaponRecommendation(
 
     if recommendation then
         return recommendation
-    end
-
-    if isLevelingItem then
-        return { kind = "no_current_upgrade" }
-    end
-
-    if isDagger and specialistHolder then
-        return specialistHolder
-    end
-
-    if holder then
-        return holder
     end
 
     if unresolvedHolder then
@@ -448,212 +231,51 @@ function BuildWeaponAlternatives(
     recommendation
 )
     local alternatives = {}
-    local specialistHolders = {}
-    local flexibleHolders = {}
-    local unresolved = {}
+    local isDaggerOverride = IsDaggerItem(itemLink)
 
-    local isLevelingItem =
-        itemMinLevel
-        and itemMinLevel > 0
-        and itemMinLevel < WGR_MAX_LEVEL
+    local function CanEquipNow(level)
+        return not itemMinLevel
+            or itemMinLevel <= 0
+            or level >= itemMinLevel
+    end
 
-    local isDagger =
-        IsDaggerItem(itemLink)
+    local specialistExists =
+        isDaggerOverride
+        and recommendation
+        and recommendation.name
+        and IsDaggerSpecialistSpec(recommendation.name)
+        or false
 
     for _, characterName in ipairs(GetActiveRoutingPriority()) do
-        local character =
-            FindCharacterByName(characterName)
+        if not recommendation
+            or recommendation.name ~= characterName
+        then
+            local character = FindCharacterByName(characterName)
 
-        if character then
-            local level =
-                DataStore:GetCharacterLevel(character) or 0
+            if character then
+                local level = WGRGetCharacterLevel(character)
+                local specIDs = WGRGetRoutingSpecIDs(characterName, character)
+                local specialist =
+                    isDaggerOverride
+                    and IsDaggerSpecialistSpec(characterName)
 
-            if level < WGR_MAX_LEVEL then
-                if isLevelingItem then
-                    if true
-                        and (
-                            not recommendation
-                            or recommendation.name ~= characterName
-                        )
+                local option = nil
+
+                if #specIDs > 0 then
+                    local fits, fitStatus =
+                        FutureHolderWeaponMatchesSpec(characterName, itemLink)
+
+                    if fitStatus == "rule_unknown"
+                        or fitStatus == "stat_rule_unknown"
                     then
-                        local remembered =
-                            GetRememberedSpec(characterName)
-
-                        if remembered and remembered.specID then
-                            local configFits =
-                                FutureHolderWeaponMatchesSpec(
-                                    characterName,
-                                    itemLink
-                                )
-
-                            if configFits == true then
-                                local config =
-                                    GetCurrentWeaponConfiguration(
-                                        character
-                                    )
-
-                                if WeaponMatchesCurrentConfiguration(
-                                    config,
-                                    itemLink,
-                                    characterName,
-                                    character
-                                ) then
-                                    local comparisonSlots =
-                                        GetWeaponComparisonSlots(
-                                            config,
-                                            itemLink,
-                                            characterName,
-                                            character
-                                        )
-
-                                    if comparisonSlots then
-                                        local upgrade, status, usesAverage, isOverAverage =
-                                            WGRGetIncomingWeaponUpgradeForMode(
-                                                characterName,
-                                                character,
-                                                itemLink,
-                                                newItemLevel,
-                                                "WEAPON"
-                                            )
-
-                                        if status ~= "unknown" then
-                                            upgrade = tonumber(upgrade) or 0
-
-                                            if upgrade > 0 then
-                                                local threshold =
-                            WGRGetCharacterThreshold(
-                                characterName
-                            )
-
-                        table.insert(alternatives, {
-                            kind = "upgrade",
+                        option = {
+                            kind = "unresolved",
                             name = characterName,
-                            upgrade = upgrade,
-                            weaponAverage = usesAverage == true,
-                                                    weaponOverAverage = isOverAverage == true,
-                            threshold = threshold,
-                            meetsThreshold =
-                                upgrade >= threshold,
-                        })
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                else
-                    local remembered =
-                        GetRememberedSpec(characterName)
-
-                    if remembered and remembered.specID then
-                        local configFits, configStatus =
-                            FutureHolderWeaponMatchesSpec(
-                                characterName,
-                                itemLink
-                            )
-
-                        if configStatus == "rule_unknown"
-                            or configStatus == "stat_rule_unknown"
-                        then
-                            if not recommendation
-                                or recommendation.name ~= characterName
-                            then
-                                table.insert(unresolved, {
-                                    kind = "unresolved",
-                                    name = characterName,
-                                    level = level,
-                                })
-                            end
-
-                        elseif configFits == true then
-                            if not recommendation
-                                or recommendation.name ~= characterName
-                            then
-                                local option = {
-                                    kind = "holder",
-                                    name = characterName,
-                                    level = level,
-                                }
-
-                                if isDagger
-                                    and IsDaggerSpecialistSpec(
-                                        characterName
-                                    )
-                                then
-                                    table.insert(
-                                        specialistHolders,
-                                        option
-                                    )
-                                else
-                                    table.insert(
-                                        flexibleHolders,
-                                        option
-                                    )
-                                end
-                            end
-                        end
-                    else
-                        local couldUse =
-                            CouldItemFitUnknownCharacter(
-                                itemLink,
-                                characterName,
-                                character
-                            )
-
-                        if couldUse == true
-                            and (
-                                not recommendation
-                                or recommendation.name ~= characterName
-                            )
-                        then
-                            table.insert(unresolved, {
-                                kind = "unresolved",
-                                name = characterName,
-                                level = level,
-                            })
-                        end
-                    end
-                end
-
-            else
-                local fitsSpec, specStatus =
-                    DoesItemFitRememberedSpec(
-                        itemLink,
-                        characterName,
-                        character
-                    )
-
-                if specStatus == "unknown_spec" then
-                    if not recommendation
-                        or recommendation.name ~= characterName
-                    then
-                        table.insert(alternatives, {
-                            kind = "unknown",
-                            name = characterName,
-                        })
-                    end
-
-                elseif fitsSpec == true then
-                    local config =
-                        GetCurrentWeaponConfiguration(character)
-
-                    if WeaponMatchesCurrentConfiguration(
-                                    config,
-                                    itemLink,
-                                    characterName,
-                                    character
-                                ) then
-                        local comparisonSlots =
-                            GetWeaponComparisonSlots(
-                                            config,
-                                            itemLink,
-                                            characterName,
-                                            character
-                                        )
-
-                        if comparisonSlots then
-                            local upgrade, status, usesAverage, isOverAverage =
+                            level = level,
+                        }
+                    elseif fits == true then
+                        if CanEquipNow(level) then
+                            local upgrade, status, usesAverage, isOverAverage, setupIncomplete =
                                 WGRGetIncomingWeaponUpgradeForMode(
                                     characterName,
                                     character,
@@ -663,67 +285,69 @@ function BuildWeaponAlternatives(
                                 )
 
                             if status == "unknown" then
-                                if not recommendation
-                                    or recommendation.name ~= characterName
-                                then
-                                    table.insert(alternatives, {
-                                        kind = "unknown",
-                                        name = characterName,
-                                    })
-                                end
-                            else
+                                option = {
+                                    kind = "unknown",
+                                    name = characterName,
+                                }
+                            elseif status == "known" then
                                 upgrade = tonumber(upgrade) or 0
-
-                                if upgrade > 0
-                                    and (
-                                        not recommendation
-                                        or recommendation.name ~= characterName
-                                    )
-                                then
-                                    local threshold =
-                            WGRGetCharacterThreshold(
-                                characterName
-                            )
-
-                        table.insert(alternatives, {
-                            kind = "upgrade",
-                            name = characterName,
-                            upgrade = upgrade,
-                            weaponAverage = usesAverage == true,
-                                                    weaponOverAverage = isOverAverage == true,
-                            threshold = threshold,
-                            meetsThreshold =
-                                upgrade >= threshold,
-                        })
+                                if upgrade > 0 then
+                                    local threshold = WGRGetCharacterThreshold(characterName)
+                                    option = { kind = "upgrade", name = characterName, upgrade = upgrade,
+                                        weaponAverage = usesAverage == true, weaponOverAverage = isOverAverage == true,
+                                        threshold = threshold, meetsThreshold = upgrade >= threshold }
+                                elseif setupIncomplete == true then
+                                    option = { kind = "upgrade", name = characterName, upgrade = 0,
+                                        setupIncomplete = true, threshold = WGRGetCharacterThreshold(characterName),
+                                        meetsThreshold = false }
                                 end
                             end
+                        else
+                            option = {
+                                kind = "holder",
+                                name = characterName,
+                                level = level,
+                                requiredLevel = itemMinLevel,
+                            }
                         end
                     end
+                else
+                    local couldUse = CouldItemFitUnknownCharacter(
+                        itemLink,
+                        characterName,
+                        character
+                    )
+                    if couldUse == true then
+                        option = {
+                            kind = CanEquipNow(level) and "unknown" or "unresolved",
+                            name = characterName,
+                            level = level,
+                        }
+                    end
+                end
+
+                if option then
+                    option.daggerSpecialist = specialist == true
+                    if option.daggerSpecialist then
+                        specialistExists = true
+                    end
+                    table.insert(alternatives, option)
                 end
             end
         end
     end
 
-    if not isLevelingItem then
-        if isDagger then
-            for _, option in ipairs(specialistHolders) do
-                table.insert(alternatives, option)
+    if isDaggerOverride and specialistExists then
+        local filtered = {}
+        for _, option in ipairs(alternatives) do
+            if option.daggerSpecialist == true then
+                filtered[#filtered + 1] = option
             end
         end
-
-        for _, option in ipairs(flexibleHolders) do
-            table.insert(alternatives, option)
-        end
-
-        for _, option in ipairs(unresolved) do
-            table.insert(alternatives, option)
-        end
+        alternatives = filtered
     end
 
-    return WGRFinalizeAlternatives(
-        alternatives,
-        recommendation
-    )
+    return WGRFinalizeAlternatives(alternatives, recommendation)
 end
 
 -- ============================================================
@@ -735,228 +359,115 @@ function BuildOffhandRecommendation(
     newItemLevel,
     itemMinLevel
 )
-    local isLevelingItem =
-        itemMinLevel
-        and itemMinLevel > 0
-        and itemMinLevel < WGR_MAX_LEVEL
-
-    local firstAnyUpgrade = nil
     local firstThresholdUpgrade = nil
-    local firstLevelingUpgrade = nil
-    local firstLevelingThresholdUpgrade = nil
-    local firstLevelingCurrentUpgrade = nil
-    local firstLevelingCurrentThresholdUpgrade = nil
+    local firstAnyUpgrade = nil
     local holder = nil
     local unresolvedHolder = nil
     local unknownIndexes = {}
 
+    local function CanEquipNow(level)
+        return not itemMinLevel
+            or itemMinLevel <= 0
+            or level >= itemMinLevel
+    end
+
     for priorityIndex, characterName
         in ipairs(GetActiveRoutingPriority())
     do
-        local character =
-            FindCharacterByName(characterName)
+        local character = FindCharacterByName(characterName)
 
         if character then
-            local level =
-                DataStore:GetCharacterLevel(character) or 0
+            local level = WGRGetCharacterLevel(character)
+            local specIDs = WGRGetRoutingSpecIDs(characterName, character)
 
-            if level < WGR_MAX_LEVEL then
-                if isLevelingItem then
-                    if true then
-                        local remembered =
-                            GetRememberedSpec(characterName)
+            if #specIDs > 0 then
+                local fits, fitStatus =
+                    FutureHolderOffhandMatchesSpec(characterName, itemLink)
 
-                        if remembered and remembered.specID then
-                            local configFits =
-                                FutureHolderOffhandMatchesSpec(
-                                    characterName,
-                                    itemLink
-                                )
-
-                            if configFits == true then
-                                local config =
-                                    GetCurrentWeaponConfiguration(
-                                        character
-                                    )
-
-                                if config
-                                    == "ONE_HAND_PLUS_OFFHAND"
-                                then
-                                    local upgrade, status, usesAverage, isOverAverage =
-                                        WGRGetIncomingWeaponUpgradeForMode(
-                                            characterName,
-                                            character,
-                                            itemLink,
-                                            newItemLevel,
-                                            "OFFHAND"
-                                        )
-
-                                    if status ~= "unknown" then
-                                        upgrade = tonumber(upgrade) or 0
-
-                                        if upgrade > 0 then
-                                            local result = {
-                                                kind =
-                                                    level >= itemMinLevel
-                                                    and "upgrade"
-                                                    or "future_upgrade",
-                                                requiredLevel = itemMinLevel,
-                                                name = characterName,
-                                                upgrade = upgrade,
-                                                weaponAverage = usesAverage == true,
-                                                    weaponOverAverage = isOverAverage == true,
-                                                priorityIndex = priorityIndex,
-                                    threshold =
-                                        WGRGetCharacterThreshold(characterName),
-                                    meetsThreshold =
-                                                    upgrade
-                                                    >= WGRGetCharacterThreshold(characterName),
-                                            }
-
-                                            if not
-                                                firstLevelingUpgrade
-                                            then
-                                                firstLevelingUpgrade =
-                                                    result
-                                            end
-
-                                            if result.meetsThreshold
-                                                and not
-                                                firstLevelingThresholdUpgrade
-                                            then
-                                                firstLevelingThresholdUpgrade =
-                                                    result
-                                            end
-
-                                            if result.kind == "upgrade" then
-                                                if not firstLevelingCurrentUpgrade then
-                                                    firstLevelingCurrentUpgrade = result
-                                                end
-                                                if result.meetsThreshold
-                                                    and not firstLevelingCurrentThresholdUpgrade
-                                                then
-                                                    firstLevelingCurrentThresholdUpgrade = result
-                                                end
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                else
-                    local remembered =
-                        GetRememberedSpec(characterName)
-
-                    if remembered and remembered.specID then
-                        local configFits, configStatus =
-                            FutureHolderOffhandMatchesSpec(
-                                characterName,
-                                itemLink
-                            )
-
-                        if configStatus == "rule_unknown"
-                            or configStatus
-                                == "stat_rule_unknown"
-                        then
-                            unresolvedHolder = {
-                                kind = "unresolved",
-                                name = characterName,
-                                level = level,
-                                priorityIndex = priorityIndex,
-                            }
-                            break
-
-                        elseif configFits == true then
-                            holder = {
-                                kind = "holder",
-                                name = characterName,
-                                level = level,
-                                priorityIndex = priorityIndex,
-                            }
-                            break
-                        end
-                    else
-                        local couldUse =
-                            CouldItemFitUnknownCharacter(
-                                itemLink,
-                                characterName,
-                                character
-                            )
-
-                        if couldUse == true then
-                            unresolvedHolder = {
-                                kind = "unresolved",
-                                name = characterName,
-                                level = level,
-                                priorityIndex = priorityIndex,
-                            }
-                            break
-                        end
-                    end
-                end
-
-            else
-                local fitsSpec, specStatus =
-                    DoesItemFitRememberedSpec(
-                        itemLink,
-                        characterName,
-                        character
-                    )
-
-                if specStatus == "unknown_spec" then
-                    table.insert(unknownIndexes, {
-                        name = characterName,
-                        priorityIndex = priorityIndex,
-                    })
-
-                elseif fitsSpec == true then
-                    -- DoesItemFitRememberedSpec already verifies that at
-                    -- least one active routing spec/profile can use this
-                    -- off-hand. Do not require the character to already be
-                    -- wearing a 1H+off-hand setup: a valid off-hand may be
-                    -- needed to build an alternative setup from a current 2H.
-                    local upgrade, status, usesAverage, isOverAverage =
-                        WGRGetIncomingWeaponUpgradeForMode(
-                            characterName,
-                            character,
-                            itemLink,
-                            newItemLevel,
-                            "OFFHAND"
-                        )
-
-                    if status == "unknown" then
+                if fitStatus == "rule_unknown"
+                    or fitStatus == "stat_rule_unknown"
+                then
+                    if CanEquipNow(level) then
                         table.insert(unknownIndexes, {
                             name = characterName,
                             priorityIndex = priorityIndex,
                         })
-                    else
-                        upgrade = tonumber(upgrade) or 0
+                    elseif not unresolvedHolder then
+                        unresolvedHolder = {
+                            kind = "unresolved",
+                            name = characterName,
+                            level = level,
+                            priorityIndex = priorityIndex,
+                        }
+                    end
 
-                        if upgrade > 0 then
-                            local result = {
-                                kind = "upgrade",
+                elseif fits == true then
+                    if CanEquipNow(level) then
+                        -- Do not require the currently equipped setup to
+                        -- already be 1H+shield/off-hand. The shared weapon
+                        -- comparison evaluates valid complete paired setups
+                        -- for the selected routing specs.
+                        local upgrade, status, usesAverage, isOverAverage, setupIncomplete =
+                            WGRGetIncomingWeaponUpgradeForMode(
+                                characterName,
+                                character,
+                                itemLink,
+                                newItemLevel,
+                                "OFFHAND"
+                            )
+
+                        if status == "unknown" then
+                            table.insert(unknownIndexes, {
                                 name = characterName,
-                                upgrade = upgrade,
-                                weaponAverage = usesAverage == true,
-                                                    weaponOverAverage = isOverAverage == true,
                                 priorityIndex = priorityIndex,
-                                threshold =
-                                    WGRGetCharacterThreshold(characterName),
-                                meetsThreshold =
-                                    upgrade >= WGRGetCharacterThreshold(characterName),
-                            }
+                            })
+                        elseif status == "known" then
+                            upgrade = tonumber(upgrade) or 0
 
-                            if not firstAnyUpgrade then
-                                firstAnyUpgrade = result
-                            end
-
-                            if result.meetsThreshold
-                                and not firstThresholdUpgrade
-                            then
-                                firstThresholdUpgrade = result
+                            if upgrade > 0 then
+                                local threshold = WGRGetCharacterThreshold(characterName)
+                                local result = { kind = "upgrade", name = characterName, upgrade = upgrade,
+                                    weaponAverage = usesAverage == true, weaponOverAverage = isOverAverage == true,
+                                    priorityIndex = priorityIndex, threshold = threshold, meetsThreshold = upgrade >= threshold }
+                                if not firstAnyUpgrade then firstAnyUpgrade = result end
+                                if result.meetsThreshold and not firstThresholdUpgrade then firstThresholdUpgrade = result end
+                            elseif setupIncomplete == true then
+                                local result = { kind = "upgrade", name = characterName, upgrade = 0,
+                                    setupIncomplete = true, priorityIndex = priorityIndex,
+                                    threshold = WGRGetCharacterThreshold(characterName), meetsThreshold = false }
+                                if not firstAnyUpgrade then firstAnyUpgrade = result end
                             end
                         end
+                    elseif not holder then
+                        holder = {
+                            kind = "holder",
+                            name = characterName,
+                            level = level,
+                            requiredLevel = itemMinLevel,
+                            priorityIndex = priorityIndex,
+                        }
+                    end
+                end
+            else
+                local couldUse = CouldItemFitUnknownCharacter(
+                    itemLink,
+                    characterName,
+                    character
+                )
+
+                if couldUse == true then
+                    if CanEquipNow(level) then
+                        table.insert(unknownIndexes, {
+                            name = characterName,
+                            priorityIndex = priorityIndex,
+                        })
+                    elseif not unresolvedHolder then
+                        unresolvedHolder = {
+                            kind = "unresolved",
+                            name = characterName,
+                            level = level,
+                            priorityIndex = priorityIndex,
+                        }
                     end
                 end
             end
@@ -966,22 +477,11 @@ function BuildOffhandRecommendation(
     local recommendation =
         firstThresholdUpgrade
         or firstAnyUpgrade
-
-    if not recommendation
-        and isLevelingItem
-    then
-        recommendation =
-            firstLevelingCurrentThresholdUpgrade
-            or firstLevelingCurrentUpgrade
-            or firstLevelingThresholdUpgrade
-            or firstLevelingUpgrade
-    end
+        or holder
 
     for _, unknown in ipairs(unknownIndexes) do
         if recommendation then
-            if unknown.priorityIndex
-                < recommendation.priorityIndex
-            then
+            if unknown.priorityIndex < recommendation.priorityIndex then
                 return {
                     kind = "unknown",
                     name = unknown.name,
@@ -997,14 +497,6 @@ function BuildOffhandRecommendation(
 
     if recommendation then
         return recommendation
-    end
-
-    if isLevelingItem then
-        return { kind = "no_current_upgrade" }
-    end
-
-    if holder then
-        return holder
     end
 
     if unresolvedHolder then
@@ -1026,179 +518,103 @@ function BuildOffhandAlternatives(
 )
     local alternatives = {}
 
-    local isLevelingItem =
-        itemMinLevel
-        and itemMinLevel > 0
-        and itemMinLevel < WGR_MAX_LEVEL
+    local function CanEquipNow(level)
+        return not itemMinLevel
+            or itemMinLevel <= 0
+            or level >= itemMinLevel
+    end
 
     for _, characterName in ipairs(GetActiveRoutingPriority()) do
-        local character =
-            FindCharacterByName(characterName)
+        if not recommendation
+            or recommendation.name ~= characterName
+        then
+            local character = FindCharacterByName(characterName)
 
-        if character then
-            local level =
-                DataStore:GetCharacterLevel(character) or 0
+            if character then
+                local level = WGRGetCharacterLevel(character)
+                local specIDs = WGRGetRoutingSpecIDs(characterName, character)
 
-            if level < WGR_MAX_LEVEL then
-                if isLevelingItem then
-                    if true
-                        and (
-                            not recommendation
-                            or recommendation.name ~= characterName
-                        )
+                if #specIDs > 0 then
+                    local fits, fitStatus =
+                        FutureHolderOffhandMatchesSpec(characterName, itemLink)
+
+                    if fitStatus == "rule_unknown"
+                        or fitStatus == "stat_rule_unknown"
                     then
-                        local remembered =
-                            GetRememberedSpec(characterName)
-
-                        if remembered and remembered.specID then
-                            local configFits =
-                                FutureHolderOffhandMatchesSpec(
+                        table.insert(alternatives, {
+                            kind = "unresolved",
+                            name = characterName,
+                            level = level,
+                        })
+                    elseif fits == true then
+                        if CanEquipNow(level) then
+                            local upgrade, status, usesAverage, isOverAverage, setupIncomplete =
+                                WGRGetIncomingWeaponUpgradeForMode(
                                     characterName,
-                                    itemLink
+                                    character,
+                                    itemLink,
+                                    newItemLevel,
+                                    "OFFHAND"
                                 )
 
-                            if configFits == true
-                                and GetCurrentWeaponConfiguration(
-                                    character
-                                ) == "ONE_HAND_PLUS_OFFHAND"
-                            then
-                                local upgrade, status, usesAverage, isOverAverage =
-                                    WGRGetIncomingWeaponUpgradeForMode(
-                                        characterName,
-                                        character,
-                                        itemLink,
-                                        newItemLevel,
-                                        "OFFHAND"
-                                    )
-
-                                if status ~= "unknown" then
-                                    upgrade = tonumber(upgrade) or 0
-
-                                    if upgrade > 0 then
-                                        local threshold =
-                            WGRGetCharacterThreshold(
-                                characterName
-                            )
-
-                        table.insert(alternatives, {
-                            kind = "upgrade",
-                            name = characterName,
-                            upgrade = upgrade,
-                            weaponAverage = usesAverage == true,
-                                                    weaponOverAverage = isOverAverage == true,
-                            threshold = threshold,
-                            meetsThreshold =
-                                upgrade >= threshold,
-                        })
-                                    end
+                            if status == "unknown" then
+                                table.insert(alternatives, {
+                                    kind = "unknown",
+                                    name = characterName,
+                                })
+                            elseif status == "known" then
+                                upgrade = tonumber(upgrade) or 0
+                                if upgrade > 0 then
+                                    local threshold =
+                                        WGRGetCharacterThreshold(characterName)
+                                    table.insert(alternatives, {
+                                        kind = "upgrade",
+                                        name = characterName,
+                                        upgrade = upgrade,
+                                        weaponAverage = usesAverage == true,
+                                        weaponOverAverage = isOverAverage == true,
+                                        threshold = threshold,
+                                        meetsThreshold = upgrade >= threshold,
+                                    })
+                                elseif setupIncomplete == true then
+                                    table.insert(alternatives, {
+                                        kind = "upgrade",
+                                        name = characterName,
+                                        upgrade = 0,
+                                        setupIncomplete = true,
+                                        threshold = WGRGetCharacterThreshold(characterName),
+                                        meetsThreshold = false,
+                                    })
                                 end
                             end
+                        else
+                            table.insert(alternatives, {
+                                kind = "holder",
+                                name = characterName,
+                                level = level,
+                                requiredLevel = itemMinLevel,
+                            })
                         end
                     end
                 else
-                    local remembered =
-                        GetRememberedSpec(characterName)
-
-                    if remembered and remembered.specID then
-                        local configFits, configStatus =
-                            FutureHolderOffhandMatchesSpec(
-                                characterName,
-                                itemLink
-                            )
-
-                        if configStatus == "rule_unknown"
-                            or configStatus
-                                == "stat_rule_unknown"
-                        then
-                            if not recommendation
-                                or recommendation.name ~= characterName
-                            then
-                                table.insert(alternatives, {
-                                    kind = "unresolved",
-                                    name = characterName,
-                                    level = level,
-                                })
-                            end
-
-                        elseif configFits == true then
-                            if not recommendation
-                                or recommendation.name ~= characterName
-                            then
-                                table.insert(alternatives, {
-                                    kind = "holder",
-                                    name = characterName,
-                                    level = level,
-                                })
-                            end
-                        end
-                    end
-
-                end
-            else
-                local fitsSpec, specStatus =
-                    DoesItemFitRememberedSpec(
+                    local couldUse = CouldItemFitUnknownCharacter(
                         itemLink,
                         characterName,
                         character
                     )
-
-                if specStatus == "unknown_spec" then
-                    if not recommendation
-                        or recommendation.name ~= characterName
-                    then
+                    if couldUse == true then
                         table.insert(alternatives, {
-                            kind = "unknown",
+                            kind = CanEquipNow(level) and "unknown" or "unresolved",
                             name = characterName,
+                            level = level,
                         })
-                    end
-                elseif fitsSpec == true then
-                    -- Match the primary recommendation path: valid off-hands
-                    -- remain useful alternative-setup components even if the
-                    -- character currently has a 2H equipped.
-                    local upgrade, status, usesAverage, isOverAverage =
-                        WGRGetIncomingWeaponUpgradeForMode(
-                            characterName,
-                            character,
-                            itemLink,
-                            newItemLevel,
-                            "OFFHAND"
-                        )
-
-                    if status ~= "unknown" then
-                        upgrade = tonumber(upgrade) or 0
-
-                        if upgrade > 0
-                            and (
-                                not recommendation
-                                or recommendation.name ~= characterName
-                            )
-                        then
-                            local threshold =
-                                WGRGetCharacterThreshold(
-                                    characterName
-                                )
-
-                            table.insert(alternatives, {
-                                kind = "upgrade",
-                                name = characterName,
-                                upgrade = upgrade,
-                                weaponAverage = usesAverage == true,
-                                                    weaponOverAverage = isOverAverage == true,
-                                threshold = threshold,
-                                meetsThreshold =
-                                    upgrade >= threshold,
-                            })
-                        end
                     end
                 end
             end
         end
     end
 
-    return WGRFinalizeAlternatives(
-        alternatives,
-        recommendation
-    )
+    return WGRFinalizeAlternatives(alternatives, recommendation)
 end
 
 -- ============================================================
@@ -1545,13 +961,12 @@ function EvaluateWeapon(
         )
 
     elseif result.kind == "upgrade" then
-        print(string.format(
-            "|cff00ff00Recommended: %s +%d ilvl|r",
-            result.name,
-            result.upgrade
-        ))
-
-        if not result.meetsThreshold then
+        if result.setupIncomplete == true then
+            print(string.format("|cff00ff00Recommended: %s (paired setup incomplete)|r", result.name))
+        else
+            print(string.format("|cff00ff00Recommended: %s +%d ilvl|r", result.name, result.upgrade))
+        end
+        if not result.meetsThreshold and result.setupIncomplete ~= true then
             print(string.format(
                 "|cffffff00No character met their upgrade threshold; using highest-priority upgrade.|r"
             ))
@@ -1608,13 +1023,12 @@ function EvaluateOffhand(
     ))
 
     if result.kind == "upgrade" then
-        print(string.format(
-            "|cff00ff00Recommended: %s +%d ilvl|r",
-            result.name,
-            result.upgrade
-        ))
-
-        if not result.meetsThreshold then
+        if result.setupIncomplete == true then
+            print(string.format("|cff00ff00Recommended: %s (paired setup incomplete)|r", result.name))
+        else
+            print(string.format("|cff00ff00Recommended: %s +%d ilvl|r", result.name, result.upgrade))
+        end
+        if not result.meetsThreshold and result.setupIncomplete ~= true then
             print(string.format(
                 "|cffffff00No character met their upgrade threshold; using highest-priority upgrade.|r"
             ))

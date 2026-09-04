@@ -1047,6 +1047,79 @@ function GetCharacterClassID(
     return nil
 end
 
+function WGRGetDataStoreCurrentSpecID(
+    characterName,
+    character
+)
+    local evalCache = WGRGetRoutingEvaluationCache and WGRGetRoutingEvaluationCache() or nil
+    local specCacheKey = characterName and string.lower(characterName) or nil
+    if evalCache and specCacheKey and evalCache.specs[specCacheKey] ~= nil then
+        local cached = evalCache.specs[specCacheKey]
+        return cached ~= false and cached or nil
+    end
+    if not DataStore
+        or not DataStore.GetActiveSpecInfo
+    then
+        return nil
+    end
+
+    character =
+        character
+        or FindCharacterByName(
+            characterName
+        )
+
+    if not character then
+        return nil
+    end
+
+    local classID =
+        GetCharacterClassID(
+            characterName,
+            character
+        )
+
+    local classSpecs =
+        classID
+        and WGRClassSpecIDs
+        and WGRClassSpecIDs[classID]
+        or nil
+
+    if not classSpecs then
+        return nil
+    end
+
+    local ok,
+          specName,
+          specIndex =
+        pcall(
+            DataStore.GetActiveSpecInfo,
+            DataStore,
+            character
+        )
+
+    if not ok
+        or type(specIndex) ~= "number"
+        or specIndex <= 0
+    then
+        return nil
+    end
+
+    local specID =
+        classSpecs[specIndex]
+
+    if not specID then
+        return nil
+    end
+
+    -- DataStore stores the last specialization it observed for the
+    -- character. Keep this as a read-through fallback only: do not write
+    -- it into WBGR's remembered-spec SavedVariables. The live WBGR value
+    -- will automatically take precedence once the character is observed.
+    if evalCache and specCacheKey then evalCache.specs[specCacheKey] = specID or false end
+    return specID, specName
+end
+
 function WGRGetRoutingSpecIDs(
     characterName,
     character
@@ -1063,6 +1136,18 @@ function WGRGetRoutingSpecIDs(
         then
             return {
                 remembered.specID,
+            }
+        end
+
+        local dataStoreSpecID =
+            WGRGetDataStoreCurrentSpecID(
+                characterName,
+                character
+            )
+
+        if dataStoreSpecID then
+            return {
+                dataStoreSpecID,
             }
         end
 

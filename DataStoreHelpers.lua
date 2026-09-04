@@ -8,6 +8,45 @@
 local WGRDataStoreCharacterIndex =
     nil
 
+-- Scoped routing-evaluation cache. Expensive held-gear/bank scans evaluate
+-- many items against the same roster. Cache DataStore reads only for the
+-- duration of one consolidated scan so correctness is preserved while
+-- avoiding repeated character/slot/item lookups.
+local WGRRoutingEvaluationCache = nil
+local WGRRoutingEvaluationCacheDepth = 0
+
+function WGRBeginRoutingEvaluationCache()
+    WGRRoutingEvaluationCacheDepth = WGRRoutingEvaluationCacheDepth + 1
+    if WGRRoutingEvaluationCacheDepth == 1 then
+        WGRRoutingEvaluationCache = { levels = {}, stored = {}, itemLevels = {}, specs = {} }
+    end
+end
+
+function WGREndRoutingEvaluationCache()
+    if WGRRoutingEvaluationCacheDepth <= 0 then return end
+    WGRRoutingEvaluationCacheDepth = WGRRoutingEvaluationCacheDepth - 1
+    if WGRRoutingEvaluationCacheDepth == 0 then
+        WGRRoutingEvaluationCache = nil
+    end
+end
+
+function WGRGetRoutingEvaluationCache()
+    return WGRRoutingEvaluationCache
+end
+
+function WGRGetCharacterLevel(character)
+    if not character then return 0 end
+    local cache = WGRRoutingEvaluationCache
+    if cache then
+        local v = cache.levels[character]
+        if v ~= nil then return v end
+        v = (DataStore and DataStore.GetCharacterLevel and DataStore:GetCharacterLevel(character)) or 0
+        cache.levels[character] = v
+        return v
+    end
+    return (DataStore and DataStore.GetCharacterLevel and DataStore:GetCharacterLevel(character)) or 0
+end
+
 local function WGRBuildDataStoreCharacterIndex()
     if not DataStore
         or not DataStore.GetCharacters
@@ -91,20 +130,28 @@ function FindCharacterByName(searchName)
 end
 
 function GetStoredItem(character, slotID)
-    if not character or not slotID then
-        return nil
+    if not character or not slotID then return nil end
+    local cache = WGRRoutingEvaluationCache
+    if cache then
+        local byChar = cache.stored[character]
+        if not byChar then byChar = {}; cache.stored[character] = byChar end
+        if byChar[slotID] ~= nil then
+            return byChar[slotID] ~= false and byChar[slotID] or nil
+        end
+        local item = DataStore.GetInventoryItem and DataStore:GetInventoryItem(character, slotID) or nil
+        byChar[slotID] = item or false
+        return item
     end
-
-    if DataStore.GetInventoryItem then
-        return DataStore:GetInventoryItem(character, slotID)
-    end
-
+    if DataStore.GetInventoryItem then return DataStore:GetInventoryItem(character, slotID) end
     return nil
 end
 
 function GetItemLevel(item)
-    if not item then
-        return nil
+    if not item then return nil end
+    local cache = WGRRoutingEvaluationCache
+    local cacheKey = tostring(item)
+    if cache and cache.itemLevels[cacheKey] ~= nil then
+        return cache.itemLevels[cacheKey] ~= false and cache.itemLevels[cacheKey] or nil
     end
 
     -- DataStore inventory values represent stored equipment links.
@@ -122,6 +169,7 @@ function GetItemLevel(item)
     if baseItemLevel
         and baseItemLevel > 0
     then
+        if cache then cache.itemLevels[cacheKey] = baseItemLevel end
         return baseItemLevel
     end
 
@@ -132,9 +180,11 @@ function GetItemLevel(item)
     if fallbackLevel
         and fallbackLevel > 0
     then
+        if cache then cache.itemLevels[cacheKey] = fallbackLevel end
         return fallbackLevel
     end
 
+    if cache then cache.itemLevels[cacheKey] = false end
     return nil
 end
 

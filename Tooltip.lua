@@ -214,6 +214,12 @@ local function FormatTooltipRecommendation(result, tooltip, displayContext)
     local isHeldHere = isCurrentCharacter and not isSharedWarbandSource
 
     if result.kind == "upgrade" then
+        if result.setupIncomplete == true then
+            if isCurrentCharacter then
+                return "POTENTIAL UPGRADE  (paired setup incomplete)", 1.00, 0.35, 0.82
+            end
+            return string.format("SEND TO: %s  (paired setup incomplete)", result.name), 0.20, 1.00, 0.20
+        end
         local averageSuffix =
             result.weaponAverage
             and " - weap avg"
@@ -439,6 +445,9 @@ tooltip:AddLine(" ")
 
             for _, option in ipairs(alternatives) do
                 if option.kind == "upgrade" then
+                    if option.setupIncomplete == true then
+                        tooltip:AddLine(string.format("%s  (Paired setup incomplete)", option.name), 1.00, 0.82, 0.20)
+                    else
                     local belowThreshold =
                         option.meetsThreshold == false
 
@@ -454,6 +463,7 @@ tooltip:AddLine(" ")
                         belowThreshold and 0.82 or 1.00,
                         0.20
                     )
+                    end
                 elseif option.kind == "holder" then
                     tooltip:AddLine(
                         string.format(
@@ -809,7 +819,111 @@ end
 -- ============================================================
 
 local cleanupGeneration = 0
-local cleanupRefreshPending = false
+local cleanupRefreshSerial = 0
+
+-- BAG_UPDATE tells the core which concrete container changed. Keep the same
+-- information for Bagnon overlays so ordinary item moves only re-evaluate
+-- buttons belonging to the affected containers instead of rebuilding every
+-- visible Bagnon button. Full refreshes are still used for routing/config UI
+-- changes, startup, and bag visibility changes.
+local cleanupDirtyBags = {}
+
+-- Full overlay passes build a lightweight index of visible Bagnon buttons by
+-- Blizzard bag/container ID. Incremental BAG_UPDATE refreshes can then jump
+-- directly to the affected container buttons instead of walking the entire
+-- Bagnon global button namespace again. The index is runtime-only and is
+-- conservatively rebuilt on every full overlay refresh.
+local bagnonButtonsByBag = {}
+local bagnonButtonsByBagSlot = {}
+local bagnonOverlaySlotSignatures = {}
+
+local function WGRIndexBagnonButton(button)
+    if not button then return end
+
+    local bagID = tonumber(button.bag)
+    local slotID = button.GetID and tonumber(button:GetID()) or nil
+    if bagID == nil then return end
+
+    local list = bagnonButtonsByBag[bagID]
+    if not list then
+        list = {}
+        bagnonButtonsByBag[bagID] = list
+    end
+
+    list[#list + 1] = button
+
+    if slotID and slotID > 0 then
+        local bySlot = bagnonButtonsByBagSlot[bagID]
+        if not bySlot then
+            bySlot = {}
+            bagnonButtonsByBagSlot[bagID] = bySlot
+        end
+
+        local slotButtons = bySlot[slotID]
+        if not slotButtons then
+            slotButtons = {}
+            bySlot[slotID] = slotButtons
+        end
+
+        slotButtons[#slotButtons + 1] = button
+    end
+end
+
+local function WGRReadOverlayBagSignatures(bagID)
+    local signatures = {}
+    if not C_Container
+        or not C_Container.GetContainerNumSlots
+        or not C_Container.GetContainerItemLink
+    then
+        return signatures
+    end
+
+    local slots = C_Container.GetContainerNumSlots(bagID) or 0
+    for slotID = 1, slots do
+        signatures[slotID] = C_Container.GetContainerItemLink(bagID, slotID) or false
+    end
+    return signatures
+end
+
+local function WGRGetChangedOverlaySlots(bagID)
+    local previous = bagnonOverlaySlotSignatures[bagID]
+    local current = WGRReadOverlayBagSignatures(bagID)
+    bagnonOverlaySlotSignatures[bagID] = current
+
+    if type(previous) ~= "table" then
+        return nil, true
+    end
+
+    local changed = {}
+    local maxSlot = 0
+    for slotID in pairs(previous) do
+        if slotID > maxSlot then maxSlot = slotID end
+    end
+    for slotID in pairs(current) do
+        if slotID > maxSlot then maxSlot = slotID end
+    end
+
+    for slotID = 1, maxSlot do
+        if previous[slotID] ~= current[slotID] then
+            changed[slotID] = true
+        end
+    end
+
+    return changed, false
+end
+
+function WGRMarkBagnonOverlayBagDirty(bagID)
+    bagID = tonumber(bagID)
+    if bagID ~= nil then
+        cleanupDirtyBags[bagID] = true
+    end
+end
+
+local function WGRTakeBagnonOverlayDirtyBags()
+    local dirty = cleanupDirtyBags
+    cleanupDirtyBags = {}
+    return dirty
+end
 
 function WGRBuildLoadedItemRecommendation(
     itemLink
@@ -3346,13 +3460,19 @@ local function WGRHeldGearAddEntry(
 end
 
 local function WGRHeldGearScanBagIDs(
-    bagIDs
+    bagIDs,
+    perfLabel
 )
     local result = {
         total = 0,
         entries = {},
         scanned = time(),
     }
+
+    local perfStart = WGRPerfNow and WGRPerfNow() or 0
+    local routingMS = 0
+    local transferableCount = 0
+    local slotCount = 0
 
     if not C_Container
         or not C_Container.GetContainerNumSlots
@@ -3373,6 +3493,8 @@ local function WGRHeldGearScanBagIDs(
             or 0
 
         for slotID = 1, slots do
+            slotCount = slotCount + 1
+
             local itemLink =
                 C_Container.GetContainerItemLink(
                     bagID,
@@ -3386,12 +3508,18 @@ local function WGRHeldGearScanBagIDs(
                     itemLink
                 )
             then
+                transferableCount = transferableCount + 1
+
+                local routeStart = WGRPerfNow and WGRPerfNow() or 0
                 local recommendation =
                     WGRBuildLoadedItemRecommendation
                     and WGRBuildLoadedItemRecommendation(
                         itemLink
                     )
                     or nil
+                if routeStart > 0 and WGRPerfNow then
+                    routingMS = routingMS + (WGRPerfNow() - routeStart)
+                end
 
                 local isDispose =
                     recommendation
@@ -3419,6 +3547,26 @@ local function WGRHeldGearScanBagIDs(
                 end
             end
         end
+    end
+
+    if perfStart > 0 and WGRPerfNow and WGRPerfRecord then
+        local elapsed = WGRPerfNow() - perfStart
+        local label = perfLabel or "held_scan"
+        WGRPerfRecord(
+            label,
+            elapsed,
+            string.format(
+                "slots=%d transferable=%d routing=%.1fms",
+                slotCount,
+                transferableCount,
+                routingMS
+            )
+        )
+        WGRPerfRecord(
+            label .. "_routing",
+            routingMS,
+            string.format("items=%d", transferableCount)
+        )
     end
 
     return result
@@ -3475,8 +3623,11 @@ local function WGRHeldGearPersonalBankIDs()
 end
 
 function WGRRefreshHeldGearSnapshot(
-    includePersonalBank
+    includePersonalBank,
+    scanBags,
+    scanPersonalBank
 )
+    local perfStart = WGRPerfNow and WGRPerfNow() or 0
     InitializeDatabase()
 
     local characterName =
@@ -3514,12 +3665,23 @@ function WGRRefreshHeldGearSnapshot(
     snapshot.character =
         characterName
 
-    snapshot.bags =
-        WGRHeldGearScanBagIDs(
-            WGRHeldGearBagIDs()
-        )
+    if scanBags == nil then
+        scanBags = true
+    end
 
-    if includePersonalBank then
+    if scanPersonalBank == nil then
+        scanPersonalBank = includePersonalBank and true or false
+    end
+
+    if scanBags then
+        snapshot.bags =
+            WGRHeldGearScanBagIDs(
+                WGRHeldGearBagIDs(),
+                "held_bags_scan"
+            )
+    end
+
+    if includePersonalBank and scanPersonalBank then
         local bankIDs =
             WGRHeldGearPersonalBankIDs()
 
@@ -3549,7 +3711,8 @@ function WGRRefreshHeldGearSnapshot(
         if hasReadableBank then
             snapshot.bank =
                 WGRHeldGearScanBagIDs(
-                    bankIDs
+                    bankIDs,
+                    "held_bank_scan"
                 )
         end
     end
@@ -3561,6 +3724,17 @@ function WGRRefreshHeldGearSnapshot(
         key
     ] =
         snapshot
+
+    if perfStart > 0 and WGRPerfNow and WGRPerfRecord then
+        WGRPerfRecord(
+            "held_snapshot_total",
+            WGRPerfNow() - perfStart,
+            (scanBags and scanPersonalBank and "bags+personal bank")
+                or (scanBags and "bags only")
+                or (scanPersonalBank and "personal bank only")
+                or "no storage scan"
+        )
+    end
 
     return snapshot
 end
@@ -3584,7 +3758,150 @@ local function WGRHeldGearWarbandBankIDs()
     return ids
 end
 
-function WGRRefreshWarbandHeldGearSnapshot()
+-- Runtime-only per-slot cache for Warband Bank tabs. This keeps the
+-- persisted snapshot format unchanged while allowing a dirty-tab refresh to
+-- reroute only slots whose item link actually changed. The cache is rebuilt
+-- conservatively on a full WBK refresh (bank open/config refresh/reload).
+local WGRWarbandSlotCache = {}
+
+local function WGRHeldGearScanWarbandTabCached(bagID)
+    local result = {
+        total = 0,
+        entries = {},
+        scanned = time(),
+    }
+
+    local perfStart = WGRPerfNow and WGRPerfNow() or 0
+    local routingMS = 0
+    local transferableCount = 0
+    local changedCount = 0
+    local routedCount = 0
+
+    if not C_Container
+        or not C_Container.GetContainerNumSlots
+        or not C_Container.GetContainerItemLink
+    then
+        return result
+    end
+
+    local oldCache = WGRWarbandSlotCache[bagID] or {}
+    local newCache = {}
+    local slots = C_Container.GetContainerNumSlots(bagID) or 0
+
+    for slotID = 1, slots do
+        local itemLink = C_Container.GetContainerItemLink(bagID, slotID)
+        local signature = itemLink or false
+        local old = oldCache[slotID]
+        local state
+
+        if old and old.signature == signature then
+            state = old
+        else
+            changedCount = changedCount + 1
+            state = { signature = signature }
+
+            if itemLink
+                and IsTransferableContainerItem(
+                    bagID,
+                    slotID,
+                    itemLink
+                )
+            then
+                state.transferable = true
+                routedCount = routedCount + 1
+
+                local routeStart = WGRPerfNow and WGRPerfNow() or 0
+                local recommendation =
+                    WGRBuildLoadedItemRecommendation
+                    and WGRBuildLoadedItemRecommendation(itemLink)
+                    or nil
+                if routeStart > 0 and WGRPerfNow then
+                    routingMS = routingMS + (WGRPerfNow() - routeStart)
+                end
+
+                local isDispose =
+                    recommendation
+                    and (
+                        recommendation.kind == "sell"
+                        or recommendation.kind == "no_current_upgrade"
+                    )
+
+                if not isDispose then
+                    local section, category, subtype =
+                        WGRHeldGearClassifyItem(itemLink)
+                    if section and category then
+                        state.included = true
+                        state.section = section
+                        state.category = category
+                        state.subtype = subtype
+                    end
+                end
+            end
+        end
+
+        newCache[slotID] = state
+
+        if state.transferable then
+            transferableCount = transferableCount + 1
+        end
+
+        if state.included then
+            WGRHeldGearAddEntry(
+                result,
+                state.section,
+                state.category,
+                state.subtype
+            )
+        end
+    end
+
+    WGRWarbandSlotCache[bagID] = newCache
+
+    if perfStart > 0 and WGRPerfNow and WGRPerfRecord then
+        WGRPerfRecord(
+            "warband_tab_scan",
+            WGRPerfNow() - perfStart,
+            string.format(
+                "slots=%d transferable=%d changed=%d routed=%d routing=%.1fms",
+                slots,
+                transferableCount,
+                changedCount,
+                routedCount,
+                routingMS
+            )
+        )
+        WGRPerfRecord(
+            "warband_tab_scan_routing",
+            routingMS,
+            string.format("items=%d", routedCount)
+        )
+    end
+
+    return result
+end
+
+local function WGRAggregateWarbandTabSnapshots(tabSnapshots)
+    local result = {
+        total = 0,
+        entries = {},
+        scanned = time(),
+    }
+
+    for _, tabSnapshot in pairs(tabSnapshots or {}) do
+        if type(tabSnapshot) == "table" then
+            result.total = result.total + (tonumber(tabSnapshot.total) or 0)
+            for key, count in pairs(tabSnapshot.entries or {}) do
+                result.entries[key] =
+                    (result.entries[key] or 0) + (tonumber(count) or 0)
+            end
+        end
+    end
+
+    return result
+end
+
+function WGRRefreshWarbandHeldGearSnapshot(dirtyBagIDs)
+    local perfStart = WGRPerfNow and WGRPerfNow() or 0
     InitializeDatabase()
     local ids = WGRHeldGearWarbandBankIDs()
     if #ids == 0 then return nil end
@@ -3598,12 +3915,83 @@ function WGRRefreshWarbandHeldGearSnapshot()
     end
     if not readable then return nil end
 
-    WarboundGearRouterDB.heldGearSnapshots["__warband_bank"] = {
-        character = "Warband Bank",
-        warband = WGRHeldGearScanBagIDs(ids),
-        updated = time(),
-    }
-    return WarboundGearRouterDB.heldGearSnapshots["__warband_bank"]
+    local snapshot =
+        WarboundGearRouterDB.heldGearSnapshots["__warband_bank"]
+        or {
+            character = "Warband Bank",
+        }
+
+    snapshot.character = "Warband Bank"
+
+    -- Per-tab snapshots let BAG_UPDATE refresh only the Warband Bank tab that
+    -- actually changed. Older saves have only the aggregate snapshot, so the
+    -- first refresh after upgrading seeds every readable tab conservatively.
+    local tabSnapshots = snapshot.warbandTabs
+    local partialRequested = type(dirtyBagIDs) == "table"
+    local canRefreshPartial = partialRequested and type(tabSnapshots) == "table"
+
+    if not canRefreshPartial then
+        -- A full refresh is authoritative and must not reuse routing results
+        -- from an earlier configuration/spec state. Seed the runtime slot
+        -- cache again from scratch.
+        WGRWarbandSlotCache = {}
+        tabSnapshots = {}
+        for _, bagID in ipairs(ids) do
+            if (C_Container.GetContainerNumSlots(bagID) or 0) > 0 then
+                tabSnapshots[bagID] =
+                    WGRHeldGearScanWarbandTabCached(bagID)
+            end
+        end
+    else
+        local validIDs = {}
+        for _, bagID in ipairs(ids) do
+            validIDs[bagID] = true
+        end
+
+        for bagID in pairs(dirtyBagIDs) do
+            bagID = tonumber(bagID)
+            if bagID
+                and validIDs[bagID]
+                and (C_Container.GetContainerNumSlots(bagID) or 0) > 0
+            then
+                tabSnapshots[bagID] =
+                    WGRHeldGearScanWarbandTabCached(bagID)
+            end
+        end
+    end
+
+    snapshot.warbandTabs = tabSnapshots
+    snapshot.warband = WGRAggregateWarbandTabSnapshots(tabSnapshots)
+    snapshot.updated = time()
+
+    WarboundGearRouterDB.heldGearSnapshots["__warband_bank"] = snapshot
+
+    if perfStart > 0 and WGRPerfNow and WGRPerfRecord then
+        local refreshedTabs = 0
+        if canRefreshPartial then
+            for bagID in pairs(dirtyBagIDs or {}) do
+                if tonumber(bagID) then
+                    refreshedTabs = refreshedTabs + 1
+                end
+            end
+        else
+            for _ in pairs(tabSnapshots) do
+                refreshedTabs = refreshedTabs + 1
+            end
+        end
+
+        WGRPerfRecord(
+            "warband_snapshot_total",
+            WGRPerfNow() - perfStart,
+            string.format(
+                "mode=%s tabs=%d",
+                canRefreshPartial and "dirty-tab" or "full",
+                refreshedTabs
+            )
+        )
+    end
+
+    return snapshot
 end
 
 function WGRGetWarbandHeldGearSummary()
@@ -3754,6 +4142,7 @@ local function RecommendationBelongsToCurrentCharacter(
     if result.kind ~= "upgrade"
         and result.kind ~= "future_upgrade"
         and result.kind ~= "holder"
+        and result.kind ~= "unknown"
     then
         return false
     end
@@ -3794,6 +4183,7 @@ local function RecommendationNeedsMove(
     if result.kind ~= "upgrade"
         and result.kind ~= "future_upgrade"
         and result.kind ~= "holder"
+        and result.kind ~= "unknown"
     then
         return false
     end
@@ -3988,7 +4378,9 @@ local function EvaluateBagnonButton(button, generation)
     )
 end
 
-function RefreshBagnonCleanupOverlays()
+function RefreshBagnonCleanupOverlays(dirtyBags)
+    local perfStart = WGRPerfNow and WGRPerfNow() or 0
+    local incremental = type(dirtyBags) == "table"
     InitializeDatabase()
 
     if WGRRoutingIsPaused() then
@@ -4003,81 +4395,150 @@ function RefreshBagnonCleanupOverlays()
         return 0, 0
     end
 
-    cleanupGeneration =
-        cleanupGeneration + 1
+    cleanupGeneration = cleanupGeneration + 1
 
-    local generation =
-        cleanupGeneration
-
+    local generation = cleanupGeneration
     local visible = 0
     local evaluated = 0
-    local misses = 0
+    local indexed = 0
 
-    -- Bagnon item buttons on this installation can have high
-    -- sequence numbers, so scan a generous but cheap global-name range.
-    for i = 1, 2500 do
-        local button =
-            _G[
-                "BagnonContainerItem"
-                .. i
-            ]
+    local function ProcessButton(button)
+        if not button or not button.IsShown or not button:IsShown() then
+            return
+        end
 
-        if button then
-            misses = 0
+        visible = visible + 1
 
-            if button.IsShown
-                and button:IsShown()
+        local bagID = button.bag
+
+        -- Clear affected/reused slots first so empty or changed buttons cannot
+        -- retain an old overlay. Unaffected bags deliberately keep their
+        -- existing overlay state during an incremental refresh.
+        HideCleanupOverlay(button)
+        HideWarbankTakeOverlay(button)
+        HideGoldEquipOverlay(button)
+        HideTiedBestOverlay(button)
+        HideDisposeOverlay(button)
+
+        if IsCurrentCharacterBagnonButton(button) then
+            local slotID = button.GetID and button:GetID()
+
+            if type(bagID) == "number"
+                and type(slotID) == "number"
+                and slotID > 0
             then
-                visible = visible + 1
-
-                -- Always clear first so reused/empty slots cannot
-                -- retain an old overlay.
-                HideCleanupOverlay(button)
-                HideWarbankTakeOverlay(button)
-                HideGoldEquipOverlay(button)
-                HideTiedBestOverlay(button)
-                HideDisposeOverlay(button)
-
-                if IsCurrentCharacterBagnonButton(
-                    button
-                ) then
-                    local bagID =
-                        button.bag
-
-                    local slotID =
-                        button.GetID
-                        and button:GetID()
-
-                    if type(bagID)
-                            == "number"
-                        and type(slotID)
-                            == "number"
-                        and slotID > 0
-                    then
-                        evaluated =
-                            evaluated + 1
-
-                        EvaluateBagnonButton(
-                            button,
-                            generation
-                        )
-                    end
-                end
-            end
-        else
-            misses = misses + 1
-
-            if i > 1000
-                and misses >= 300
-            then
-                break
+                evaluated = evaluated + 1
+                EvaluateBagnonButton(button, generation)
             end
         end
     end
 
+    if incremental and next(bagnonButtonsByBag) then
+        -- Slot-diff fast path. BAG_UPDATE identifies the dirty container; compare
+        -- that container's current slot links against the last overlay snapshot
+        -- and only re-evaluate Bagnon buttons whose exact bag+slot changed.
+        -- If a bag has not been seeded yet, conservatively refresh that bag once.
+        for bagID in pairs(dirtyBags) do
+            bagID = tonumber(bagID)
+            if bagID ~= nil then
+                local changedSlots, needsSeed = WGRGetChangedOverlaySlots(bagID)
+                local bySlot = bagnonButtonsByBagSlot[bagID]
+                local list = bagnonButtonsByBag[bagID]
+                local usedFallback = needsSeed or type(bySlot) ~= "table"
+
+                if not usedFallback and changedSlots then
+                    for slotID in pairs(changedSlots) do
+                        local slotButtons = bySlot[slotID]
+                        if slotButtons then
+                            for _, button in ipairs(slotButtons) do
+                                indexed = indexed + 1
+                                if button
+                                    and tonumber(button.bag) == bagID
+                                    and button.GetID
+                                    and tonumber(button:GetID()) == slotID
+                                then
+                                    ProcessButton(button)
+                                end
+                            end
+                        else
+                            -- Bagnon may have recycled/rebuilt frames since the
+                            -- last full index. Fall back to the dirty bag rather
+                            -- than risk leaving a stale overlay behind.
+                            usedFallback = true
+                            break
+                        end
+                    end
+                end
+
+                if usedFallback and list then
+                    for _, button in ipairs(list) do
+                        indexed = indexed + 1
+                        if button and tonumber(button.bag) == bagID then
+                            ProcessButton(button)
+                        end
+                    end
+                end
+            end
+        end
+    else
+        -- Full refresh / conservative fallback. Rebuild the runtime index while
+        -- walking Bagnon's global button namespace. Startup and bag-visibility
+        -- hooks intentionally use this path so later dirty refreshes are cheap.
+        bagnonButtonsByBag = {}
+        bagnonButtonsByBagSlot = {}
+        bagnonOverlaySlotSignatures = {}
+        local misses = 0
+
+        for i = 1, 2500 do
+            local button = _G["BagnonContainerItem" .. i]
+
+            if button then
+                misses = 0
+
+                if button.IsShown and button:IsShown() then
+                    WGRIndexBagnonButton(button)
+
+                    local bagID = button.bag
+                    local shouldEvaluate =
+                        (not incremental)
+                        or (type(bagID) == "number" and dirtyBags[bagID])
+
+                    if shouldEvaluate then
+                        ProcessButton(button)
+                    end
+                end
+            else
+                misses = misses + 1
+
+                if i > 1000 and misses >= 300 then
+                    break
+                end
+            end
+        end
+    end
+
+    if not incremental then
+        for bagID in pairs(bagnonButtonsByBag) do
+            bagnonOverlaySlotSignatures[bagID] = WGRReadOverlayBagSignatures(bagID)
+        end
+    end
+
+    if perfStart > 0 and WGRPerfNow and WGRPerfRecord then
+        WGRPerfRecord(
+            "bagnon_overlays",
+            WGRPerfNow() - perfStart,
+            string.format(
+                "visible=%d evaluated=%d mode=%s indexed=%d",
+                visible,
+                evaluated,
+                incremental and "indexed-dirty" or "full",
+                indexed
+            )
+        )
+    end
+
     return visible, evaluated
 end
-
 
 function WGRUpdateRoutingPauseButton(
     suppliedButton
@@ -4167,7 +4628,7 @@ function WGRSetRoutingPaused(
     if not quiet then
         if WarboundGearRouterDB.interface.routingPaused then
             print(
-                "|cffffff00WBGR PAUSED.|r Routing, Gear Finder, and Mail Router are disabled. Passive data collection remains active."
+                "|cffffff00WBGR PAUSED.|r Routing, Gear Finder, Mail Router, and live inventory evaluation are paused."
             )
         else
             print(
@@ -4178,18 +4639,30 @@ function WGRSetRoutingPaused(
 end
 
 
-function QueueCleanupRefresh()
-    if cleanupRefreshPending then
-        return
-    end
+function QueueCleanupRefresh(useDirtyBags)
+    cleanupRefreshSerial =
+        cleanupRefreshSerial + 1
 
-    cleanupRefreshPending = true
+    local serial =
+        cleanupRefreshSerial
 
     C_Timer.After(
-        0.12,
+        0.25,
         function()
-            cleanupRefreshPending = false
-            RefreshBagnonCleanupOverlays()
+            if serial ~= cleanupRefreshSerial then
+                return
+            end
+
+            if useDirtyBags then
+                local dirty = WGRTakeBagnonOverlayDirtyBags()
+                if next(dirty) then
+                    RefreshBagnonCleanupOverlays(dirty)
+                end
+            else
+                -- A full refresh supersedes any pending incremental state.
+                cleanupDirtyBags = {}
+                RefreshBagnonCleanupOverlays()
+            end
         end
     )
 end

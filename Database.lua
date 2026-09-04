@@ -1,3 +1,49 @@
+
+-- ============================================================
+-- TEMPORARY PERFORMANCE DIAGNOSTICS
+-- ============================================================
+
+WGRPerfStats = WGRPerfStats or {}
+
+function WGRPerfNow()
+    if type(debugprofilestop) == "function" then
+        return debugprofilestop()
+    end
+
+    return 0
+end
+
+function WGRPerfRecord(name, elapsedMS, details)
+    if not name then
+        return
+    end
+
+    local stat = WGRPerfStats[name] or {
+        count = 0,
+        total = 0,
+        max = 0,
+        last = 0,
+        details = nil,
+    }
+
+    local value = tonumber(elapsedMS) or 0
+    stat.count = stat.count + 1
+    stat.total = stat.total + value
+    stat.last = value
+    if value > (stat.max or 0) then
+        stat.max = value
+    end
+    if details ~= nil then
+        stat.details = tostring(details)
+    end
+
+    WGRPerfStats[name] = stat
+end
+
+function WGRPerfReset()
+    WGRPerfStats = {}
+end
+
 -- Database and persisted settings defaults.
 local WGR_DATABASE_SCHEMA_VERSION = 2
 
@@ -329,6 +375,12 @@ function InitializeDatabase()
 
     if WarboundGearRouterDB.mainWindow.y == nil then
         WarboundGearRouterDB.mainWindow.y = 100
+    end
+
+    -- The original 470px window remains the minimum height.  Users may
+    -- expand the main window vertically; the chosen height is remembered.
+    if WarboundGearRouterDB.mainWindow.height == nil then
+        WarboundGearRouterDB.mainWindow.height = 470
     end
 
     if not WarboundGearRouterDB.interface then

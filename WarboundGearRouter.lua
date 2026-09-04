@@ -30,6 +30,10 @@ eventFrame:RegisterEvent(
 )
 
 eventFrame:RegisterEvent(
+    "BAG_UPDATE"
+)
+
+eventFrame:RegisterEvent(
     "BAG_UPDATE_DELAYED"
 )
 
@@ -40,6 +44,183 @@ eventFrame:RegisterEvent(
 eventFrame:RegisterEvent(
     "BANKFRAME_CLOSED"
 )
+
+-- Coalesce bursts of bag/bank events into one expensive inventory refresh.
+-- BAG_UPDATE tells us which storage actually changed; BAG_UPDATE_DELAYED then
+-- performs one trailing-edge refresh for only those dirty storage groups.
+local inventoryRefreshSerial = 0
+local inventoryDirty = {
+    bags = false,
+    personalBank = false,
+    warbandBank = false,
+    warbandBagIDs = {},
+    unknown = false,
+}
+
+local function WGRClassifyBagID(bagID)
+    bagID = tonumber(bagID)
+    if bagID == nil then
+        return "unknown"
+    end
+
+    -- Backpack + equipped bag slots.
+    if bagID >= 0 and bagID <= 5 then
+        return "bags"
+    end
+
+    if Enum and Enum.BagIndex then
+        for name, enumBagID in pairs(Enum.BagIndex) do
+            if enumBagID == bagID and type(name) == "string" then
+                if name:find("AccountBankTab", 1, true)
+                    or name:find("WarbandBank", 1, true)
+                then
+                    return "warbandBank"
+                end
+
+                if name:find("CharacterBankTab", 1, true) then
+                    return "personalBank"
+                end
+            end
+        end
+    end
+
+    -- Legacy/fallback personal-bank bag IDs. Unknown IDs remain conservative.
+    if bagID >= 6 and bagID <= 11 then
+        return "personalBank"
+    end
+
+    return "unknown"
+end
+
+local function WGRMarkInventoryDirty(bagID)
+    if WGRMarkBagnonOverlayBagDirty then
+        WGRMarkBagnonOverlayBagDirty(bagID)
+    end
+
+    local group = WGRClassifyBagID(bagID)
+    if group == "bags" then
+        inventoryDirty.bags = true
+    elseif group == "personalBank" then
+        inventoryDirty.personalBank = true
+    elseif group == "warbandBank" then
+        inventoryDirty.warbandBank = true
+        local numericBagID = tonumber(bagID)
+        if numericBagID ~= nil then
+            inventoryDirty.warbandBagIDs[numericBagID] = true
+        end
+    else
+        inventoryDirty.unknown = true
+    end
+end
+
+local function WGRTakeInventoryDirtySnapshot(forceAll)
+    local dirtyWarbandBagIDs = {}
+    for bagID in pairs(inventoryDirty.warbandBagIDs) do
+        dirtyWarbandBagIDs[bagID] = true
+    end
+
+    local dirty = {
+        bags = inventoryDirty.bags,
+        personalBank = inventoryDirty.personalBank,
+        warbandBank = inventoryDirty.warbandBank,
+        warbandBagIDs = dirtyWarbandBagIDs,
+        unknown = inventoryDirty.unknown,
+    }
+
+    inventoryDirty.bags = false
+    inventoryDirty.personalBank = false
+    inventoryDirty.warbandBank = false
+    inventoryDirty.warbandBagIDs = {}
+    inventoryDirty.unknown = false
+
+    if forceAll or dirty.unknown then
+        dirty.bags = true
+        dirty.personalBank = true
+        dirty.warbandBank = true
+        dirty.warbandBagIDs = nil
+    end
+
+    -- BAG_UPDATE_DELAYED should normally follow one or more BAG_UPDATE events.
+    -- If it does not, keep the old conservative behavior rather than risk stale data.
+    if not dirty.bags
+        and not dirty.personalBank
+        and not dirty.warbandBank
+    then
+        dirty.bags = true
+        dirty.personalBank = true
+        dirty.warbandBank = true
+        dirty.warbandBagIDs = nil
+    end
+
+    return dirty
+end
+
+local function WGRScheduleInventoryRefresh(delay, forceAll)
+    inventoryRefreshSerial =
+        inventoryRefreshSerial + 1
+
+    local serial =
+        inventoryRefreshSerial
+
+    C_Timer.After(
+        delay or 0.30,
+        function()
+            if serial ~= inventoryRefreshSerial then
+                return
+            end
+
+            -- A paused WBGR should not perform routing-aware inventory scans.
+            if WGRRoutingIsPaused
+                and WGRRoutingIsPaused()
+            then
+                return
+            end
+
+            local dirty = WGRTakeInventoryDirtySnapshot(forceAll)
+            local perfStart = WGRPerfNow and WGRPerfNow() or 0
+
+            if WGRBeginRoutingEvaluationCache then WGRBeginRoutingEvaluationCache() end
+
+            if WGRRefreshHeldGearSnapshot
+                and (dirty.bags or dirty.personalBank)
+            then
+                WGRRefreshHeldGearSnapshot(
+                    dirty.personalBank,
+                    dirty.bags,
+                    dirty.personalBank
+                )
+            end
+
+            if dirty.warbandBank
+                and WGRRefreshWarbandHeldGearSnapshot
+            then
+                WGRRefreshWarbandHeldGearSnapshot(
+                    dirty.warbandBagIDs
+                )
+            end
+
+            if WGRRefreshRosterIfOpen then
+                WGRRefreshRosterIfOpen()
+            end
+
+            if WGREndRoutingEvaluationCache then WGREndRoutingEvaluationCache() end
+
+            if perfStart > 0 and WGRPerfNow and WGRPerfRecord then
+                local detail = string.format(
+                    "bags=%s personal=%s warband=%s",
+                    dirty.bags and "yes" or "no",
+                    dirty.personalBank and "yes" or "no",
+                    dirty.warbandBank and "yes" or "no"
+                )
+                WGRPerfRecord(
+                    "inventory_refresh_total",
+                    WGRPerfNow() - perfStart,
+                    detail
+                )
+            end
+        end
+    )
+end
 
 -- Forward declaration: PLAYER_ENTERING_WORLD can call this before the
 -- implementation appears later in the file.
@@ -162,58 +343,43 @@ eventFrame:SetScript(
                 RefreshBagnonCleanupOverlays
             )
 
+        elseif event == "BAG_UPDATE" then
+            WGRMarkInventoryDirty(unit)
+
         elseif event == "BAG_UPDATE_DELAYED" then
-            QueueCleanupRefresh()
-
-            C_Timer.After(
-                0.10,
-                function()
-                    if WGRRefreshHeldGearSnapshot then
-                        WGRRefreshHeldGearSnapshot(
-                            true
-                        )
-                    end
-
-                    if WGRRefreshWarbandHeldGearSnapshot then
-                        WGRRefreshWarbandHeldGearSnapshot()
-                    end
-
-                    if WGRRefreshRosterIfOpen then
-                        WGRRefreshRosterIfOpen()
-                    end
-                end
+            -- Ordinary inventory changes only need overlays for the concrete
+            -- bag IDs reported by BAG_UPDATE. Other callers still request a
+            -- full overlay rebuild when routing/configuration changes.
+            QueueCleanupRefresh(true)
+            WGRScheduleInventoryRefresh(
+                0.30
             )
 
         elseif event == "BANKFRAME_OPENED" then
             QueueCleanupRefresh()
 
-            if WGRRefreshTodoPage then
+            if (not WGRRoutingIsPaused
+                    or not WGRRoutingIsPaused())
+                and WGRRefreshTodoPage
+            then
                 WGRRefreshTodoPage()
             end
 
-            C_Timer.After(
+            -- Opening a bank can make previously unreadable storage visible,
+            -- so do one conservative full refresh here. Subsequent item moves
+            -- are storage-aware through BAG_UPDATE.
+            WGRScheduleInventoryRefresh(
                 0.35,
-                function()
-                    if WGRRefreshHeldGearSnapshot then
-                        WGRRefreshHeldGearSnapshot(
-                            true
-                        )
-                    end
-
-                    if WGRRefreshWarbandHeldGearSnapshot then
-                        WGRRefreshWarbandHeldGearSnapshot()
-                    end
-
-                    if WGRRefreshRosterIfOpen then
-                        WGRRefreshRosterIfOpen()
-                    end
-                end
+                true
             )
 
         elseif event == "BANKFRAME_CLOSED" then
             QueueCleanupRefresh()
 
-            if WGRRefreshTodoPage then
+            if (not WGRRoutingIsPaused
+                    or not WGRRoutingIsPaused())
+                and WGRRefreshTodoPage
+            then
                 WGRRefreshTodoPage()
             end
         end
