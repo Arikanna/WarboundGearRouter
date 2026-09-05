@@ -648,10 +648,12 @@ end
 
 WGRMailRefreshCurrentTodoSnapshot =
     function(
-        force
+        force,
+        allowPaused
     )
         if WGRRoutingIsPaused
             and WGRRoutingIsPaused()
+            and not allowPaused
         then
             return false
         end
@@ -1323,15 +1325,6 @@ WGRMailSetMasterPaused =
 
 WGRMailRetrieveTrackedForCurrent =
     function()
-        if WGRRoutingIsPaused
-            and WGRRoutingIsPaused()
-        then
-            print(
-                "|cffffcc00WBGR:|r WBGR is currently paused. Resume WBGR to retrieve routed mail."
-            )
-            return
-        end
-
         if not WGRMail
             or not WGRMail.mailboxOpen
         then
@@ -1730,15 +1723,6 @@ WGRMailRetrieveTrackedForCurrent =
 
 WGRMailOpenRouterManual =
     function()
-        if WGRRoutingIsPaused
-            and WGRRoutingIsPaused()
-        then
-            print(
-                "|cffffcc00WBGR:|r WBGR is currently paused. Resume WBGR to use the Mail Router."
-            )
-            return
-        end
-
         if not WGRMail
             or not WGRMail.mailboxOpen
         then
@@ -1996,19 +1980,6 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         end
 
         WGRMailQueueInboxScan()
-
-        if WGRRoutingIsPaused
-            and WGRRoutingIsPaused()
-        then
-            WGRMail.destinations = {}
-
-            local pausedFrame =
-                WGRMailCreateFrame()
-
-            WGRMailUpdateRows()
-            pausedFrame:Hide()
-            return
-        end
 
         local f=WGRMailCreateFrame()
         f:ClearAllPoints()

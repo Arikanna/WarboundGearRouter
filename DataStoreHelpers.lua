@@ -18,7 +18,7 @@ local WGRRoutingEvaluationCacheDepth = 0
 function WGRBeginRoutingEvaluationCache()
     WGRRoutingEvaluationCacheDepth = WGRRoutingEvaluationCacheDepth + 1
     if WGRRoutingEvaluationCacheDepth == 1 then
-        WGRRoutingEvaluationCache = { levels = {}, stored = {}, itemLevels = {}, specs = {} }
+        WGRRoutingEvaluationCache = { levels = {}, stored = {}, itemLevels = {}, specs = {}, ownedWeaponSetups = {} }
     end
 end
 

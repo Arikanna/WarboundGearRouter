@@ -308,6 +308,20 @@ function InitializeDatabase()
         WarboundGearRouterDB.specWeaponBaselines = {}
     end
 
+    -- Last-observed physical SOULBOUND weapon components owned by each
+    -- character. This is separate from per-spec historical baselines so
+    -- routing can combine committed pieces across specs without treating
+    -- still-transferable Warbound/BoE candidates as already owned upgrades.
+    -- v0.64ad changes this cache's semantics from "all observed weapons" to
+    -- "confirmed Soulbound weapons only", so discard older persisted entries
+    -- once rather than allowing pre-ad transferable items to raise routing.
+    if WarboundGearRouterDB.ownedWeaponComponentsSoulboundOnlyVersion ~= 1 then
+        WarboundGearRouterDB.ownedWeaponComponents = {}
+        WarboundGearRouterDB.ownedWeaponComponentsSoulboundOnlyVersion = 1
+    elseif not WarboundGearRouterDB.ownedWeaponComponents then
+        WarboundGearRouterDB.ownedWeaponComponents = {}
+    end
+
     -- Tracks specs whose incomplete/zero weapon baseline was deliberately
     -- accepted through the Custom Weapons Reset action. This suppresses the
     -- To Do initialization reminder without pretending the setup is complete.

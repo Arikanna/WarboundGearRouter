@@ -3454,6 +3454,19 @@ local function WGRGearFinderDepositRecordsToWarband(
     WGRScheduleGearFinderRefresh(
         0.20
     )
+
+    if moved > 0
+        and WGRRoutingIsPaused
+        and WGRRoutingIsPaused()
+        and WGRMailRefreshCurrentTodoSnapshot
+    then
+        C_Timer.After(
+            0.35,
+            function()
+                WGRMailRefreshCurrentTodoSnapshot(true, true)
+            end
+        )
+    end
 end
 
 local function WGRGearFinderCreateMoveButton(
@@ -6018,6 +6031,147 @@ local function WGRGearFinderRender(
         end
     end
 
+    local function RenderWrappedGroupedItems(
+        groups,
+        startY,
+        valueTextFunc
+    )
+        local startX = 8
+        local x = startX
+        local lineY = startY
+        local lineHeight = 72
+        local usedLines = 1
+        local maxX = contentWidth - 8
+        local iconSpacing = 38
+        local iconsPerLine =
+            math.max(
+                1,
+                math.floor(
+                    (maxX - startX)
+                    / iconSpacing
+                )
+            )
+
+        for _, group
+            in ipairs(groups)
+        do
+            local groupWidth =
+                math.max(
+                    44,
+                    #group.records * iconSpacing
+                )
+
+            local oversized =
+                #group.records > iconsPerLine
+
+            if oversized then
+                if x > startX then
+                    x = startX
+                    lineY = lineY - lineHeight
+                    usedLines = usedLines + 1
+                end
+            elseif x > startX
+                and x + groupWidth > maxX
+            then
+                x = startX
+                lineY = lineY - lineHeight
+                usedLines = usedLines + 1
+            end
+
+            local label =
+                content:CreateFontString(
+                    nil,
+                    "OVERLAY",
+                    "GameFontHighlightSmall"
+                )
+
+            label:SetPoint(
+                "TOPLEFT",
+                content,
+                "TOPLEFT",
+                x,
+                lineY
+            )
+
+            label:SetTextColor(
+                0.65,
+                0.65,
+                0.65
+            )
+
+            label:SetText(
+                group.label
+            )
+
+            WGRGearFinderTrackChild(
+                content,
+                label
+            )
+
+            if oversized then
+                local rowCount =
+                    math.max(
+                        1,
+                        math.ceil(
+                            #group.records
+                            / iconsPerLine
+                        )
+                    )
+
+                for itemIndex, record
+                    in ipairs(group.records)
+                do
+                    local zeroIndex = itemIndex - 1
+                    local itemColumn = zeroIndex % iconsPerLine
+                    local itemRow = math.floor(zeroIndex / iconsPerLine)
+
+                    WGRGearFinderCreateItemButton(
+                        content,
+                        record,
+                        startX + (itemColumn * iconSpacing),
+                        lineY - 14 - (itemRow * lineHeight),
+                        valueTextFunc
+                            and valueTextFunc(record)
+                            or ""
+                    )
+                end
+
+                if rowCount > 1 then
+                    lineY =
+                        lineY
+                        - ((rowCount - 1) * lineHeight)
+                    usedLines =
+                        usedLines
+                        + rowCount
+                        - 1
+                end
+
+                -- Force the next category onto a fresh line after a wrapped
+                -- oversized group instead of trying to append it to the final
+                -- icon row.
+                x = maxX
+            else
+                for itemIndex, record
+                    in ipairs(group.records)
+                do
+                    WGRGearFinderCreateItemButton(
+                        content,
+                        record,
+                        x + ((itemIndex - 1) * iconSpacing),
+                        lineY - 14,
+                        valueTextFunc
+                            and valueTextFunc(record)
+                            or ""
+                    )
+                end
+
+                x = x + groupWidth + 18
+            end
+        end
+
+        return usedLines
+    end
+
     local function RenderFullWidthSection(
         title,
         records,
@@ -6090,80 +6244,12 @@ local function WGRGearFinderRender(
                 records
             )
 
-        local startX = 8
-        local x = startX
-        local lineY = y
-        local lineHeight = 72
-        local usedLines = 1
-        local maxX = contentWidth - 8
-
-        for _, group
-            in ipairs(groups)
-        do
-            local groupWidth =
-                math.max(
-                    44,
-                    #group.records * 38
-                )
-
-            if x > startX
-                and (
-                    x
-                    + groupWidth
-                    > maxX
-                )
-            then
-                x = startX
-                lineY =
-                    lineY
-                    - lineHeight
-                usedLines =
-                    usedLines + 1
-            end
-
-            local label =
-                content:CreateFontString(
-                    nil,
-                    "OVERLAY",
-                    "GameFontHighlightSmall"
-                )
-
-            label:SetPoint(
-                "TOPLEFT",
-                content,
-                "TOPLEFT",
-                x,
-                lineY
-            )
-
-            label:SetTextColor(
-                0.65,
-                0.65,
-                0.65
-            )
-
-            label:SetText(
-                group.label
-            )
-
-            WGRGearFinderTrackChild(
-                content,
-                label
-            )
-
-            for itemIndex, record
-                in ipairs(group.records)
-            do
-                WGRGearFinderCreateItemButton(
-                    content,
-                    record,
-                    x
-                        + (
-                            (itemIndex - 1)
-                            * 38
-                        ),
-                    lineY - 14,
-                    record.upgrade
+        local usedLines =
+            RenderWrappedGroupedItems(
+                groups,
+                y,
+                function(record)
+                    return record.upgrade
                         and (
                             "+"
                             .. tostring(
@@ -6173,21 +6259,12 @@ local function WGRGearFinderRender(
                             )
                         )
                         or ""
-                )
-            end
-
-            x =
-                x
-                + groupWidth
-                + 18
-        end
+                end
+            )
 
         y =
             y
-            - (
-                usedLines
-                * lineHeight
-            )
+            - (usedLines * 72)
             - 12
     end
 
@@ -6401,102 +6478,28 @@ local function WGRGearFinderRender(
                     ]
                 )
 
-            local x = startX
-            local lineY = y - 30
-            local usedLines = 1
-
-            for _, group
-                in ipairs(groups)
-            do
-                local groupWidth =
-                    math.max(
-                        44,
-                        #group.records * 38
-                    )
-
-                if x > startX
-                    and (
-                        x
-                        + groupWidth
-                        > maxX
-                    )
-                then
-                    x = startX
-                    lineY =
-                        lineY
-                        - lineHeight
-                    usedLines =
-                        usedLines + 1
-                end
-
-                local slotLabel =
-                    content:CreateFontString(
-                        nil,
-                        "OVERLAY",
-                        "GameFontHighlightSmall"
-                    )
-
-                slotLabel:SetPoint(
-                    "TOPLEFT",
-                    content,
-                    "TOPLEFT",
-                    x,
-                    lineY
-                )
-
-                slotLabel:SetTextColor(
-                    0.65,
-                    0.65,
-                    0.65
-                )
-
-                slotLabel:SetText(
-                    group.label
-                )
-
-                WGRGearFinderTrackChild(
-                    content,
-                    slotLabel
-                )
-
-                for itemIndex, record
-                    in ipairs(group.records)
-                do
-                    WGRGearFinderCreateItemButton(
-                        content,
-                        record,
-                        x
-                            + (
-                                (itemIndex - 1)
-                                * 38
-                            ),
-                        lineY - 14,
-                        record.upgrade
-                            and (
-                                "+"
-                                .. tostring(
-                                    math.floor(
-                                        record.upgrade
-                                    )
+            local usedLines =
+                RenderWrappedGroupedItems(
+                    groups,
+                    y - 30,
+                    function(record)
+                    return record.upgrade
+                        and (
+                            "+"
+                            .. tostring(
+                                math.floor(
+                                    record.upgrade
                                 )
                             )
-                            or ""
-                    )
+                        )
+                        or ""
                 end
-
-                x =
-                    x
-                    + groupWidth
-                    + 18
-            end
+                )
 
             y =
                 y
                 - 30
-                - (
-                    usedLines
-                    * lineHeight
-                )
+                - (usedLines * 72)
                 - 18
         end
 
@@ -6548,69 +6551,12 @@ local function WGRGearFinderRender(
                 records
             )
 
-        local startX = 8
-        local x = startX
-        local lineY = y
-        local lineHeight = 72
-        local usedLines = 1
-        local maxX = contentWidth - 8
-
-        for _, group
-            in ipairs(groups)
-        do
-            local groupWidth =
-                math.max(
-                    44,
-                    #group.records * 38
-                )
-
-            if x > startX
-                and x + groupWidth > maxX
-            then
-                x = startX
-                lineY = lineY - lineHeight
-                usedLines = usedLines + 1
-            end
-
-            local label =
-                content:CreateFontString(
-                    nil,
-                    "OVERLAY",
-                    "GameFontHighlightSmall"
-                )
-
-            label:SetPoint(
-                "TOPLEFT",
-                content,
-                "TOPLEFT",
-                x,
-                lineY
-            )
-
-            label:SetTextColor(
-                0.65,
-                0.65,
-                0.65
-            )
-
-            label:SetText(
-                group.label
-            )
-
-            WGRGearFinderTrackChild(
-                content,
-                label
-            )
-
-            for itemIndex, record
-                in ipairs(group.records)
-            do
-                WGRGearFinderCreateItemButton(
-                    content,
-                    record,
-                    x + ((itemIndex - 1) * 38),
-                    lineY - 14,
-                    record.upgrade
+        local usedLines =
+            RenderWrappedGroupedItems(
+                groups,
+                y,
+                function(record)
+                    return record.upgrade
                         and (
                             "+"
                             .. tostring(
@@ -6620,15 +6566,12 @@ local function WGRGearFinderRender(
                             )
                         )
                         or ""
-                )
-            end
-
-            x = x + groupWidth + 18
-        end
+                end
+            )
 
         y =
             y
-            - (usedLines * lineHeight)
+            - (usedLines * 72)
             - 12
     end
 
@@ -6674,93 +6617,27 @@ local function WGRGearFinderRender(
                 classified.other
             )
 
-        local otherStartX = 8
-        local otherX = otherStartX
-        local otherLineY = y
-        local otherLineHeight = 72
-        local otherUsedLines = 1
-        local otherMaxX = contentWidth - 8
-
-        for _, group
-            in ipairs(otherGroups)
-        do
-        local groupWidth =
-            math.max(
-                44,
-                #group.records * 38
-            )
-
-        if otherX > otherStartX
-            and otherX + groupWidth > otherMaxX
-        then
-            otherX = otherStartX
-            otherLineY =
-                otherLineY
-                - otherLineHeight
-            otherUsedLines =
-                otherUsedLines + 1
-        end
-
-        local label =
-            content:CreateFontString(
-                nil,
-                "OVERLAY",
-                "GameFontHighlightSmall"
-            )
-
-        label:SetPoint(
-            "TOPLEFT",
-            content,
-            "TOPLEFT",
-            otherX,
-            otherLineY
-        )
-
-        label:SetTextColor(
-            0.65,
-            0.65,
-            0.65
-        )
-
-        label:SetText(
-            group.label
-        )
-
-        WGRGearFinderTrackChild(
-            content,
-            label
-        )
-
-        for itemIndex, record
-            in ipairs(group.records)
-        do
-            WGRGearFinderCreateItemButton(
-                content,
-                record,
-                otherX + ((itemIndex - 1) * 38),
-                otherLineY - 14,
-                record.upgrade
-                    and (
-                        "+"
-                        .. tostring(
-                            math.floor(
-                                record.upgrade
+        local otherUsedLines =
+            RenderWrappedGroupedItems(
+                otherGroups,
+                y,
+                function(record)
+                    return record.upgrade
+                        and (
+                            "+"
+                            .. tostring(
+                                math.floor(
+                                    record.upgrade
+                                )
                             )
                         )
-                    )
-                    or ""
+                        or ""
+                end
             )
-        end
-
-            otherX =
-                otherX
-                + groupWidth
-                + 18
-        end
 
         y =
             y
-            - (otherUsedLines * otherLineHeight)
+            - (otherUsedLines * 72)
             - 12
     end
 
@@ -6810,84 +6687,18 @@ local function WGRGearFinderRender(
                 classified.held
             )
 
-        local heldStartX = 8
-        local heldX = heldStartX
-        local heldLineY = y
-        local heldLineHeight = 72
-        local heldUsedLines = 1
-        local heldMaxX = contentWidth - 8
-
-        for _, group
-            in ipairs(heldGroups)
-        do
-            local groupWidth =
-                math.max(
-                    44,
-                    #group.records * 38
-                )
-
-            if heldX > heldStartX
-                and heldX + groupWidth > heldMaxX
-            then
-                heldX = heldStartX
-                heldLineY =
-                    heldLineY
-                    - heldLineHeight
-                heldUsedLines =
-                    heldUsedLines + 1
-            end
-
-            local label =
-                content:CreateFontString(
-                    nil,
-                    "OVERLAY",
-                    "GameFontHighlightSmall"
-                )
-
-            label:SetPoint(
-                "TOPLEFT",
-                content,
-                "TOPLEFT",
-                heldX,
-                heldLineY
+        local heldUsedLines =
+            RenderWrappedGroupedItems(
+                heldGroups,
+                y,
+                function()
+                    return ""
+                end
             )
-
-            label:SetTextColor(
-                0.65,
-                0.65,
-                0.65
-            )
-
-            label:SetText(
-                group.label
-            )
-
-            WGRGearFinderTrackChild(
-                content,
-                label
-            )
-
-            for itemIndex, record
-                in ipairs(group.records)
-            do
-                WGRGearFinderCreateItemButton(
-                    content,
-                    record,
-                    heldX + ((itemIndex - 1) * 38),
-                    heldLineY - 14,
-                    ""
-                )
-            end
-
-            heldX =
-                heldX
-                + groupWidth
-                + 18
-        end
 
         y =
             y
-            - (heldUsedLines * heldLineHeight)
+            - (heldUsedLines * 72)
             - 12
     end
 
@@ -6975,85 +6786,67 @@ function WGRGearFinderDepositCurrentOutgoingToWarband()
         return
     end
 
-    local frame =
-        WGRGearFinderFrame
+    -- To Do is an explicit movement workflow and must not depend on Gear
+    -- Finder being active. Revalidate only current BAG items, then move the
+    -- ones whose live routing result still points away from this character.
+    local currentName = WGRGearFinderCurrentName()
+    local carried = {}
 
-    if not frame
-        or not frame.gearFinderPage
-    then
+    if WGRBeginRoutingEvaluationCache then WGRBeginRoutingEvaluationCache() end
+
+    for bagID = 0, 4 do
+        local slots = C_Container.GetContainerNumSlots(bagID) or 0
+        for slotID = 1, slots do
+            local itemLink = C_Container.GetContainerItemLink(bagID, slotID)
+
+            if itemLink
+                and WGRGearFinderIsSupportedGear(itemLink)
+                and IsTransferableContainerItem(bagID, slotID, itemLink)
+            then
+                local recommendation =
+                    WGRBuildLoadedItemRecommendation
+                    and WGRBuildLoadedItemRecommendation(itemLink)
+                    or nil
+
+                if recommendation
+                    and recommendation.name
+                    and not WGRGearFinderSameCharacter(
+                        recommendation.name,
+                        currentName
+                    )
+                    and (
+                        recommendation.kind == "upgrade"
+                        or recommendation.kind == "future_upgrade"
+                        or recommendation.kind == "holder"
+                        or recommendation.kind == "unknown"
+                    )
+                then
+                    carried[#carried + 1] = {
+                        itemLink = itemLink,
+                        bagID = bagID,
+                        slotID = slotID,
+                        source = "BAGS",
+                    }
+                end
+            end
+        end
+    end
+
+    if WGREndRoutingEvaluationCache then WGREndRoutingEvaluationCache() end
+
+    if #carried == 0 then
         print(
-            "|cffff5555WBGR:|r Gear Finder is not ready yet."
+            "|cff33ff99WBGR:|r No routed bag items currently need to be deposited."
         )
+        if WGRRefreshTodoPage then
+            WGRRefreshTodoPage()
+        end
         return
     end
 
-    -- Force a fresh classification so the To Do action never deposits from
-    -- stale routing results. The scan may complete asynchronously while item
-    -- data loads, so wait for gearFinderLastResults to be repopulated.
-    frame.gearFinderLastResults = nil
-    WGRRefreshGearFinder(
-        frame
-    )
-
-    local attempts = 0
-
-    local function TryDeposit()
-        attempts =
-            attempts + 1
-
-        local classified =
-            frame.gearFinderLastResults
-
-        if classified
-            and classified.onward
-        then
-            local carried = {}
-
-            for _, record
-                in ipairs(
-                    WGRGearFinderUniquePhysicalRecords(
-                        classified.onward
-                    )
-                )
-            do
-                if record.source == "BAGS" then
-                    carried[#carried + 1] =
-                        record
-                end
-            end
-
-            if #carried == 0 then
-                print(
-                    "|cff33ff99WBGR:|r No routed bag items currently need to be deposited."
-                )
-                if WGRRefreshTodoPage then
-                    WGRRefreshTodoPage()
-                end
-                return
-            end
-
-            WGRGearFinderDepositRecordsToWarband(
-                carried,
-                "routed item(s)"
-            )
-            return
-        end
-
-        if attempts < 30 then
-            C_Timer.After(
-                0.10,
-                TryDeposit
-            )
-        else
-            print(
-                "|cffff5555WBGR:|r Gear scan did not finish in time. Try Deposit to WBK again."
-            )
-        end
-    end
-
-    C_Timer.After(
-        0.05,
-        TryDeposit
+    WGRGearFinderDepositRecordsToWarband(
+        carried,
+        "routed item(s)"
     )
 end
 

@@ -53,9 +53,27 @@ local inventoryDirty = {
     bags = false,
     personalBank = false,
     warbandBank = false,
+    bagIDs = {},
+    personalBankBagIDs = {},
     warbandBagIDs = {},
     unknown = false,
 }
+
+-- While paused, bank moves can arrive as separate BAG_UPDATE bursts. Keep a
+-- short grace window after PBK/WBK activity so a trailing BAG-only update is
+-- treated as the second half of the same deliberate storage movement instead
+-- of being mistaken for ordinary loot/bag sorting.
+local pausedStorageBoundaryUntil = 0
+
+local function WGRArmPausedStorageBoundary()
+    local now = GetTime and GetTime() or 0
+    pausedStorageBoundaryUntil = now + 1.25
+end
+
+local function WGRPausedStorageBoundaryActive()
+    local now = GetTime and GetTime() or 0
+    return pausedStorageBoundaryUntil > now
+end
 
 local function WGRClassifyBagID(bagID)
     bagID = tonumber(bagID)
@@ -100,8 +118,16 @@ local function WGRMarkInventoryDirty(bagID)
     local group = WGRClassifyBagID(bagID)
     if group == "bags" then
         inventoryDirty.bags = true
+        local numericBagID = tonumber(bagID)
+        if numericBagID ~= nil then
+            inventoryDirty.bagIDs[numericBagID] = true
+        end
     elseif group == "personalBank" then
         inventoryDirty.personalBank = true
+        local numericBagID = tonumber(bagID)
+        if numericBagID ~= nil then
+            inventoryDirty.personalBankBagIDs[numericBagID] = true
+        end
     elseif group == "warbandBank" then
         inventoryDirty.warbandBank = true
         local numericBagID = tonumber(bagID)
@@ -119,10 +145,22 @@ local function WGRTakeInventoryDirtySnapshot(forceAll)
         dirtyWarbandBagIDs[bagID] = true
     end
 
+    local dirtyBagIDs = {}
+    for bagID in pairs(inventoryDirty.bagIDs) do
+        dirtyBagIDs[bagID] = true
+    end
+
+    local dirtyPersonalBankBagIDs = {}
+    for bagID in pairs(inventoryDirty.personalBankBagIDs) do
+        dirtyPersonalBankBagIDs[bagID] = true
+    end
+
     local dirty = {
         bags = inventoryDirty.bags,
         personalBank = inventoryDirty.personalBank,
         warbandBank = inventoryDirty.warbandBank,
+        bagIDs = dirtyBagIDs,
+        personalBankBagIDs = dirtyPersonalBankBagIDs,
         warbandBagIDs = dirtyWarbandBagIDs,
         unknown = inventoryDirty.unknown,
     }
@@ -130,6 +168,8 @@ local function WGRTakeInventoryDirtySnapshot(forceAll)
     inventoryDirty.bags = false
     inventoryDirty.personalBank = false
     inventoryDirty.warbandBank = false
+    inventoryDirty.bagIDs = {}
+    inventoryDirty.personalBankBagIDs = {}
     inventoryDirty.warbandBagIDs = {}
     inventoryDirty.unknown = false
 
@@ -137,6 +177,8 @@ local function WGRTakeInventoryDirtySnapshot(forceAll)
         dirty.bags = true
         dirty.personalBank = true
         dirty.warbandBank = true
+        dirty.bagIDs = nil
+        dirty.personalBankBagIDs = nil
         dirty.warbandBagIDs = nil
     end
 
@@ -155,7 +197,7 @@ local function WGRTakeInventoryDirtySnapshot(forceAll)
     return dirty
 end
 
-local function WGRScheduleInventoryRefresh(delay, forceAll)
+local function WGRScheduleInventoryRefresh(delay, forceAll, allowWhenPaused)
     inventoryRefreshSerial =
         inventoryRefreshSerial + 1
 
@@ -169,10 +211,14 @@ local function WGRScheduleInventoryRefresh(delay, forceAll)
                 return
             end
 
-            -- A paused WBGR should not perform routing-aware inventory scans.
-            if WGRRoutingIsPaused
+            local paused =
+                WGRRoutingIsPaused
                 and WGRRoutingIsPaused()
-            then
+
+            -- Paused mode defers ordinary BAG-only churn. Explicit storage
+            -- management/spec/equipment events may opt into lightweight
+            -- snapshot/routing maintenance without waking presentation layers.
+            if paused and not allowWhenPaused then
                 return
             end
 
@@ -187,7 +233,9 @@ local function WGRScheduleInventoryRefresh(delay, forceAll)
                 WGRRefreshHeldGearSnapshot(
                     dirty.personalBank,
                     dirty.bags,
-                    dirty.personalBank
+                    dirty.personalBank,
+                    dirty.bagIDs,
+                    dirty.personalBankBagIDs
                 )
             end
 
@@ -199,8 +247,15 @@ local function WGRScheduleInventoryRefresh(delay, forceAll)
                 )
             end
 
-            if WGRRefreshRosterIfOpen then
+            if (not paused) and WGRRefreshRosterIfOpen then
                 WGRRefreshRosterIfOpen()
+            end
+
+            if paused and WGRMailRefreshCurrentTodoSnapshot then
+                -- Keep the current carried-outgoing To Do snapshot accurate
+                -- while paused. PBK/elsewhere routed gear remains future
+                -- Gather Routed Gear work.
+                WGRMailRefreshCurrentTodoSnapshot(true, true)
             end
 
             if WGREndRoutingEvaluationCache then WGREndRoutingEvaluationCache() end
@@ -220,6 +275,10 @@ local function WGRScheduleInventoryRefresh(delay, forceAll)
             end
         end
     )
+end
+
+function WGRRequestInventoryRefresh(delay, forceAll, allowWhenPaused)
+    WGRScheduleInventoryRefresh(delay, forceAll, allowWhenPaused)
 end
 
 -- Forward declaration: PLAYER_ENTERING_WORLD can call this before the
@@ -269,6 +328,10 @@ eventFrame:SetScript(
                     0.35,
                     SaveCurrentSpec
                 )
+
+                if WGRRoutingIsPaused and WGRRoutingIsPaused() then
+                    WGRScheduleInventoryRefresh(0.85, true, true)
+                end
             end
 
         elseif event
@@ -286,6 +349,10 @@ eventFrame:SetScript(
                 0.75,
                 SaveCurrentSpec
             )
+
+            if WGRRoutingIsPaused and WGRRoutingIsPaused() then
+                WGRScheduleInventoryRefresh(0.90, true, true)
+            end
 
         elseif event
             ==
@@ -346,14 +413,53 @@ eventFrame:SetScript(
         elseif event == "BAG_UPDATE" then
             WGRMarkInventoryDirty(unit)
 
+            if WGRRoutingIsPaused and WGRRoutingIsPaused() then
+                local changedGroup = WGRClassifyBagID(unit)
+                if changedGroup == "personalBank"
+                    or changedGroup == "warbandBank"
+                then
+                    WGRArmPausedStorageBoundary()
+                end
+            end
+
         elseif event == "BAG_UPDATE_DELAYED" then
-            -- Ordinary inventory changes only need overlays for the concrete
-            -- bag IDs reported by BAG_UPDATE. Other callers still request a
-            -- full overlay rebuild when routing/configuration changes.
-            QueueCleanupRefresh(true)
-            WGRScheduleInventoryRefresh(
-                0.30
-            )
+            local paused =
+                WGRRoutingIsPaused
+                and WGRRoutingIsPaused()
+
+            if paused then
+                local changedGroups = 0
+                if inventoryDirty.bags then changedGroups = changedGroups + 1 end
+                if inventoryDirty.personalBank then changedGroups = changedGroups + 1 end
+                if inventoryDirty.warbandBank then changedGroups = changedGroups + 1 end
+
+                local mailboxOpen = WGRMail and WGRMail.mailboxOpen
+
+                -- Loot and BAG-to-BAG sorting stay deferred while paused. A
+                -- PBK/WBK change is deliberate management and arms a short
+                -- grace window so a trailing BAG-only event from the same move
+                -- is still processed. This avoids intermittent stale To Do
+                -- state without waking broad presentation work.
+                local storageDirty =
+                    inventoryDirty.personalBank
+                    or inventoryDirty.warbandBank
+
+                local trailingBoundaryBag =
+                    inventoryDirty.bags
+                    and WGRPausedStorageBoundaryActive()
+
+                if changedGroups >= 2
+                    or storageDirty
+                    or trailingBoundaryBag
+                    or (inventoryDirty.bags and mailboxOpen)
+                then
+                    WGRScheduleInventoryRefresh(0.30, false, true)
+                end
+            else
+                -- Active mode keeps the normal overlay/UI behavior.
+                QueueCleanupRefresh(true)
+                WGRScheduleInventoryRefresh(0.30)
+            end
 
         elseif event == "BANKFRAME_OPENED" then
             QueueCleanupRefresh()
@@ -370,7 +476,8 @@ eventFrame:SetScript(
             -- are storage-aware through BAG_UPDATE.
             WGRScheduleInventoryRefresh(
                 0.35,
-                true
+                true,
+                WGRRoutingIsPaused and WGRRoutingIsPaused()
             )
 
         elseif event == "BANKFRAME_CLOSED" then

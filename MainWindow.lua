@@ -1168,32 +1168,20 @@ function WGRUpdateOpenRouterButton()
         WGRMail
         and WGRMail.mailboxOpen
 
-    local paused =
-        WGRRoutingIsPaused
-        and WGRRoutingIsPaused()
-
     frame.openRouterButton:SetEnabled(
         mailboxOpen
-        and not paused
         and true
         or false
     )
 
     if frame.routerRequirement then
         frame.routerRequirement:SetShown(
-            (not mailboxOpen)
-            or paused
+            not mailboxOpen
         )
 
-        if paused then
-            frame.routerRequirement:SetText(
-                "WBGR is paused. Resume WBGR to use the Mail Router."
-            )
-        else
-            frame.routerRequirement:SetText(
-                "Open a mailbox to use the Mail Router."
-            )
-        end
+        frame.routerRequirement:SetText(
+            "Open a mailbox to use the Mail Router."
+        )
     end
 end
 
@@ -3379,7 +3367,7 @@ local function WGRBuildAboutSubtabs(
         {"/wbgr", "Open Warbound Gear Router."},
         {"/wbgr mailrouter", "Open the Mail Router while at a mailbox."},
         {"/wbgr cleanup", "Rescan and refresh WBGR gear overlays."},
-        {"/wbgr pause", "Pause live routing tooltips and overlay scans."},
+        {"/wbgr pause", "Pause live tooltips, overlays, Gear Finder, and BAG-only routing while keeping tracking active."},
         {"/wbgr resume", "Resume live routing and rebuild overlays."},
         {"/wbgr help", "Show normal WBGR command help."},
     }
@@ -4242,7 +4230,7 @@ local function WGRMailCreateTrackerFrame()
                 "Master WBGR Toggle"
             )
             GameTooltip:AddLine(
-                "Pause routing, Gear Finder, Mail Router, and live inventory evaluation.",
+                "Pause live tooltips, overlays, Gear Finder, and BAG-only routing. Storage/mail/spec tracking stays active.",
                 1.00,
                 1.00,
                 1.00,
@@ -4961,16 +4949,7 @@ local function WGRMailCreateTrackerFrame()
                 0.00
             )
 
-            if WGRRoutingIsPaused
-                and WGRRoutingIsPaused()
-            then
-                GameTooltip:AddLine(
-                    "WBGR is paused. Resume WBGR to use the Mail Router.",
-                    1.00,
-                    0.75,
-                    0.20
-                )
-            elseif WGRMail
+            if WGRMail
                 and WGRMail.mailboxOpen
             then
                 GameTooltip:AddLine(
@@ -5648,14 +5627,9 @@ local function WGRMailCreateTrackerFrame()
                         WGRMail
                         and WGRMail.mailboxOpen
 
-                    local paused =
-                        WGRRoutingIsPaused
-                        and WGRRoutingIsPaused()
-
                     row.action:SetEnabled(
                         isCurrent
                         and mailboxOpen
-                        and not paused
                     )
 
                     if not isCurrent then
@@ -5666,11 +5640,6 @@ local function WGRMailCreateTrackerFrame()
                                 entry.character
                             )
                             .. " and open a mailbox."
-                        )
-                    elseif paused then
-                        row.detail:SetText(
-                            baseDetail
-                            .. "\nResume WBGR first."
                         )
                     elseif not mailboxOpen then
                         row.detail:SetText(
@@ -5713,10 +5682,6 @@ local function WGRMailCreateTrackerFrame()
                     local warbandOpen =
                         WGRGearFinderIsWarbandBankOpen
                         and WGRGearFinderIsWarbandBankOpen()
-
-                    local paused =
-                        WGRRoutingIsPaused
-                        and WGRRoutingIsPaused()
 
                     row.action:SetScript(
                         "OnEnter",
@@ -5790,19 +5755,6 @@ local function WGRMailCreateTrackerFrame()
                                 entry.character
                             )
                             .. " first."
-                        )
-                        row.action:SetScript(
-                            "OnClick",
-                            nil
-                        )
-                    elseif paused then
-                        row.action:SetText(
-                            "Mail or WBK"
-                        )
-                        row.action:Disable()
-                        row.detail:SetText(
-                            baseDetail
-                            .. "\nResume WBGR first."
                         )
                         row.action:SetScript(
                             "OnClick",
@@ -12836,20 +12788,26 @@ local function WGRMailCreateTrackerFrame()
     frame:SetScript(
         "OnShow",
         function()
-            if WGRMailRefreshCurrentTodoSnapshot then
-                C_Timer.After(
-                    0,
-                    function()
-                        if frame:IsShown()
-                            and WGRMailRefreshCurrentTodoSnapshot
-                        then
-                            WGRMailRefreshCurrentTodoSnapshot(
-                                true
-                            )
-                        end
+            C_Timer.After(
+                0,
+                function()
+                    if not frame:IsShown() then
+                        return
                     end
-                )
-            end
+
+                    if WGRRoutingIsPaused
+                        and WGRRoutingIsPaused()
+                    then
+                        if WGRRefreshTodoPage then
+                            WGRRefreshTodoPage()
+                        end
+                    elseif WGRMailRefreshCurrentTodoSnapshot then
+                        WGRMailRefreshCurrentTodoSnapshot(
+                            true
+                        )
+                    end
+                end
+            )
         end
     )
 

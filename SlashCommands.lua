@@ -378,14 +378,6 @@ SlashCmdList[
     if command == "mailrouter"
         or command == "mail"
     then
-        if WGRRoutingIsPaused
-            and WGRRoutingIsPaused()
-        then
-            print(
-                "|cffffcc00WBGR:|r WBGR is currently paused. Resume WBGR to use the Mail Router."
-            )
-            return
-        end
 
         if WGRMailOpenRouterManual then
             WGRMailOpenRouterManual()
@@ -892,6 +884,7 @@ SlashCmdList[
 
         return
     end
+
 
     if command == "cleanup" then
         if WGRRoutingIsPaused() then

@@ -3459,6 +3459,318 @@ local function WGRHeldGearAddEntry(
         ) + 1
 end
 
+-- Runtime-only per-slot caches for Bags and Personal Bank. These keep the
+-- persisted heldGearSnapshots format unchanged while allowing a dirty-container
+-- refresh to reroute only slots whose item link actually changed.
+local WGRHeldSlotCaches = {
+    BAGS = {},
+    PERSONAL_BANK = {},
+}
+
+local function WGRItemLocationIsSoulbound(itemLocation)
+    if not itemLocation
+        or not C_Item
+        or not C_Item.IsBound
+    then
+        return false
+    end
+
+    local ok, isBound = pcall(C_Item.IsBound, itemLocation)
+    return ok and isBound == true
+end
+
+local function WGRContainerItemIsSoulbound(bagID, slotID)
+    if not ItemLocation
+        or not ItemLocation.CreateFromBagAndSlot
+    then
+        return false
+    end
+
+    local ok, itemLocation = pcall(
+        ItemLocation.CreateFromBagAndSlot,
+        ItemLocation,
+        bagID,
+        slotID
+    )
+
+    return ok and WGRItemLocationIsSoulbound(itemLocation)
+end
+
+local function WGREquippedItemIsSoulbound(slotID)
+    if not ItemLocation
+        or not ItemLocation.CreateFromEquipmentSlot
+    then
+        return false
+    end
+
+    local ok, itemLocation = pcall(
+        ItemLocation.CreateFromEquipmentSlot,
+        ItemLocation,
+        slotID
+    )
+
+    return ok and WGRItemLocationIsSoulbound(itemLocation)
+end
+
+local function WGRHeldGearBuildSlotState(
+    bagID,
+    slotID,
+    itemLink
+)
+    local state = {
+        signature = itemLink or false,
+    }
+
+    -- Cross-spec owned-component routing uses committed gear only. A
+    -- Warbound/BoE weapon in Bags/PBK is still a routing candidate and must
+    -- not raise the destination's routing floor merely because it is sitting
+    -- there. Only a physically-confirmed Soulbound weapon/off-hand enters the
+    -- owned component cache.
+    if itemLink and WGRContainerItemIsSoulbound(bagID, slotID) then
+        local weaponKind = GetWeaponKind and GetWeaponKind(itemLink) or nil
+        local offhandKind = WGRGetOffhandKind and WGRGetOffhandKind(itemLink) or nil
+        if weaponKind or offhandKind == "SHIELD" or offhandKind == "OFFHAND" then
+            state.ownedWeaponLink = itemLink
+            state.ownedWeaponLevel = tonumber(GetItemLevel(itemLink)) or 0
+        end
+    end
+
+    if not itemLink
+        or not IsTransferableContainerItem(
+            bagID,
+            slotID,
+            itemLink
+        )
+    then
+        return state
+    end
+
+    state.transferable = true
+
+    local recommendation =
+        WGRBuildLoadedItemRecommendation
+        and WGRBuildLoadedItemRecommendation(itemLink)
+        or nil
+
+    local isDispose =
+        recommendation
+        and (
+            recommendation.kind == "sell"
+            or recommendation.kind == "no_current_upgrade"
+        )
+
+    if not isDispose then
+        local section, category, subtype =
+            WGRHeldGearClassifyItem(itemLink)
+
+        if section and category then
+            state.included = true
+            state.section = section
+            state.category = category
+            state.subtype = subtype
+        end
+    end
+
+    return state
+end
+
+local function WGRHeldGearScanContainerCached(
+    cacheGroup,
+    bagID,
+    forceRoute,
+    perfLabel
+)
+    local result = {
+        total = 0,
+        entries = {},
+        scanned = time(),
+    }
+
+    if not C_Container
+        or not C_Container.GetContainerNumSlots
+        or not C_Container.GetContainerItemLink
+    then
+        return result
+    end
+
+    local groupCache = WGRHeldSlotCaches[cacheGroup]
+    if not groupCache then
+        groupCache = {}
+        WGRHeldSlotCaches[cacheGroup] = groupCache
+    end
+
+    local oldCache = groupCache[bagID] or {}
+    local newCache = {}
+    local slots = C_Container.GetContainerNumSlots(bagID) or 0
+    local perfStart = WGRPerfNow and WGRPerfNow() or 0
+    local routingMS = 0
+    local changedCount = 0
+    local routedCount = 0
+    local transferableCount = 0
+
+    for slotID = 1, slots do
+        local itemLink = C_Container.GetContainerItemLink(bagID, slotID)
+        local signature = itemLink or false
+        local old = oldCache[slotID]
+        local state
+
+        if (not forceRoute)
+            and old
+            and old.signature == signature
+        then
+            state = old
+        else
+            changedCount = changedCount + 1
+            local routeStart = WGRPerfNow and WGRPerfNow() or 0
+            state = WGRHeldGearBuildSlotState(bagID, slotID, itemLink)
+            if state.transferable then
+                routedCount = routedCount + 1
+            end
+            if routeStart > 0 and WGRPerfNow then
+                routingMS = routingMS + (WGRPerfNow() - routeStart)
+            end
+        end
+
+        newCache[slotID] = state
+
+        if state.transferable then
+            transferableCount = transferableCount + 1
+        end
+
+        if state.included then
+            WGRHeldGearAddEntry(
+                result,
+                state.section,
+                state.category,
+                state.subtype
+            )
+        end
+    end
+
+    groupCache[bagID] = newCache
+
+    if perfStart > 0 and WGRPerfNow and WGRPerfRecord then
+        WGRPerfRecord(
+            perfLabel or "held_container_scan",
+            WGRPerfNow() - perfStart,
+            string.format(
+                "bag=%s slots=%d transferable=%d changed=%d routed=%d routing=%.1fms",
+                tostring(bagID),
+                slots,
+                transferableCount,
+                changedCount,
+                routedCount,
+                routingMS
+            )
+        )
+    end
+
+    return result
+end
+
+local function WGRAggregateHeldContainerSnapshots(containerSnapshots)
+    local result = {
+        total = 0,
+        entries = {},
+        scanned = time(),
+    }
+
+    for _, containerSnapshot in pairs(containerSnapshots or {}) do
+        if type(containerSnapshot) == "table" then
+            result.total = result.total + (tonumber(containerSnapshot.total) or 0)
+            for key, count in pairs(containerSnapshot.entries or {}) do
+                result.entries[key] =
+                    (result.entries[key] or 0) + (tonumber(count) or 0)
+            end
+        end
+    end
+
+    return result
+end
+
+local WGRHeldContainerSnapshots = {
+    BAGS = {},
+    PERSONAL_BANK = {},
+}
+
+local function WGRCollectOwnedWeaponsFromHeldCache(cacheGroup)
+    local result = {}
+    local group = WGRHeldSlotCaches[cacheGroup] or {}
+
+    for bagID, slots in pairs(group) do
+        for slotID, state in pairs(slots or {}) do
+            if state and state.ownedWeaponLink then
+                local level = tonumber(state.ownedWeaponLevel) or 0
+                if level <= 0 then
+                    level = tonumber(GetItemLevel(state.ownedWeaponLink)) or 0
+                    state.ownedWeaponLevel = level
+                end
+
+                if level > 0 then
+                    result[#result + 1] = {
+                        link = state.ownedWeaponLink,
+                        level = level,
+                        bagID = tonumber(bagID),
+                        slotID = tonumber(slotID),
+                    }
+                end
+            end
+        end
+    end
+
+    return result
+end
+
+local function WGRRefreshOwnedWeaponComponentsForCurrentCharacter(
+    characterName,
+    updateBags,
+    updateBank
+)
+    InitializeDatabase()
+    if not characterName then return end
+
+    local key = string.lower(characterName)
+    local owned = WarboundGearRouterDB.ownedWeaponComponents[key] or {
+        character = characterName,
+        bags = {},
+        bank = {},
+        equipped = {},
+    }
+
+    owned.character = characterName
+
+    if updateBags then
+        owned.bags = WGRCollectOwnedWeaponsFromHeldCache("BAGS")
+        owned.bagsObserved = true
+    end
+
+    if updateBank then
+        owned.bank = WGRCollectOwnedWeaponsFromHeldCache("PERSONAL_BANK")
+        owned.bankObserved = true
+    end
+
+    local equipped = {}
+    for _, slotID in ipairs({ 16, 17 }) do
+        local itemLink = GetInventoryItemLink and GetInventoryItemLink("player", slotID) or nil
+        if itemLink and WGREquippedItemIsSoulbound(slotID) then
+            local weaponKind = GetWeaponKind and GetWeaponKind(itemLink) or nil
+            local offhandKind = WGRGetOffhandKind and WGRGetOffhandKind(itemLink) or nil
+            if weaponKind or offhandKind == "SHIELD" or offhandKind == "OFFHAND" then
+                equipped[#equipped + 1] = {
+                    link = itemLink,
+                    level = tonumber(GetItemLevel(itemLink)) or 0,
+                    slotID = slotID,
+                }
+            end
+        end
+    end
+
+    owned.equipped = equipped
+    owned.equippedObserved = true
+    owned.updated = time()
+    WarboundGearRouterDB.ownedWeaponComponents[key] = owned
+end
+
 local function WGRHeldGearScanBagIDs(
     bagIDs,
     perfLabel
@@ -3625,7 +3937,9 @@ end
 function WGRRefreshHeldGearSnapshot(
     includePersonalBank,
     scanBags,
-    scanPersonalBank
+    scanPersonalBank,
+    dirtyBagIDs,
+    dirtyPersonalBankBagIDs
 )
     local perfStart = WGRPerfNow and WGRPerfNow() or 0
     InitializeDatabase()
@@ -3674,34 +3988,54 @@ function WGRRefreshHeldGearSnapshot(
     end
 
     if scanBags then
+        local bagIDs = WGRHeldGearBagIDs()
+        local partial =
+            type(dirtyBagIDs) == "table"
+            and next(dirtyBagIDs) ~= nil
+            and next(WGRHeldContainerSnapshots.BAGS) ~= nil
+
+        if not partial then
+            WGRHeldSlotCaches.BAGS = {}
+            WGRHeldContainerSnapshots.BAGS = {}
+            for _, bagID in ipairs(bagIDs) do
+                WGRHeldContainerSnapshots.BAGS[bagID] =
+                    WGRHeldGearScanContainerCached(
+                        "BAGS",
+                        bagID,
+                        true,
+                        "held_bags_scan"
+                    )
+            end
+        else
+            local valid = {}
+            for _, bagID in ipairs(bagIDs) do valid[bagID] = true end
+            for bagID in pairs(dirtyBagIDs) do
+                bagID = tonumber(bagID)
+                if bagID and valid[bagID] then
+                    WGRHeldContainerSnapshots.BAGS[bagID] =
+                        WGRHeldGearScanContainerCached(
+                            "BAGS",
+                            bagID,
+                            false,
+                            "held_bags_scan"
+                        )
+                end
+            end
+        end
+
         snapshot.bags =
-            WGRHeldGearScanBagIDs(
-                WGRHeldGearBagIDs(),
-                "held_bags_scan"
+            WGRAggregateHeldContainerSnapshots(
+                WGRHeldContainerSnapshots.BAGS
             )
     end
 
     if includePersonalBank and scanPersonalBank then
-        local bankIDs =
-            WGRHeldGearPersonalBankIDs()
+        local bankIDs = WGRHeldGearPersonalBankIDs()
+        local hasReadableBank = false
 
-        local hasReadableBank =
-            false
-
-        for _, bagID
-            in ipairs(
-                bankIDs
-            )
-        do
-            if (
-                C_Container.GetContainerNumSlots(
-                    bagID
-                )
-                or 0
-            ) > 0
-            then
-                hasReadableBank =
-                    true
+        for _, bagID in ipairs(bankIDs) do
+            if (C_Container.GetContainerNumSlots(bagID) or 0) > 0 then
+                hasReadableBank = true
                 break
             end
         end
@@ -3709,13 +4043,60 @@ function WGRRefreshHeldGearSnapshot(
         -- Do not erase a useful cached bank snapshot if this event came
         -- from another bank type and Character Bank containers are unavailable.
         if hasReadableBank then
+            local partial =
+                type(dirtyPersonalBankBagIDs) == "table"
+                and next(dirtyPersonalBankBagIDs) ~= nil
+                and next(WGRHeldContainerSnapshots.PERSONAL_BANK) ~= nil
+
+            if not partial then
+                WGRHeldSlotCaches.PERSONAL_BANK = {}
+                WGRHeldContainerSnapshots.PERSONAL_BANK = {}
+                for _, bagID in ipairs(bankIDs) do
+                    if (C_Container.GetContainerNumSlots(bagID) or 0) > 0 then
+                        WGRHeldContainerSnapshots.PERSONAL_BANK[bagID] =
+                            WGRHeldGearScanContainerCached(
+                                "PERSONAL_BANK",
+                                bagID,
+                                true,
+                                "held_bank_scan"
+                            )
+                    end
+                end
+            else
+                local valid = {}
+                for _, bagID in ipairs(bankIDs) do valid[bagID] = true end
+                for bagID in pairs(dirtyPersonalBankBagIDs) do
+                    bagID = tonumber(bagID)
+                    if bagID
+                        and valid[bagID]
+                        and (C_Container.GetContainerNumSlots(bagID) or 0) > 0
+                    then
+                        WGRHeldContainerSnapshots.PERSONAL_BANK[bagID] =
+                            WGRHeldGearScanContainerCached(
+                                "PERSONAL_BANK",
+                                bagID,
+                                false,
+                                "held_bank_scan"
+                            )
+                    end
+                end
+            end
+
             snapshot.bank =
-                WGRHeldGearScanBagIDs(
-                    bankIDs,
-                    "held_bank_scan"
+                WGRAggregateHeldContainerSnapshots(
+                    WGRHeldContainerSnapshots.PERSONAL_BANK
                 )
         end
     end
+
+    -- Keep the physical owned-weapon cache synchronized with the same
+    -- dirty-container work we already performed. No additional bag/bank scan
+    -- is introduced here. Equipped slots are only two direct lookups.
+    WGRRefreshOwnedWeaponComponentsForCurrentCharacter(
+        characterName,
+        scanBags == true,
+        includePersonalBank and scanPersonalBank == true
+    )
 
     snapshot.updated =
         time()
@@ -4601,19 +4982,35 @@ function WGRSetRoutingPaused(
 
     if WarboundGearRouterDB.interface.routingPaused then
         WGRHideAllGearOverlays()
+
+        if WGRGearFinderSetMasterPaused then
+            WGRGearFinderSetMasterPaused(true)
+        end
     else
-        RefreshBagnonCleanupOverlays()
-    end
+        -- Route any BAG-only acquisitions/rearrangements that accumulated
+        -- while paused and reconcile readable storage before restoring the
+        -- expensive presentation layers.
+        if WGRRequestInventoryRefresh then
+            WGRRequestInventoryRefresh(
+                0.05,
+                true,
+                false
+            )
+        end
 
-    if WGRGearFinderSetMasterPaused then
-        WGRGearFinderSetMasterPaused(
-            WarboundGearRouterDB.interface.routingPaused
-        )
-    end
+        C_Timer.After(
+            0.25,
+            function()
+                if WGRRoutingIsPaused() then
+                    return
+                end
 
-    if WGRMailSetMasterPaused then
-        WGRMailSetMasterPaused(
-            WarboundGearRouterDB.interface.routingPaused
+                RefreshBagnonCleanupOverlays()
+
+                if WGRGearFinderSetMasterPaused then
+                    WGRGearFinderSetMasterPaused(false)
+                end
+            end
         )
     end
 
@@ -4628,11 +5025,11 @@ function WGRSetRoutingPaused(
     if not quiet then
         if WarboundGearRouterDB.interface.routingPaused then
             print(
-                "|cffffff00WBGR PAUSED.|r Routing, Gear Finder, Mail Router, and live inventory evaluation are paused."
+                "|cffffff00WBGR PAUSED.|r Live tooltips, overlays, Gear Finder, and BAG-only routing are paused. Storage/mail/spec tracking remains active."
             )
         else
             print(
-                "|cff00ff00WBGR ACTIVE.|r Routing, Gear Finder, and Mail Router are enabled."
+                "|cff00ff00WBGR ACTIVE.|r Full live routing, tooltips, overlays, and Gear Finder are enabled."
             )
         end
     end

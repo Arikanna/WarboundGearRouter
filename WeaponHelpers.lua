@@ -1755,11 +1755,185 @@ function WGRGetKnownWeaponSetupForConfig(characterName, character, specID, targe
 end
 
 
+-- Build the strongest complete setup the character can assemble from
+-- confirmed Soulbound weapon components WGR has physically observed in that
+-- character's equipped slots, Bags, and Personal Bank. Components may come
+-- from different specs (for
+-- example Holy's Int 1H plus Protection's shield). This cache is maintained by
+-- the existing dirty-container snapshot path, so routing does not rescan storage.
+local function WGRBuildBestOwnedWeaponSetupForSpec(
+    characterName,
+    character,
+    specID,
+    allowedConfigs
+)
+    InitializeDatabase()
+
+    if not characterName or not specID then
+        return nil, nil
+    end
+
+    local configKeyParts = {}
+    for _, config in ipairs(allowedConfigs or {}) do
+        configKeyParts[#configKeyParts + 1] = tostring(config)
+    end
+    local cacheKey = string.lower(characterName)
+        .. "\031" .. tostring(specID)
+        .. "\031" .. table.concat(configKeyParts, ",")
+    local evalCache = WGRGetRoutingEvaluationCache and WGRGetRoutingEvaluationCache() or nil
+    if evalCache and evalCache.ownedWeaponSetups then
+        local cached = evalCache.ownedWeaponSetups[cacheKey]
+        if cached ~= nil then
+            if cached == false then return nil, nil end
+            return cached.level, cached.baseline
+        end
+    end
+
+    local key = string.lower(characterName)
+    local owned = WarboundGearRouterDB.ownedWeaponComponents
+        and WarboundGearRouterDB.ownedWeaponComponents[key]
+        or nil
+
+    if type(owned) ~= "table" then
+        if evalCache and evalCache.ownedWeaponSetups then
+            evalCache.ownedWeaponSetups[cacheKey] = false
+        end
+        return nil, nil
+    end
+
+    local classID = GetCharacterClassID(characterName, character)
+    if not classID then
+        return nil, nil
+    end
+
+    local components = {}
+    local function append(list)
+        for _, data in ipairs(list or {}) do
+            if data
+                and data.link
+                and (tonumber(data.level) or 0) > 0
+            then
+                components[#components + 1] = data
+            end
+        end
+    end
+
+    append(owned.equipped)
+    append(owned.bags)
+    append(owned.bank)
+
+    if #components == 0 then
+        if evalCache and evalCache.ownedWeaponSetups then
+            evalCache.ownedWeaponSetups[cacheKey] = false
+        end
+        return nil, nil
+    end
+
+    local function bestOfKind(kind, count)
+        local matches = {}
+        for _, data in ipairs(components) do
+            if WGRBaselineComponentFitsSpec(
+                data.link,
+                classID,
+                specID,
+                kind
+            ) then
+                matches[#matches + 1] = data
+            end
+        end
+
+        table.sort(matches, function(a, b)
+            return (tonumber(a.level) or 0) > (tonumber(b.level) or 0)
+        end)
+
+        local result = {}
+        for index = 1, math.min(count or 1, #matches) do
+            result[#result + 1] = matches[index]
+        end
+        return result
+    end
+
+    local bestLevel = nil
+    local best = nil
+
+    local function consider(config)
+        local main, off
+
+        if config == "RANGED" then
+            main = bestOfKind("RANGED", 1)[1]
+        elseif config == "TWO_HAND" then
+            main = bestOfKind("TWO_HAND", 1)[1]
+        elseif config == "ONE_HAND" then
+            main = bestOfKind("ONE_HAND", 1)[1]
+        elseif config == "DUAL_1H" then
+            local items = bestOfKind("ONE_HAND", 2)
+            main, off = items[1], items[2]
+        elseif config == "DUAL_2H" then
+            local items = bestOfKind("TWO_HAND", 2)
+            main, off = items[1], items[2]
+        elseif config == "ONE_HAND_PLUS_SHIELD" then
+            main = bestOfKind("ONE_HAND", 1)[1]
+            off = bestOfKind("SHIELD", 1)[1]
+        elseif config == "ONE_HAND_PLUS_OFFHAND" then
+            main = bestOfKind("ONE_HAND", 1)[1]
+            off = bestOfKind("OFFHAND", 1)[1]
+        end
+
+        local paired =
+            config == "DUAL_1H"
+            or config == "DUAL_2H"
+            or config == "ONE_HAND_PLUS_SHIELD"
+            or config == "ONE_HAND_PLUS_OFFHAND"
+
+        if not main or (paired and not off) then
+            return
+        end
+
+        local candidate = {
+            specID = specID,
+            specName = WGRSpecNamesByID[specID],
+            mainHand = main.link,
+            mainHandLevel = tonumber(main.level) or 0,
+            offHand = off and off.link or nil,
+            offHandLevel = off and (tonumber(off.level) or 0) or 0,
+            weaponConfig = config,
+            weaponConfigState = "OWNED_COMPLETE",
+            missingMainHand = false,
+            missingOffHand = false,
+            ownedComplete = true,
+            updated = tonumber(owned.updated) or 0,
+        }
+
+        local level = WGRGetCompleteWeaponSetupLevel(candidate)
+        if level and level > 0 and (not bestLevel or level > bestLevel) then
+            bestLevel = level
+            best = candidate
+        end
+    end
+
+    for _, config in ipairs(allowedConfigs or {}) do
+        consider(config)
+    end
+
+    if best then
+        best.effectiveSetupLevel = bestLevel
+    end
+
+    if evalCache and evalCache.ownedWeaponSetups then
+        evalCache.ownedWeaponSetups[cacheKey] = best and {
+            level = bestLevel,
+            baseline = best,
+        } or false
+    end
+
+    return bestLevel, best
+end
+
 -- Build the strongest COMPLETE weapon setup WGR can legitimately prove for
--- one spec from its recorded spec baselines.  A setup may come from this
--- spec's own saved record or from a compatible record belonging to another
--- spec on the same character.  Random Soulbound items merely sitting in
--- bags/banks are never ingested here.
+-- one spec. Saved per-spec records remain intact, while the physical owned-
+-- Soulbound owned-weapon cache may raise the routing floor when the character
+-- can assemble a stronger compatible setup from committed equipped/BAG/PBK
+-- components. Transferable Warbound/BoE candidates never participate.
 --
 -- This is intentionally setup-based:
 --   2H/Ranged                     = item level
@@ -1916,6 +2090,27 @@ local function WGRGetBestKnownCompleteWeaponBaseline(
         end
     end
 
+    -- Physical ownership can produce a stronger complete setup than any one
+    -- saved spec baseline, including a setup assembled from components first
+    -- seen under different specs. This is a cache lookup only; no storage scan
+    -- happens during routing.
+    local ownedLevel, ownedBaseline =
+        WGRBuildBestOwnedWeaponSetupForSpec(
+            characterName,
+            character,
+            specID,
+            allowedConfigs
+        )
+
+    if ownedLevel
+        and ownedLevel > 0
+        and (not bestLevel or ownedLevel > bestLevel)
+    then
+        bestLevel = ownedLevel
+        bestBaseline = ownedBaseline
+        bestSourceSpecID = nil
+    end
+
     if not bestLevel then
         return 0, nil, "uninitialized"
     end
@@ -1951,6 +2146,194 @@ function WGRGetEffectiveSpecWeaponBaseline(
             characterName,
             character,
             specID
+        )
+end
+
+-- Return whether an authoritative saved setup is still physically represented
+-- in the character's confirmed Soulbound-owned component cache. This prevents
+-- an old per-spec baseline from continuing to raise routing after those exact
+-- weapons have been sold, destroyed, mailed away, or otherwise removed.
+--
+-- If this character has not yet been physically observed by the Soulbound
+-- ownership system, return nil so routing can conservatively keep using the
+-- historical saved baseline (important for offline/legacy characters).
+local function WGRSavedWeaponBaselineStillOwned(characterName, baseline)
+    if not characterName or not baseline then
+        return nil
+    end
+
+    local ownedTable = WarboundGearRouterDB.ownedWeaponComponents
+    local owned = ownedTable and ownedTable[string.lower(characterName)] or nil
+    if type(owned) ~= "table" then
+        return nil
+    end
+
+    local hasObservation = owned.equippedObserved == true
+        or owned.bagsObserved == true
+        or owned.bankObserved == true
+    if not hasObservation then
+        return nil
+    end
+
+    local counts = {}
+    local function add(list)
+        for _, data in ipairs(list or {}) do
+            local link = data and data.link
+            if link then
+                local itemID = GetItemInfoInstant and select(1, GetItemInfoInstant(link)) or nil
+                local key = itemID and ("id:" .. tostring(itemID)) or ("link:" .. tostring(link))
+                counts[key] = (counts[key] or 0) + 1
+            end
+        end
+    end
+
+    add(owned.equipped)
+    add(owned.bags)
+    add(owned.bank)
+
+    local function consume(link)
+        if not link then return false end
+        local itemID = GetItemInfoInstant and select(1, GetItemInfoInstant(link)) or nil
+        local key = itemID and ("id:" .. tostring(itemID)) or ("link:" .. tostring(link))
+        local count = counts[key] or 0
+        if count <= 0 then return false end
+        counts[key] = count - 1
+        return true
+    end
+
+    local config = baseline.weaponConfig
+    if config == "RANGED" or config == "TWO_HAND" or config == "ONE_HAND" then
+        return consume(baseline.mainHand)
+    end
+
+    if config == "DUAL_1H"
+        or config == "DUAL_2H"
+        or config == "ONE_HAND_PLUS_SHIELD"
+        or config == "ONE_HAND_PLUS_OFFHAND"
+    then
+        return consume(baseline.mainHand) and consume(baseline.offHand)
+    end
+
+    return false
+end
+
+-- Routing-specific complete weapon baseline. Unlike the broader effective
+-- baseline helper above, this must never borrow another spec's historical
+-- saved setup. Cross-spec routing protection comes only from components that
+-- are physically confirmed Soulbound-owned right now. The target spec may
+-- use its own saved baseline only while it is still physically represented
+-- (or before ownership has ever been observed), plus a compatible currently-
+-- equipped DataStore setup and the Soulbound-owned component cache.
+function WGRGetRoutingSpecWeaponBaseline(
+    characterName,
+    character,
+    specID
+)
+    InitializeDatabase()
+
+    WGRRepairLegacyWeaponBaselineLevelsForCharacter(characterName)
+
+    local allowedConfigs = WGRGetAllowedBaselineConfigs(characterName, specID) or {}
+    local allowed = {}
+    for _, config in ipairs(allowedConfigs) do
+        allowed[config] = true
+    end
+
+    local bestLevel = nil
+    local bestBaseline = nil
+
+    -- Only this spec's own authoritative saved baseline may contribute
+    -- historical state to its routing floor.
+    local byCharacter =
+        WarboundGearRouterDB.specWeaponBaselines[string.lower(characterName or "")]
+    local ownBaseline = byCharacter and (byCharacter[specID] or byCharacter[tostring(specID)])
+
+    if ownBaseline and ownBaseline.weaponConfigState == "INITIALIZED" then
+        local stillOwned = WGRSavedWeaponBaselineStillOwned(characterName, ownBaseline)
+        -- nil means this character has not yet been observed by the new
+        -- Soulbound ownership cache, so preserve the historical baseline as a
+        -- conservative fallback until WBGR has physical evidence. false means
+        -- the character has been observed and the saved setup is no longer
+        -- physically present, so it must not raise routing.
+        if stillOwned ~= false then
+            for _, targetConfig in ipairs(allowedConfigs) do
+                local candidate = WGRBuildInheritedCandidate(
+                    characterName,
+                    specID,
+                    ownBaseline,
+                    targetConfig
+                )
+                if candidate and candidate.inheritedComplete then
+                    local level = WGRGetCompleteWeaponSetupLevel(candidate)
+                    if level and level > 0 and (not bestLevel or level > bestLevel) then
+                        bestLevel = level
+                        bestBaseline = candidate
+                        bestBaseline.inherited = false
+                        bestBaseline.inheritedFromSpecID = nil
+                        bestBaseline.inheritedFromSpecName = nil
+                    end
+                end
+            end
+        end
+    end
+
+    -- A currently-equipped compatible DataStore setup is physical evidence,
+    -- not historical cross-spec inheritance.
+    local dataStoreBaseline =
+        WGRBuildDataStoreWeaponBaseline(characterName, character, specID)
+    if dataStoreBaseline and allowed[dataStoreBaseline.weaponConfig] then
+        local level = WGRGetCompleteWeaponSetupLevel(dataStoreBaseline)
+        if level and level > 0 and (not bestLevel or level > bestLevel) then
+            bestLevel = level
+            bestBaseline = dataStoreBaseline
+        end
+    end
+
+    -- Cross-spec improvement is allowed only through components that are
+    -- currently confirmed Soulbound-owned by this character.
+    local ownedLevel, ownedBaseline =
+        WGRBuildBestOwnedWeaponSetupForSpec(
+            characterName,
+            character,
+            specID,
+            allowedConfigs
+        )
+    if ownedLevel and ownedLevel > 0 and (not bestLevel or ownedLevel > bestLevel) then
+        bestLevel = ownedLevel
+        bestBaseline = ownedBaseline
+    end
+
+    if not bestLevel then
+        return 0, nil, "uninitialized"
+    end
+
+    if bestBaseline then
+        bestBaseline.effectiveSetupLevel = bestLevel
+    end
+
+    return bestLevel, bestBaseline, "known"
+end
+
+-- Diagnostic/public read-only helper. Returns the strongest complete setup
+-- that can be assembled from the character's cached physically owned weapon
+-- components for the requested spec. This never scans storage.
+function WGRGetOwnedCompatibleWeaponSetupForSpec(
+    characterName,
+    character,
+    specID
+)
+    local allowedConfigs =
+        WGRGetAllowedBaselineConfigs(
+            characterName,
+            specID
+        )
+
+    return
+        WGRBuildBestOwnedWeaponSetupForSpec(
+            characterName,
+            character,
+            specID,
+            allowedConfigs
         )
 end
 
@@ -2263,7 +2646,7 @@ function WGRGetSpecificSpecWeaponComparisonLevel(
     -- Gear Finder will later make the stricter decision about whether a full
     -- candidate setup can actually be equipped as an upgrade.
     local baseline =
-        WGRGetBestKnownCompleteWeaponBaseline(
+        WGRGetRoutingSpecWeaponBaseline(
             characterName,
             character,
             specID
@@ -2464,7 +2847,7 @@ function WGRGetIncomingWeaponUpgradeForSpecificSpec(
     -- "this candidate is averaged" from "this 2H is measured over an
     -- existing paired weapon average."
     local _, baselineRecord =
-        WGRGetBestKnownCompleteWeaponBaseline(
+        WGRGetRoutingSpecWeaponBaseline(
             characterName,
             character,
             specID
@@ -2497,6 +2880,33 @@ function WGRGetIncomingWeaponUpgradeForSpecificSpec(
 
             local main = tonumber(known and known.mainHandLevel) or 0
             local off = tonumber(known and known.offHandLevel) or 0
+
+            -- Incoming paired components must be evaluated with the strongest
+            -- compatible Soulbound partner the character physically owns, not
+            -- merely whichever historical saved setup WGR happened to select.
+            -- The routing floor already uses this owned state; using the same
+            -- partner here prevents a strong incoming off-hand/shield from
+            -- being undervalued because an older spec record has a weak 1H
+            -- (and vice versa). Transferable Warbound/BoE items are excluded
+            -- by the Soulbound-only owned-component cache.
+            local ownedConfigLevel, ownedConfig =
+                WGRBuildBestOwnedWeaponSetupForSpec(
+                    characterName,
+                    character,
+                    specID,
+                    { config }
+                )
+
+            if ownedConfigLevel and ownedConfig then
+                main = math.max(
+                    main,
+                    tonumber(ownedConfig.mainHandLevel) or 0
+                )
+                off = math.max(
+                    off,
+                    tonumber(ownedConfig.offHandLevel) or 0
+                )
+            end
 
             -- A freshly equipped half of an otherwise uninitialized paired
             -- setup is intentionally not written into the authoritative saved
@@ -2621,9 +3031,49 @@ function WGRGetIncomingWeaponUpgradeForSpecificSpec(
                 or config == "DUAL_1H"
                 or config == "DUAL_2H"
 
-            if pairedConfig and overallBaseline <= 0 and improvesComponent then
+            -- A valid paired component can still be useful even when its
+            -- partner is not currently known.  Keep this distinct from a
+            -- complete candidate: routing may send the component, while Gear
+            -- Finder still waits for a complete setup before recommending an
+            -- equip action.  Compare the incoming component against both the
+            -- known same-slot component and any complete routing floor so we
+            -- do not resurrect weaker partial alternatives below a proven
+            -- complete setup.
+            local missingPartnerForIncoming = false
+            local currentComponentLevel = 0
+
+            if config == "ONE_HAND_PLUS_OFFHAND"
+                or config == "ONE_HAND_PLUS_SHIELD"
+            then
+                if comparisonType == "WEAPON" then
+                    missingPartnerForIncoming = off <= 0
+                    currentComponentLevel = main
+                elseif comparisonType == "OFFHAND" then
+                    missingPartnerForIncoming = main <= 0
+                    currentComponentLevel = off
+                end
+            elseif config == "DUAL_1H"
+                or config == "DUAL_2H"
+            then
+                if comparisonType == "WEAPON" and main <= 0 and off <= 0 then
+                    missingPartnerForIncoming = true
+                    currentComponentLevel = 0
+                end
+            end
+
+            if pairedConfig
+                and candidateScore == nil
+                and missingPartnerForIncoming
+                and (
+                    currentComponentLevel <= 0
+                    or newItemLevel > currentComponentLevel
+                )
+                and (
+                    overallBaseline <= 0
+                    or newItemLevel > overallBaseline
+                )
+            then
                 sawIncompleteUsefulSetup = true
-                candidateScore = nil
             end
 
             if improvesComponent and candidateScore then
@@ -3166,7 +3616,9 @@ function WGRDetectWeaponConfigurationForSpec(
 
     -- If the spec previously established a multi-slot configuration,
     -- removing one side must not collapse it into a simpler configuration.
-    if existingBaseline then
+    if existingBaseline
+        and detected.state ~= "INITIALIZED"
+    then
         local previous =
             existingBaseline.weaponConfig
 

@@ -1709,6 +1709,29 @@ function WGRCreateGearSearchView(
         )
 
         if search then
+            -- Gear Search is long-term inventory tracking, so an explicit
+            -- request to view it should reconcile currently readable storage
+            -- even while live routing presentation is paused.
+            if WGRRoutingIsPaused
+                and WGRRoutingIsPaused()
+            then
+                if WGRBeginRoutingEvaluationCache then WGRBeginRoutingEvaluationCache() end
+
+                if WGRRefreshHeldGearSnapshot then
+                    WGRRefreshHeldGearSnapshot(
+                        true,
+                        true,
+                        true
+                    )
+                end
+
+                if WGRRefreshWarbandHeldGearSnapshot then
+                    WGRRefreshWarbandHeldGearSnapshot()
+                end
+
+                if WGREndRoutingEvaluationCache then WGREndRoutingEvaluationCache() end
+            end
+
             Render()
         else
             if WGRRefreshGearFinder then
