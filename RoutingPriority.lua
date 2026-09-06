@@ -321,6 +321,14 @@ function WGRRemoveCharacter(characterName)
         WarboundGearRouterDB.heldGearSnapshots[key] = nil
     end
 
+    if WarboundGearRouterDB.mailGearTracking then
+        WarboundGearRouterDB.mailGearTracking[key] = nil
+    end
+
+    if WGRNotifyGearSearchChanged then
+        WGRNotifyGearSearchChanged()
+    end
+
     if WarboundGearRouterDB.ownedWeaponComponents then
         WarboundGearRouterDB.ownedWeaponComponents[key] = nil
     end

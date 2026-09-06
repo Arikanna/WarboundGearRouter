@@ -11,6 +11,843 @@ WGRMail = {
 }
 local WGR_MAIL_MAX = ATTACHMENTS_MAX_SEND or 12
 
+-- Gear Search MAIL tracking is intentionally separate from the existing
+-- recipient mail-reminder state. It records physical item location only.
+-- Routing destination is recalculated elsewhere and must never overwrite
+-- this physical holder/location record.
+local function WGRMailNormalizeCharacterName(name)
+    if not name or name == "" then
+        return nil
+    end
+
+    local clean = tostring(name)
+
+    if Ambiguate then
+        local ok, shortName = pcall(Ambiguate, clean, "short")
+        if ok and shortName and shortName ~= "" then
+            clean = shortName
+        end
+    end
+
+    clean = clean:match("^([^%-]+)") or clean
+    clean = strtrim(clean)
+
+    if clean == "" then
+        return nil
+    end
+
+    return clean
+end
+
+local function WGRMailResolveTrackedRecipient(name)
+    local shortName = WGRMailNormalizeCharacterName(name)
+    if not shortName then
+        return nil
+    end
+
+    if WGRIsCharacterRemoved and WGRIsCharacterRemoved(shortName) then
+        return nil
+    end
+
+    local targetKey = string.lower(shortName)
+
+    for _, rosterName in ipairs(GetRoutingPriority and GetRoutingPriority() or {}) do
+        local rosterShort = WGRMailNormalizeCharacterName(rosterName)
+        if rosterShort and string.lower(rosterShort) == targetKey then
+            if not (WGRIsCharacterRemoved and WGRIsCharacterRemoved(rosterName)) then
+                return rosterName
+            end
+        end
+    end
+
+    return nil
+end
+
+local function WGRMailGearTrackingTable()
+    InitializeDatabase()
+    WarboundGearRouterDB.mailGearTracking =
+        WarboundGearRouterDB.mailGearTracking or {}
+    return WarboundGearRouterDB.mailGearTracking
+end
+
+local function WGRMailRawGearKeyForItem(itemLink)
+    if not itemLink or not WGRClassifyHeldGearItem then
+        return nil
+    end
+
+    local section, category, subtype =
+        WGRClassifyHeldGearItem(itemLink)
+
+    if not section or not category then
+        return nil
+    end
+
+    return table.concat({
+        tostring(section),
+        tostring(category),
+        tostring(subtype or ""),
+    }, "\031")
+end
+
+local function WGRMailGearKeyForItem(itemLink)
+    if not itemLink then
+        return nil
+    end
+
+    local recommendation =
+        WGRBuildLoadedItemRecommendation
+        and WGRBuildLoadedItemRecommendation(itemLink)
+        or nil
+
+    if recommendation
+        and (
+            recommendation.kind == "sell"
+            or recommendation.kind == "no_current_upgrade"
+        )
+    then
+        return nil
+    end
+
+    return WGRMailRawGearKeyForItem(itemLink)
+end
+
+local function WGRMailItemID(itemLink)
+    if not itemLink then
+        return nil
+    end
+
+    if C_Item and C_Item.GetItemInfoInstant then
+        local itemID = C_Item.GetItemInfoInstant(itemLink)
+        if itemID then
+            return tonumber(itemID)
+        end
+    end
+
+    if GetItemInfoInstant then
+        local itemID = GetItemInfoInstant(itemLink)
+        if itemID then
+            return tonumber(itemID)
+        end
+    end
+
+    return tonumber(tostring(itemLink):match("item:(%d+)"))
+end
+
+local function WGRMailPhysicalIdentityKey(itemLink, gearKey)
+    local itemID = WGRMailItemID(itemLink)
+    if not itemID or not gearKey then
+        return nil
+    end
+
+    return tostring(itemID) .. "\031" .. tostring(gearKey)
+end
+
+local function WGRMailRememberGearSearchContinuity(characterName, itemLink, gearKey)
+    if not characterName or not itemLink or not gearKey then return end
+    InitializeDatabase()
+    WarboundGearRouterDB.gearSearchMailContinuity =
+        WarboundGearRouterDB.gearSearchMailContinuity or {}
+
+    local characterKey = string.lower(characterName)
+    local records = WarboundGearRouterDB.gearSearchMailContinuity[characterKey]
+    if type(records) ~= "table" then
+        records = {}
+        WarboundGearRouterDB.gearSearchMailContinuity[characterKey] = records
+    end
+
+    local identityKey = WGRMailPhysicalIdentityKey(itemLink, gearKey)
+    if identityKey then
+        records[identityKey] = (tonumber(records[identityKey]) or 0) + 1
+    end
+end
+
+local function WGRMailCurrentBagIdentityMultiset()
+    local counts = {}
+
+    if not C_Container
+        or not C_Container.GetContainerNumSlots
+        or not C_Container.GetContainerItemLink
+    then
+        return counts
+    end
+
+    -- Match the same carried-bag range already used by WBGR's held-gear
+    -- snapshots. This is a targeted current-character reconciliation pass,
+    -- not a cross-character or bank rescan.
+    for bagID = 0, 5 do
+        local slots = C_Container.GetContainerNumSlots(bagID) or 0
+
+        for slotID = 1, slots do
+            local itemLink = C_Container.GetContainerItemLink(bagID, slotID)
+            if itemLink then
+                local gearKey = WGRMailGearKeyForItem(itemLink)
+                local identityKey = WGRMailPhysicalIdentityKey(itemLink, gearKey)
+
+                if identityKey then
+                    counts[identityKey] = (counts[identityKey] or 0) + 1
+                end
+            end
+        end
+    end
+
+    return counts
+end
+
+local function WGRMailCaptureDraftItems(recipientOverride)
+    local items = {}
+
+    for index = 1, WGR_MAIL_MAX do
+        local itemLink =
+            GetSendMailItemLink
+            and GetSendMailItemLink(index)
+            or nil
+
+        if itemLink then
+            local gearKey = WGRMailGearKeyForItem(itemLink)
+            if gearKey then
+                items[#items + 1] = {
+                    itemLink = itemLink,
+                    gearKey = gearKey,
+                    itemID = WGRMailItemID(itemLink),
+                }
+            end
+        end
+    end
+
+    local recipient = recipientOverride
+
+    if (not recipient or recipient == "")
+        and SendMailNameEditBox
+        and SendMailNameEditBox.GetText
+    then
+        recipient = strtrim(SendMailNameEditBox:GetText() or "")
+    end
+
+    WGRMail.pendingGearDraft = {
+        recipient = recipient,
+        items = items,
+        capturedAt = time(),
+    }
+
+    return WGRMail.pendingGearDraft
+end
+
+local function WGRMailCommitGearSend(recipient, draft)
+    local trackedRecipient =
+        WGRMailResolveTrackedRecipient(recipient)
+
+    if not trackedRecipient then
+        return false
+    end
+
+    local items =
+        draft
+        and draft.items
+        or nil
+
+    if type(items) ~= "table" or #items == 0 then
+        return false
+    end
+
+    local tracking = WGRMailGearTrackingTable()
+    local key = string.lower(trackedRecipient)
+    local entry = tracking[key]
+
+    if not entry then
+        entry = {
+            name = trackedRecipient,
+            items = {},
+        }
+        tracking[key] = entry
+    end
+
+    entry.name = trackedRecipient
+    entry.items = entry.items or {}
+
+    local sender = UnitName("player")
+    local now = time()
+
+    for _, item in ipairs(items) do
+        if item.gearKey then
+            entry.items[#entry.items + 1] = {
+                itemLink = item.itemLink,
+                gearKey = item.gearKey,
+                itemID = item.itemID or WGRMailItemID(item.itemLink),
+                sender = sender,
+                sentAt = now,
+            }
+        end
+    end
+
+    entry.updated = now
+    entry.seenInInbox = false
+
+    if WGRNotifyGearSearchChanged then
+        WGRNotifyGearSearchChanged()
+    end
+
+    return true, trackedRecipient
+end
+
+
+
+local function WGRMailRefreshReturnCache()
+    if not WGRMail then return end
+
+    local tracking = WGRMailGearTrackingTable()
+    local currentName = WGRMailNormalizeCharacterName(UnitName("player"))
+    local currentKey = currentName and string.lower(currentName) or nil
+    local currentEntry = currentKey and tracking[currentKey] or nil
+
+    -- Match inbox attachments against already-tracked MAIL state whenever the
+    -- current recipient is tracked.  Removed characters intentionally have no
+    -- personal WBGR MAIL state, so for them we cache only classifiable gear so
+    -- a user-initiated Return can reintroduce qualifying gear to a tracked
+    -- original sender without exposing the Removed character in Gear Search.
+    local expected = {}
+    local expectedSenders = {}
+    if currentEntry and type(currentEntry.items) == "table" then
+        for _, item in ipairs(currentEntry.items) do
+            local identityKey =
+                WGRMailPhysicalIdentityKey(item.itemLink, item.gearKey)
+            if identityKey then
+                expected[identityKey] = (expected[identityKey] or 0) + 1
+                expectedSenders[identityKey] = expectedSenders[identityKey] or {}
+                expectedSenders[identityKey][#expectedSenders[identityKey] + 1] = item.sender
+            end
+        end
+    end
+
+    local cache = {}
+    local inboxCount =
+        GetInboxNumItems
+        and select(1, GetInboxNumItems())
+        or 0
+
+    for mailIndex = 1, inboxCount do
+        local sender = nil
+        if GetInboxHeaderInfo then
+            local _, _, headerSender = GetInboxHeaderInfo(mailIndex)
+            sender = headerSender
+        end
+
+        local items = {}
+        local matched = {}
+        for attachmentIndex = 1, (ATTACHMENTS_MAX_RECEIVE or 16) do
+            local itemLink =
+                GetInboxItemLink
+                and GetInboxItemLink(mailIndex, attachmentIndex)
+                or nil
+
+            if itemLink then
+                local rawGearKey = WGRMailRawGearKeyForItem(itemLink)
+                local identityKey =
+                    WGRMailPhysicalIdentityKey(itemLink, rawGearKey)
+
+                if currentEntry then
+                    local available = identityKey and expected[identityKey] or 0
+                    local alreadyMatched = identityKey and matched[identityKey] or 0
+
+                    if identityKey and available > alreadyMatched then
+                        local senderList = expectedSenders[identityKey]
+                        local originalSender =
+                            senderList
+                            and senderList[alreadyMatched + 1]
+                            or nil
+
+                        items[#items + 1] = {
+                            itemLink = itemLink,
+                            gearKey = rawGearKey,
+                            itemID = WGRMailItemID(itemLink),
+                            originalSender = originalSender,
+                        }
+                        matched[identityKey] = alreadyMatched + 1
+                    end
+                elseif rawGearKey then
+                    items[#items + 1] = {
+                        itemLink = itemLink,
+                        gearKey = rawGearKey,
+                        itemID = WGRMailItemID(itemLink),
+                    }
+                end
+            end
+        end
+
+        cache[mailIndex] = {
+            sender = sender,
+            items = items,
+            capturedAt = time(),
+        }
+    end
+
+    WGRMail.returnInboxCache = cache
+end
+
+local function WGRMailPrimeReturn(mailIndex)
+    mailIndex = tonumber(mailIndex)
+    if not mailIndex or mailIndex < 1 then
+        return false
+    end
+
+    local cached =
+        WGRMail
+        and WGRMail.returnInboxCache
+        and WGRMail.returnInboxCache[mailIndex]
+        or nil
+
+    if not cached or type(cached.items) ~= "table" or #cached.items == 0 then
+        return false
+    end
+
+    local items = {}
+    for _, item in ipairs(cached.items) do
+        items[#items + 1] = {
+            itemLink = item.itemLink,
+            gearKey = item.gearKey,
+            itemID = item.itemID,
+            originalSender = item.originalSender,
+        }
+    end
+
+    WGRMail.pendingReturn = {
+        mailIndex = mailIndex,
+        sender = cached.sender,
+        items = items,
+        capturedAt = time(),
+    }
+
+    return true
+end
+
+local function WGRMailPendingReturnStillInInbox(pending)
+    if not pending or type(pending.items) ~= "table" or #pending.items == 0 then
+        return false
+    end
+
+    local targetSender =
+        WGRMailNormalizeCharacterName(pending.sender)
+    local needed = {}
+    for _, item in ipairs(pending.items) do
+        local identityKey =
+            WGRMailPhysicalIdentityKey(item.itemLink, item.gearKey)
+        if identityKey then
+            needed[identityKey] = (needed[identityKey] or 0) + 1
+        end
+    end
+
+    local inboxCount =
+        GetInboxNumItems
+        and select(1, GetInboxNumItems())
+        or 0
+
+    for mailIndex = 1, inboxCount do
+        local sender = nil
+        if GetInboxHeaderInfo then
+            local _, _, headerSender = GetInboxHeaderInfo(mailIndex)
+            sender = WGRMailNormalizeCharacterName(headerSender)
+        end
+
+        if not targetSender
+            or not sender
+            or string.lower(sender) == string.lower(targetSender)
+        then
+            local found = {}
+            for attachmentIndex = 1, (ATTACHMENTS_MAX_RECEIVE or 16) do
+                local itemLink =
+                    GetInboxItemLink
+                    and GetInboxItemLink(mailIndex, attachmentIndex)
+                    or nil
+                if itemLink then
+                    local rawGearKey = WGRMailRawGearKeyForItem(itemLink)
+                    local identityKey =
+                        WGRMailPhysicalIdentityKey(itemLink, rawGearKey)
+                    if identityKey then
+                        found[identityKey] = (found[identityKey] or 0) + 1
+                    end
+                end
+            end
+
+            local matchesAll = true
+            for identityKey, count in pairs(needed) do
+                if (found[identityKey] or 0) < count then
+                    matchesAll = false
+                    break
+                end
+            end
+            if matchesAll then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function WGRMailFinalizePendingReturn()
+    local pending = WGRMail and WGRMail.pendingReturn or nil
+    if not pending then
+        return false
+    end
+
+    -- MAIL_INBOX_UPDATE can fire before the returned message has fully left
+    -- the inbox.  Do not transfer ownership until the staged message is no
+    -- longer observable.
+    if WGRMailPendingReturnStillInInbox(pending) then
+        return false
+    end
+
+    local persistedSender = nil
+    for _, item in ipairs(pending.items or {}) do
+        if item.originalSender then
+            persistedSender = item.originalSender
+            break
+        end
+    end
+
+    local sender = persistedSender or pending.sender
+    local trackedSender = WGRMailResolveTrackedRecipient(sender)
+    local returnDestination =
+        WGRMailNormalizeCharacterName(sender)
+        or sender
+
+    -- Whether or not the return target is tracked, the pending action is now
+    -- complete because the original inbox message is gone.
+    WGRMail.pendingReturn = nil
+
+    local returnedItems = pending.items or {}
+    if #returnedItems == 0 then
+        return false
+    end
+
+    local tracking = WGRMailGearTrackingTable()
+    local currentName = WGRMailNormalizeCharacterName(UnitName("player"))
+    local currentKey = currentName and string.lower(currentName) or nil
+    local currentEntry = currentKey and tracking[currentKey] or nil
+
+    -- Remove the returned copies from the current tracked recipient, if any.
+    if currentEntry and type(currentEntry.items) == "table" then
+        local needed = {}
+        for _, returnedItem in ipairs(returnedItems) do
+            local identityKey =
+                WGRMailPhysicalIdentityKey(returnedItem.itemLink, returnedItem.gearKey)
+            if identityKey then
+                needed[identityKey] = (needed[identityKey] or 0) + 1
+            end
+        end
+
+        for index = #currentEntry.items, 1, -1 do
+            local item = currentEntry.items[index]
+            local identityKey =
+                WGRMailPhysicalIdentityKey(item.itemLink, item.gearKey)
+            local remaining = identityKey and needed[identityKey] or 0
+            if remaining and remaining > 0 then
+                table.remove(currentEntry.items, index)
+                needed[identityKey] = remaining - 1
+            end
+        end
+
+        if #(currentEntry.items or {}) == 0 then
+            tracking[currentKey] = nil
+
+            -- A successful Return removes the tracked gear from the current
+            -- recipient's MAIL state.  Clear that recipient's legacy/message-
+            -- level Retrieve Mail reminder at the same transition so To Do
+            -- follows the physical MAIL ownership transfer.  Do this silently
+            -- rather than using WGRMailMarkChecked(), because a Return is not
+            -- a mail retrieval and should not log MAIL_RETRIEVED activity.
+            local reminderTracking =
+                WarboundGearRouterDB
+                and WarboundGearRouterDB.mailTracking
+            if reminderTracking and currentKey then
+                reminderTracking[currentKey] = nil
+            end
+        else
+            currentEntry.updated = time()
+        end
+    end
+
+    local committed = false
+    local resolvedSender = nil
+
+    -- Re-enter item-aware MAIL tracking only when the return destination is
+    -- an Active/Ignored tracked roster character.  A Removed/non-roster
+    -- destination intentionally remains outside WBGR after the return.
+    if trackedSender then
+        committed, resolvedSender =
+            WGRMailCommitGearSend(
+                trackedSender,
+                {
+                    recipient = trackedSender,
+                    items = returnedItems,
+                    capturedAt = time(),
+                    returned = true,
+                }
+            )
+
+        if committed and resolvedSender and WGRMailRecordSend then
+            WGRMailRecordSend(resolvedSender)
+        end
+    end
+
+    -- Recent Activity records the meaningful manual return even when the
+    -- destination is Removed/non-roster and therefore leaves WBGR tracking.
+    if returnDestination and WGRAddRecentActivity then
+        local returnedCount = #returnedItems
+        local returningCharacter = WGRMailNormalizeCharacterName(UnitName and UnitName("player") or nil)
+            or (UnitName and UnitName("player"))
+            or "Current character"
+        WGRAddRecentActivity(
+            tostring(returningCharacter)
+            .. " returned "
+            .. tostring(returnedCount)
+            .. (returnedCount == 1 and " item to " or " items to ")
+            .. tostring(returnDestination)
+            .. ".",
+            "MAIL_RETURNED"
+        )
+    end
+
+    if WGRRefreshTodoPage then
+        WGRRefreshTodoPage()
+    end
+
+    return committed
+end
+
+local function WGRMailInboxAttachmentMultiset()
+    local actual = {}
+    local returned = {}
+    local inboxCount =
+        GetInboxNumItems
+        and select(1, GetInboxNumItems())
+        or 0
+
+    for mailIndex = 1, inboxCount do
+        local _, _, sender, _, _, _, _, _, _, wasReturned =
+            GetInboxHeaderInfo(mailIndex)
+
+        local senderKey =
+            string.lower(WGRMailNormalizeCharacterName(sender) or "")
+
+        for attachmentIndex = 1, (ATTACHMENTS_MAX_RECEIVE or 16) do
+            local itemLink =
+                GetInboxItemLink
+                and GetInboxItemLink(mailIndex, attachmentIndex)
+                or nil
+
+            if itemLink then
+                -- Gear Search tracks the item's searchable gear identity, not
+                -- the exact serialized hyperlink. Blizzard can normalize or
+                -- rebuild a link between send and receive, so reconciliation
+                -- must use the same Gear Search key that was captured on send.
+                local gearKey = WGRMailGearKeyForItem(itemLink)
+
+                if gearKey then
+                    local matchKey = senderKey .. "\031" .. gearKey
+                    actual[matchKey] = (actual[matchKey] or 0) + 1
+                end
+
+                if wasReturned then
+                    returned[#returned + 1] = {
+                        sender = sender,
+                        itemLink = itemLink,
+                        gearKey = gearKey,
+                    }
+                end
+            end
+        end
+    end
+
+    return actual, returned, inboxCount
+end
+
+function WGRMailReconcileTrackedGearInbox()
+    if not WGRMail or not WGRMail.mailboxOpen then
+        return
+    end
+
+    local currentName = UnitName("player")
+    local currentTracked = WGRMailResolveTrackedRecipient(currentName)
+    if not currentTracked then
+        return
+    end
+
+    local tracking = WGRMailGearTrackingTable()
+    local currentKey = string.lower(currentTracked)
+    local entry = tracking[currentKey]
+    local actual, returned, inboxCount = WGRMailInboxAttachmentMultiset()
+    local changed = false
+
+    -- Returned mail becomes physically held by the original sender's MAIL.
+    -- Move matching outbound records back to the current character when the
+    -- inbox explicitly marks them as returned.
+    if #returned > 0 then
+        for _, returnedItem in ipairs(returned) do
+            local returnLink = returnedItem.itemLink
+            local returnFrom = WGRMailNormalizeCharacterName(returnedItem.sender)
+            local currentShort = WGRMailNormalizeCharacterName(currentTracked)
+
+            for destinationKey, destinationEntry in pairs(tracking) do
+                if destinationKey ~= currentKey and type(destinationEntry) == "table" then
+                    for index = #(destinationEntry.items or {}), 1, -1 do
+                        local item = destinationEntry.items[index]
+                        local originalSender = WGRMailNormalizeCharacterName(item.sender)
+                        local destinationName = WGRMailNormalizeCharacterName(destinationEntry.name)
+
+                        if (
+                                item.itemLink == returnLink
+                                or (
+                                    item.gearKey
+                                    and returnedItem.gearKey
+                                    and item.gearKey == returnedItem.gearKey
+                                )
+                            )
+                            and originalSender
+                            and currentShort
+                            and string.lower(originalSender) == string.lower(currentShort)
+                            and (
+                                not returnFrom
+                                or not destinationName
+                                or string.lower(returnFrom) == string.lower(destinationName)
+                            )
+                        then
+                            table.remove(destinationEntry.items, index)
+
+                            entry = entry or {
+                                name = currentTracked,
+                                items = {},
+                            }
+                            tracking[currentKey] = entry
+                            entry.items = entry.items or {}
+                            entry.items[#entry.items + 1] = {
+                                itemLink = item.itemLink,
+                                gearKey = item.gearKey,
+                                itemID = item.itemID or WGRMailItemID(item.itemLink),
+                                sender = destinationEntry.name,
+                                sentAt = time(),
+                                returned = true,
+                            }
+                            entry.seenInInbox = true
+                            changed = true
+                            break
+                        end
+                    end
+
+                    if #(destinationEntry.items or {}) == 0 then
+                        tracking[destinationKey] = nil
+                    end
+                end
+            end
+        end
+    end
+
+    entry = tracking[currentKey]
+    if entry and type(entry.items) == "table" then
+        local matchedAny = false
+        local promotedFromMailToBag = false
+        local retained = {}
+        local counts = {}
+        local bagCounts = WGRMailCurrentBagIdentityMultiset()
+        for key, count in pairs(actual) do counts[key] = count end
+
+        for _, item in ipairs(entry.items) do
+            local senderKey =
+                string.lower(WGRMailNormalizeCharacterName(item.sender) or "")
+            local matchKey = senderKey .. "\031" .. tostring(item.gearKey or "")
+            local available = counts[matchKey] or 0
+
+            if available > 0 then
+                counts[matchKey] = available - 1
+                retained[#retained + 1] = item
+                matchedAny = true
+            elseif entry.seenInInbox ~= true then
+                -- Self-heal records created by older test builds when the
+                -- attachment was already retrieved before item-aware inbox
+                -- reconciliation existed. If the expected mail attachment is
+                -- absent but the same tracked gear is physically present in
+                -- this character's carried bags, BAG is stronger evidence
+                -- than the stale MAIL prediction and the MAIL record can be
+                -- retired safely.
+                local identityKey =
+                    WGRMailPhysicalIdentityKey(
+                        item.itemLink,
+                        item.gearKey
+                    )
+                local bagAvailable =
+                    identityKey
+                    and (bagCounts[identityKey] or 0)
+                    or 0
+
+                if bagAvailable > 0 then
+                    bagCounts[identityKey] = bagAvailable - 1
+                    WGRMailRememberGearSearchContinuity(
+                        currentTracked,
+                        item.itemLink,
+                        item.gearKey
+                    )
+                    promotedFromMailToBag = true
+                    changed = true
+                else
+                    -- Until at least one expected attachment has been
+                    -- positively observed, do not erase a freshly-sent
+                    -- record merely because inbox population can lag behind
+                    -- MAIL_SHOW/MAIL_INBOX_UPDATE.
+                    retained[#retained + 1] = item
+                end
+            else
+                changed = true
+            end
+        end
+
+        if matchedAny then
+            entry.seenInInbox = true
+            entry.lastInboxSeenAt = time()
+        elseif entry.seenInInbox == true and inboxCount == 0 then
+            changed = true
+        end
+
+        entry.items = retained
+        entry.updated = time()
+
+        if promotedFromMailToBag and WGRRefreshHeldGearSnapshot then
+            -- We positively found the former MAIL item in the recipient's
+            -- carried bags. Mail/inventory events can report before the normal
+            -- held-gear routing state has fully settled, so do one immediate
+            -- BAG-only refresh and one short deferred BAG-only refresh. This
+            -- rare reconciliation path deliberately avoids PBK/WBK rescans.
+            WGRRefreshHeldGearSnapshot(false, true, false)
+
+            if C_Timer and C_Timer.After then
+                C_Timer.After(
+                    0.35,
+                    function()
+                        if WGRRefreshHeldGearSnapshot then
+                            WGRRefreshHeldGearSnapshot(false, true, false)
+                        end
+                    end
+                )
+            end
+        end
+
+        if #entry.items == 0 then
+            tracking[currentKey] = nil
+
+            -- Item-aware MAIL tracking is authoritative for tracked gear.
+            -- This also clears Retrieve Mail To Do for manual sends, which do
+            -- not necessarily use the legacy "Alt Gear" mail subject.
+            if WGRMailMarkChecked then
+                WGRMailMarkChecked(currentTracked)
+            elseif WGRRefreshTodoPage then
+                WGRRefreshTodoPage()
+            end
+        end
+    end
+
+    if changed and WGRNotifyGearSearchChanged then
+        WGRNotifyGearSearchChanged()
+    end
+end
+
 -- Forward declaration: early draft-clear callbacks rescan before the
 -- implementation appears later in this module.
 local WGRMailScan
@@ -454,6 +1291,110 @@ local function WGRMailBagItems()
     return items
 end
 
+local function WGRMailCanViewPersonalBank()
+    if not C_Bank
+        or not Enum
+        or not Enum.BankType
+        or Enum.BankType.Character == nil
+    then
+        return false
+    end
+
+    if C_Bank.CanViewBank then
+        local ok, result =
+            pcall(
+                C_Bank.CanViewBank,
+                Enum.BankType.Character
+            )
+
+        if ok then
+            return result == true
+        end
+    end
+
+    if C_Bank.CanUseBank then
+        local ok, result =
+            pcall(
+                C_Bank.CanUseBank,
+                Enum.BankType.Character
+            )
+
+        if ok then
+            return result == true
+        end
+    end
+
+    return false
+end
+
+local function WGRMailCountPersonalBankOutgoing()
+    if not WGRMailCanViewPersonalBank() then
+        return nil
+    end
+
+    if not C_Bank
+        or not C_Bank.FetchPurchasedBankTabIDs
+    then
+        return nil
+    end
+
+    local ok, tabIDs =
+        pcall(
+            C_Bank.FetchPurchasedBankTabIDs,
+            Enum.BankType.Character
+        )
+
+    if not ok
+        or type(tabIDs) ~= "table"
+    then
+        return nil
+    end
+
+    local count = 0
+
+    for _, bagID
+        in ipairs(tabIDs)
+    do
+        local slots =
+            C_Container.GetContainerNumSlots(
+                bagID
+            )
+            or 0
+
+        for slotID = 1, slots do
+            local itemLink =
+                C_Container.GetContainerItemLink(
+                    bagID,
+                    slotID
+                )
+
+            if itemLink
+                and IsTransferableContainerItem(
+                    bagID,
+                    slotID,
+                    itemLink
+                )
+            then
+                local result =
+                    WGRMailEvaluateItem(
+                        itemLink
+                    )
+
+                local destination =
+                    WGRMailDestination(
+                        result
+                    )
+
+                if destination then
+                    count = count + 1
+                end
+            end
+        end
+    end
+
+    return count
+end
+
 local WGRMailPrepareDestination
 local WGRMailPrepareNext
 
@@ -529,6 +1470,37 @@ local WGRMailTodoSnapshotDirty =
 WGRMailScan = function(
     callback
 )
+    local currentName = UnitName("player")
+
+    -- Removed characters are outside WBGR routing for their personal Bags/PBK.
+    -- Keep Mail Router consistent with Gear Finder/tooltips/overlays and do not
+    -- discover or route outgoing gear from a Removed character's carried bags.
+    if currentName
+        and WGRIsCharacterRemoved
+        and WGRIsCharacterRemoved(currentName)
+    then
+        WGRMail.destinations = {}
+        WGRMailTodoSnapshotDirty = false
+
+        if WGRUpdateGearTodoSnapshot then
+            WGRUpdateGearTodoSnapshot(
+                currentName,
+                0,
+                nil,
+                false,
+                0
+            )
+        end
+
+        WGRMailUpdateRows()
+
+        if callback then
+            callback()
+        end
+
+        return
+    end
+
     local items =
         WGRMailBagItems()
 
@@ -631,11 +1603,15 @@ WGRMailScan = function(
     end
 
     if WGRUpdateGearTodoSnapshot then
+        local personalBankOutgoing =
+            WGRMailCountPersonalBankOutgoing()
+
         WGRUpdateGearTodoSnapshot(
             UnitName("player"),
             totalOutgoing,
             nil,
-            false
+            false,
+            personalBankOutgoing
         )
     end
 
@@ -1941,11 +2917,52 @@ WGRMailBagTodoRefresh:SetScript(
     end
 )
 
+local WGRMailReturnPreClickHooked = false
+
+local function WGRMailInstallReturnPreClickHook()
+    if WGRMailReturnPreClickHooked then
+        return
+    end
+
+    if not OpenMailDeleteButton or not OpenMailDeleteButton.HookScript then
+        return
+    end
+
+    OpenMailDeleteButton:HookScript(
+        "PreClick",
+        function()
+            local mailIndex =
+                InboxFrame
+                and InboxFrame.openMailID
+                or nil
+
+            if not mailIndex then
+                return
+            end
+
+            -- This Blizzard button serves both Delete and Return. Only stage
+            -- a transfer when the open message is actually returnable.
+            local canDelete = InboxItemCanDelete and InboxItemCanDelete(mailIndex)
+            if canDelete then
+                return
+            end
+
+            WGRMailPrimeReturn(mailIndex)
+        end
+    )
+
+    WGRMailReturnPreClickHooked = true
+end
+
 local WGRMailEvents=CreateFrame("Frame")
+
+WGRMailInstallReturnPreClickHook()
+
 WGRMailEvents:RegisterEvent("MAIL_SHOW")
 WGRMailEvents:RegisterEvent("MAIL_CLOSED")
 WGRMailEvents:RegisterEvent("MAIL_SEND_SUCCESS")
 WGRMailEvents:RegisterEvent("MAIL_INBOX_UPDATE")
+WGRMailEvents:RegisterEvent("MAIL_SEND_INFO_UPDATE")
 WGRMailEvents:RegisterEvent("PLAYER_LOGOUT")
 WGRMailEvents:RegisterEvent("PLAYER_LOGIN")
 WGRMailEvents:SetScript("OnEvent",function(_,event)
@@ -1955,6 +2972,14 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
     )
 
     if event=="MAIL_SHOW" then
+        WGRMailInstallReturnPreClickHook()
+        WGRMailRefreshReturnCache()
+        C_Timer.After(0.35, function()
+            if WGRMail and WGRMail.mailboxOpen then
+                WGRMailRefreshReturnCache()
+            end
+        end)
+
         WGRMail.mailboxOpen=true
 
         WGRUpdateOpenRouterButton()
@@ -1980,6 +3005,18 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         end
 
         WGRMailQueueInboxScan()
+
+        C_Timer.After(
+            0.60,
+            function()
+                if WGRMail
+                    and WGRMail.mailboxOpen
+                    and WGRMailReconcileTrackedGearInbox
+                then
+                    WGRMailReconcileTrackedGearInbox()
+                end
+            end
+        )
 
         local f=WGRMailCreateFrame()
         f:ClearAllPoints()
@@ -2087,10 +3124,50 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
             0.25,
             SettleInitialScan
         )
+    elseif event=="MAIL_SEND_INFO_UPDATE" then
+        WGRMailCaptureDraftItems()
+
     elseif event=="MAIL_INBOX_UPDATE" then
         WGRMailQueueInboxScan()
 
+        -- A Return is staged before Blizzard processes it.  Finalize that
+        -- physical MAIL -> MAIL transfer only after the inbox update settles
+        -- and the original message is no longer observable.  Do this before
+        -- rebuilding the return cache or normal inbox reconciliation so the
+        -- staged sender/item identity cannot be overwritten by shifted rows.
+        C_Timer.After(
+            0.20,
+            function()
+                if not (WGRMail and WGRMail.mailboxOpen) then
+                    return
+                end
+
+                WGRMailFinalizePendingReturn()
+                WGRMailRefreshReturnCache()
+            end
+        )
+
+        C_Timer.After(
+            0.35,
+            function()
+                if WGRMail
+                    and WGRMail.mailboxOpen
+                    and WGRMailReconcileTrackedGearInbox
+                then
+                    -- One last return-finalization attempt covers clients
+                    -- whose first inbox update fires before the row vanishes.
+                    WGRMailFinalizePendingReturn()
+                    WGRMailReconcileTrackedGearInbox()
+                    WGRMailRefreshReturnCache()
+                end
+            end
+        )
+
     elseif event=="MAIL_CLOSED" then
+        if WGRMail then
+            WGRMail.returnInboxCache = nil
+            WGRMail.pendingReturn = nil
+        end
         WGRMailHandleMailboxHidden()
 
         if WGRRefreshTodoPage then
@@ -2099,8 +3176,13 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
     elseif event=="MAIL_SEND_SUCCESS" then
         local continue=WGRMail.prepareAll
 
+        local pendingGearDraft =
+            WGRMail.pendingGearDraft
+
         local sentRecipient =
             WGRMail.preparedRecipient
+            or WGRMail.pendingSendRecipient
+            or (pendingGearDraft and pendingGearDraft.recipient)
 
         local sentCount =
             tonumber(
@@ -2113,36 +3195,81 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         -- are reflected in the activity log.
 
         if sentRecipient then
-            WGRMailRecordSend(
-                sentRecipient
-            )
+            local trackedGearCommitted, trackedRecipient =
+                WGRMailCommitGearSend(
+                    sentRecipient,
+                    pendingGearDraft
+                )
 
-            if WGRAddRecentActivity then
+            -- Any qualifying tracked gear mailed to a tracked roster
+            -- character needs the same Retrieve Mail To Do reminder, whether
+            -- it was sent by WBGR Mail Router or through the normal mail UI.
+            -- This remains separate from Gear Search's physical MAIL record.
+            if trackedGearCommitted
+                and trackedRecipient
+                and WGRMailRecordSend
+            then
+                WGRMailRecordSend(
+                    trackedRecipient
+                )
+            end
+
+            -- Log any successful movement of WBGR-tracked gear into the
+            -- tracked roster, whether it was sent through Mail Router or
+            -- manually through the normal WoW mail UI.  Count only the
+            -- qualifying tracked gear attachments; unrelated attachments in
+            -- the same message are intentionally ignored by WBGR.
+            if trackedGearCommitted
+                and trackedRecipient
+                and WGRAddRecentActivity
+            then
                 local sender =
                     UnitName("player")
                     or "Current character"
 
-                WGRAddRecentActivity(
-                    tostring(sender)
-                    .. " sent "
-                    .. tostring(sentCount)
-                    .. " item"
-                    .. (
-                        sentCount == 1
-                        and ""
-                        or "s"
+                local trackedSentCount = 0
+
+                if pendingGearDraft
+                    and type(pendingGearDraft.items) == "table"
+                then
+                    trackedSentCount =
+                        #pendingGearDraft.items
+                end
+
+                -- Mail Router already knows its prepared tracked count. Keep
+                -- that as a fallback if the persisted draft did not expose
+                -- the item list for some reason.
+                if trackedSentCount <= 0 then
+                    trackedSentCount =
+                        tonumber(sentCount)
+                        or 0
+                end
+
+                if trackedSentCount > 0 then
+                    WGRAddRecentActivity(
+                        tostring(sender)
+                        .. " sent "
+                        .. tostring(trackedSentCount)
+                        .. " item"
+                        .. (
+                            trackedSentCount == 1
+                            and ""
+                            or "s"
+                        )
+                        .. " to "
+                        .. tostring(trackedRecipient)
+                        .. ".",
+                        "MAIL_SENT"
                     )
-                    .. " to "
-                    .. tostring(sentRecipient)
-                    .. ".",
-                    "MAIL_SENT"
-                )
+                end
             end
         end
 
         WGRMail.waitingForSend=false
         WGRMail.preparedRecipient=nil
         WGRMail.preparedCount=0
+        WGRMail.pendingSendRecipient=nil
+        WGRMail.pendingGearDraft=nil
         WGRMail.ownsDraft=false
         C_Timer.After(.35,function()
             if not WGRMail.mailboxOpen then return end
@@ -2185,3 +3312,24 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         WGRMailStop()
     end
 end)
+
+
+-- Capture ordinary/manual sends without replacing or wrapping Blizzard's
+-- SendMail function. MAIL_SEND_INFO_UPDATE normally keeps the attachment
+-- snapshot current; this secure post-hook supplies the final recipient name
+-- and performs a last best-effort capture while the draft is still readable.
+if hooksecurefunc and SendMail then
+    hooksecurefunc(
+        "SendMail",
+        function(recipient)
+            WGRMail.pendingSendRecipient = recipient
+
+            local current = WGRMail.pendingGearDraft
+            if not current or #(current.items or {}) == 0 then
+                WGRMailCaptureDraftItems(recipient)
+            elseif recipient and recipient ~= "" then
+                current.recipient = recipient
+            end
+        end
+    )
+end

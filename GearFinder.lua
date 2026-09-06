@@ -812,6 +812,12 @@ local function WGRGearFinderIsWarbandBankAvailable()
         )
 end
 
+function WGRGearFinderIsPersonalBankOpen()
+    return
+        WGRGearFinderPersonalBankOpen
+            == true
+end
+
 function WGRGearFinderIsWarbandBankOpen()
     return
         WGRGearFinderWarbandBankOpen
@@ -5218,7 +5224,31 @@ local function WGRGearFinderRender(
         rightLine:SetPoint("LEFT", content, "TOPLEFT", centerX + gap, y - 7)
         rightLine:SetPoint("RIGHT", content, "TOPLEFT", contentWidth - 8, y - 7)
         WGRGearFinderTrackChild(content, rightLine)
-        y = y - 28
+        y = y - 24
+
+        local advisory =
+            content:CreateFontString(
+                nil,
+                "OVERLAY",
+                "GameFontNormalSmall"
+            )
+        advisory:SetPoint(
+            "TOP",
+            content,
+            "TOPLEFT",
+            centerX,
+            y
+        )
+        advisory:SetTextColor(
+            1.00,
+            0.78,
+            0.18
+        )
+        advisory:SetText(
+            "|TInterface\\DialogFrame\\UI-Dialog-Icon-AlertNew:14:14:0:0|t Check To Do and Gather Gear before equipping."
+        )
+        WGRGearFinderTrackChild(content, advisory)
+        y = y - 24
     end
 
     if #activeSpecs == 0 then
@@ -6734,15 +6764,22 @@ local function WGRGearFinderRender(
                 classified.onward
             )
 
-        local carriedSendCount = 0
+        local bagSendCount = 0
+        local personalBankSendCount = 0
         local warbankSendCount = 0
 
         for _, record
             in ipairs(uniqueOnward)
         do
             if record.source == "BAGS" then
-                carriedSendCount =
-                    carriedSendCount + 1
+                bagSendCount =
+                    bagSendCount + 1
+            elseif record.source == "PERSONAL_BANK" then
+                -- Red/SEND ONWARDS gear in PBK remains actionable outgoing
+                -- work. Track it independently so BAG-only Mail Router
+                -- refreshes cannot erase the PBK reminder.
+                personalBankSendCount =
+                    personalBankSendCount + 1
             elseif record.source
                 == "WARBAND_BANK"
             then
@@ -6768,14 +6805,157 @@ local function WGRGearFinderRender(
             end
         end
 
+        -- Only replace the saved PBK outgoing count when the Personal
+        -- Bank is actually open/observed. Login and ordinary Gear Finder
+        -- refreshes cannot authoritatively see PBK contents and must retain
+        -- the last known count instead of clearing the To Do reminder.
+        local observedPersonalBankSendCount =
+            WGRGearFinderPersonalBankOpen
+                == true
+            and personalBankSendCount
+            or nil
+
         WGRUpdateGearTodoSnapshot(
             WGRGearFinderCurrentName(),
-            carriedSendCount,
+            bagSendCount,
             warbankSendCount,
             WGRGearFinderWarbandBankOpen
-                == true
+                == true,
+            observedPersonalBankSendCount
         )
     end
+end
+
+local function WGRGearFinderCollectCurrentPersonalBankOutgoing()
+    if not WGRGearFinderIsPersonalBankAvailable() then
+        return {}
+    end
+
+    local currentName =
+        WGRGearFinderCurrentName()
+
+    local outgoing = {}
+
+    if WGRBeginRoutingEvaluationCache then
+        WGRBeginRoutingEvaluationCache()
+    end
+
+    for _, record
+        in ipairs(
+            WGRGearFinderScanPersonalBank()
+        )
+    do
+        local recommendation =
+            WGRBuildLoadedItemRecommendation
+            and WGRBuildLoadedItemRecommendation(
+                record.itemLink
+            )
+            or nil
+
+        if recommendation
+            and recommendation.name
+            and not WGRGearFinderSameCharacter(
+                recommendation.name,
+                currentName
+            )
+            and (
+                recommendation.kind == "upgrade"
+                or recommendation.kind == "future_upgrade"
+                or recommendation.kind == "holder"
+                or recommendation.kind == "unknown"
+            )
+        then
+            outgoing[
+                #outgoing + 1
+            ] = record
+        end
+    end
+
+    if WGREndRoutingEvaluationCache then
+        WGREndRoutingEvaluationCache()
+    end
+
+    return outgoing
+end
+
+local function WGRGearFinderRefreshOutgoingTodoAfterMove()
+    if WGRMailRefreshCurrentTodoSnapshot then
+        C_Timer.After(
+            0.35,
+            function()
+                WGRMailRefreshCurrentTodoSnapshot(
+                    true,
+                    true
+                )
+            end
+        )
+    elseif WGRRefreshTodoPage then
+        C_Timer.After(
+            0.35,
+            WGRRefreshTodoPage
+        )
+    end
+end
+
+function WGRGearFinderMoveCurrentPersonalBankOutgoingToBags()
+    if not WGRGearFinderIsPersonalBankAvailable() then
+        print(
+            "|cffff5555WBGR:|r Open Personal Bank before moving routed items."
+        )
+        return
+    end
+
+    local records =
+        WGRGearFinderCollectCurrentPersonalBankOutgoing()
+
+    if #records == 0 then
+        print(
+            "|cff33ff99WBGR:|r No routed Personal Bank items currently need to move."
+        )
+        WGRGearFinderRefreshOutgoingTodoAfterMove()
+        return
+    end
+
+    WGRGearFinderMoveRecordsToBags(
+        records,
+        "routed Personal Bank item(s)"
+    )
+
+    WGRGearFinderRefreshOutgoingTodoAfterMove()
+end
+
+function WGRGearFinderDepositCurrentPersonalBankOutgoingToWarband()
+    if not WGRGearFinderIsPersonalBankAvailable() then
+        print(
+            "|cffff5555WBGR:|r Open Personal Bank before moving routed items."
+        )
+        return
+    end
+
+    if not WGRGearFinderIsWarbandBankAvailable() then
+        print(
+            "|cffff5555WBGR:|r Open the Warband Bank before depositing routed items."
+        )
+        return
+    end
+
+    local records =
+        WGRGearFinderCollectCurrentPersonalBankOutgoing()
+
+    if #records == 0 then
+        print(
+            "|cff33ff99WBGR:|r No routed Personal Bank items currently need to be deposited."
+        )
+        WGRGearFinderRefreshOutgoingTodoAfterMove()
+        return
+    end
+
+    WGRGearFinderDepositRecordsToWarband(
+        records,
+        "routed Personal Bank item(s)"
+    )
+
+    WGRGearFinderRefreshOutgoingTodoAfterMove()
 end
 
 function WGRGearFinderDepositCurrentOutgoingToWarband()

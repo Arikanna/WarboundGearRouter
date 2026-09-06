@@ -68,6 +68,14 @@ function WGRAddRecentActivity(
 end
 
 function WGRRefreshTodoPage()
+    -- Item-aware MAIL state is the source of truth for whether tracked gear
+    -- is still waiting for a roster character.  Older builds could clear the
+    -- message-level reminder while leaving mailGearTracking intact, so heal
+    -- that missing To Do state before rebuilding the page.
+    if WGRMailEnsureTrackedGearReminders then
+        WGRMailEnsureTrackedGearReminders()
+    end
+
     local frame =
         WGRMailTracker.frame
 
@@ -107,6 +115,82 @@ local function WGRMailTrackingTable()
 
     return
         WarboundGearRouterDB.mailTracking
+end
+
+function WGRMailEnsureTrackedGearReminders()
+    InitializeDatabase()
+
+    local gearTracking =
+        WarboundGearRouterDB.mailGearTracking
+
+    if type(gearTracking) ~= "table" then
+        return false
+    end
+
+    local reminderTracking =
+        WGRMailTrackingTable()
+
+    local changed = false
+
+    for key, gearEntry in pairs(gearTracking) do
+        if type(gearEntry) == "table"
+            and type(gearEntry.items) == "table"
+            and #gearEntry.items > 0
+            and reminderTracking[key] == nil
+        then
+            local sends = {}
+            local seen = {}
+
+            -- Rebuild enough sender/time information for the existing To Do
+            -- urgency display without manufacturing extra mail records.  One
+            -- record per distinct send signature is sufficient; item-aware
+            -- reconciliation remains authoritative for when the task clears.
+            for _, item in ipairs(gearEntry.items) do
+                local sender =
+                    item
+                    and item.sender
+                    or nil
+                local timestamp =
+                    tonumber(
+                        item
+                        and item.sentAt
+                    )
+                    or tonumber(gearEntry.updated)
+                    or time()
+                local signature =
+                    tostring(sender or "")
+                    .. "\031"
+                    .. tostring(timestamp)
+
+                if not seen[signature] then
+                    seen[signature] = true
+                    sends[#sends + 1] = {
+                        timestamp = timestamp,
+                        sender = sender,
+                    }
+                end
+            end
+
+            if #sends == 0 then
+                sends[1] = {
+                    timestamp =
+                        tonumber(gearEntry.updated)
+                        or time(),
+                    sender = nil,
+                }
+            end
+
+            reminderTracking[key] = {
+                name = gearEntry.name or key,
+                sends = sends,
+                itemAwareRebuilt = true,
+            }
+
+            changed = true
+        end
+    end
+
+    return changed
 end
 
 function WGRMailRecordSend(
@@ -157,7 +241,7 @@ function WGRMailRecordSend(
     WGRRefreshTodoPage()
 end
 
-local function WGRMailMarkChecked(
+function WGRMailMarkChecked(
     recipient
 )
     if not recipient then
@@ -393,6 +477,10 @@ local function WGRMailUrgencyColor(
 end
 
 function WGRMailGetTrackedList()
+    if WGRMailEnsureTrackedGearReminders then
+        WGRMailEnsureTrackedGearReminders()
+    end
+
     local tracking =
         WGRMailTrackingTable()
 
@@ -656,6 +744,33 @@ local function WGRMailScanTrackedInbox()
             "No tracked mail entry exists for "
                 .. currentName
                 .. "."
+        )
+        return
+    end
+
+    -- Item-aware MAIL tracking is authoritative whenever it has
+    -- concrete tracked gear for the current recipient.  The legacy reminder
+    -- scanner was designed around WBGR's older message-level "Alt Gear"
+    -- tracking and can otherwise clear a Retrieve Mail task merely because
+    -- the mailbox was opened (especially for manually-sent tracked gear).
+    -- Let WGRMailReconcileTrackedGearInbox() retire/return those actual item
+    -- records first; it will clear/update the reminder when the tracked gear
+    -- is genuinely gone.
+    local itemAwareTracking =
+        WarboundGearRouterDB
+        and WarboundGearRouterDB.mailGearTracking
+    local itemAwareEntry =
+        itemAwareTracking
+        and itemAwareTracking[key]
+
+    if itemAwareEntry
+        and type(itemAwareEntry.items) == "table"
+        and #itemAwareEntry.items > 0
+    then
+        WGRMailDebug(
+            "Item-aware tracked MAIL gear is still present for "
+                .. currentName
+                .. "; legacy reminder auto-clear is suppressed."
         )
         return
     end
@@ -1151,6 +1266,14 @@ local function WGRRefreshGearFinderIfOpen()
         WGRScheduleGearFinderRefresh(
             0.10
         )
+    end
+
+    -- Gather Gear is scoped to the current character's effective Spec Mode,
+    -- selected specs, and weapon eligibility. Reuse the existing live locator
+    -- notifier so an already-open Gather Gear view updates immediately when
+    -- those roster settings change.
+    if WGRNotifyGearSearchChanged then
+        WGRNotifyGearSearchChanged()
     end
 end
 
@@ -1781,7 +1904,9 @@ local function WGRTodoBuildList()
         end
     end
 
-    -- Priority 3: carried outgoing gear by character, global priority order.
+    -- Priority 3: outgoing routed gear by character and physical source.
+    -- BAG and Personal Bank are intentionally separate To Do entries because
+    -- they require different actions.
     for _, characterName
         in ipairs(
             GetActiveRoutingPriority()
@@ -1800,72 +1925,143 @@ local function WGRTodoBuildList()
                 key
             ]
 
-        if snapshot
-            and (
+        if snapshot then
+            local bagCount =
                 tonumber(
-                    snapshot.sendCount
-                )
-                or 0
-            ) > 0
-        then
-            local count =
-                tonumber(
-                    snapshot.sendCount
+                    snapshot.bagSendCount
                 )
                 or 0
 
-            local dismissKey =
-                "SEND:"
-                .. key
-                .. ":"
-                .. tostring(
-                    snapshot.scanID
-                    or 0
+            local pbkCount =
+                tonumber(
+                    snapshot.personalBankSendCount
                 )
+                or 0
 
-            if not WGRTodoIsDismissed(
-                dismissKey
-            )
-            then
-                todo[
-                    #todo + 1
-                ] = {
-                    kind =
-                        "SEND_CHARACTER",
-                    priority =
-                        3,
-                    sortValue =
-                        priority[key]
-                        or 9999,
-                    character =
-                        characterName,
-                    count =
-                        count,
-                    title =
-                        tostring(characterName)
-                        .. " — Send "
-                        .. tostring(count)
-                        .. " Item"
-                        .. (
-                            count == 1
-                            and ""
-                            or "s"
-                        ),
-                    detail =
-                        tostring(count)
-                        .. " routed item"
-                        .. (
-                            count == 1
-                            and " is"
-                            or "s are"
-                        )
-                        .. " ready to send to other characters."
-                        .. "\nOpen a mailbox, or deposit them in the Warband Bank.",
-                    dismissKey =
-                        dismissKey,
-                    action =
-                        "SEND_CONTEXT",
-                }
+            if bagCount > 0 then
+                local dismissKey =
+                    "SEND_BAGS:"
+                    .. key
+                    .. ":"
+                    .. tostring(
+                        snapshot.scanID
+                        or 0
+                    )
+
+                if not WGRTodoIsDismissed(
+                    dismissKey
+                )
+                then
+                    todo[
+                        #todo + 1
+                    ] = {
+                        kind =
+                            "SEND_BAGS",
+                        priority =
+                            3,
+                        sortValue =
+                            priority[key]
+                            or 9999,
+                        character =
+                            characterName,
+                        count =
+                            bagCount,
+                        title =
+                            tostring(characterName)
+                            .. " — Send "
+                            .. tostring(bagCount)
+                            .. " Item"
+                            .. (
+                                bagCount == 1
+                                and ""
+                                or "s"
+                            )
+                            .. " (BAG)",
+                        detail =
+                            tostring(bagCount)
+                            .. " routed item"
+                            .. (
+                                bagCount == 1
+                                and " is"
+                                or "s are"
+                            )
+                            .. " ready in Bags."
+                            .. "\nOpen a mailbox, or deposit "
+                            .. (
+                                bagCount == 1
+                                and "it"
+                                or "them"
+                            )
+                            .. " in the Warband Bank.",
+                        dismissKey =
+                            dismissKey,
+                        action =
+                            "SEND_BAGS",
+                    }
+                end
+            end
+
+            if pbkCount > 0 then
+                local dismissKey =
+                    "SEND_PBK:"
+                    .. key
+                    .. ":"
+                    .. tostring(
+                        snapshot.scanID
+                        or 0
+                    )
+
+                if not WGRTodoIsDismissed(
+                    dismissKey
+                )
+                then
+                    todo[
+                        #todo + 1
+                    ] = {
+                        kind =
+                            "SEND_PERSONAL_BANK",
+                        priority =
+                            3,
+                        sortValue =
+                            priority[key]
+                            or 9999,
+                        character =
+                            characterName,
+                        count =
+                            pbkCount,
+                        title =
+                            tostring(characterName)
+                            .. " — Send "
+                            .. tostring(pbkCount)
+                            .. " Item"
+                            .. (
+                                pbkCount == 1
+                                and ""
+                                or "s"
+                            )
+                            .. " (PBK)",
+                        detail =
+                            tostring(pbkCount)
+                            .. " routed item"
+                            .. (
+                                pbkCount == 1
+                                and " is"
+                                or "s are"
+                            )
+                            .. " waiting in Personal Bank."
+                            .. "\nMove "
+                            .. (
+                                pbkCount == 1
+                                and "it"
+                                or "them"
+                            )
+                            .. " to the Warband Bank or Bags.",
+                        dismissKey =
+                            dismissKey,
+                        action =
+                            "SEND_PBK",
+                    }
+                end
             end
         end
     end
@@ -1977,6 +2173,43 @@ local function WGRTodoBuildList()
     table.sort(
         todo,
         function(a, b)
+            local currentCharacter =
+                UnitName("player")
+
+            local aIsCurrent =
+                currentCharacter
+                and a.character
+                and string.lower(
+                    tostring(a.character)
+                )
+                == string.lower(
+                    tostring(currentCharacter)
+                )
+
+            local bIsCurrent =
+                currentCharacter
+                and b.character
+                and string.lower(
+                    tostring(b.character)
+                )
+                == string.lower(
+                    tostring(currentCharacter)
+                )
+
+            -- Pin current-character work only for the default Urgency sort.
+            -- If the user explicitly chooses Priority, Name, or another sort,
+            -- honor that ordering exactly and do not override it.
+            local currentSort =
+                WarboundGearRouterDB
+                and WarboundGearRouterDB.todoSortMode
+                or "URGENCY"
+
+            if currentSort == "URGENCY"
+                and aIsCurrent ~= bIsCurrent
+            then
+                return aIsCurrent
+            end
+
             if sortMode
                 == "URGENCY"
             then
@@ -2041,6 +2274,7 @@ local function WGRTodoBuildList()
                 a,
                 b
             )
+        
         end
     )
 
@@ -2083,9 +2317,10 @@ end
 
 function WGRUpdateGearTodoSnapshot(
     characterName,
-    sendCount,
+    bagSendCount,
     warbankCount,
-    warbankObserved
+    warbankObserved,
+    personalBankSendCount
 )
     InitializeDatabase()
 
@@ -2100,16 +2335,53 @@ function WGRUpdateGearTodoSnapshot(
         WarboundGearRouterDB.todoScanSerial
 
     if characterName then
-        WarboundGearRouterDB.todoGearSnapshots[
+        local key =
             string.lower(
                 tostring(characterName)
             )
+
+        local previous =
+            WarboundGearRouterDB.todoGearSnapshots[
+                key
+            ]
+            or {}
+
+        -- MailRuntime refreshes only carried BAG outgoing gear. When it does
+        -- not provide a PBK value, retain the last PBK count observed by the
+        -- Gear Finder/PBK scan instead of silently erasing that work.
+        local pbkCount
+        if personalBankSendCount ~= nil then
+            pbkCount =
+                tonumber(
+                    personalBankSendCount
+                )
+                or 0
+        else
+            pbkCount =
+                tonumber(
+                    previous.personalBankSendCount
+                )
+                or 0
+        end
+
+        local bagCount =
+            tonumber(
+                bagSendCount
+            )
+            or 0
+
+        WarboundGearRouterDB.todoGearSnapshots[
+            key
         ] = {
             name =
                 characterName,
+            bagSendCount =
+                bagCount,
+            personalBankSendCount =
+                pbkCount,
             sendCount =
-                tonumber(sendCount)
-                or 0,
+                bagCount
+                + pbkCount,
             scanID =
                 scanID,
             updated =
@@ -2949,6 +3221,12 @@ local function WGRShowHeldGearTooltip(
             0.75, 0.75, 0.75,
             1.00, 1.00, 1.00
         )
+        GameTooltip:AddDoubleLine(
+            "Mail",
+            tostring(summary.mail or 0),
+            0.75, 0.75, 0.75,
+            1.00, 1.00, 1.00
+        )
     end
 
     local tree =
@@ -3224,7 +3502,7 @@ local function WGRBuildAboutSubtabs(
             )
 
         button:SetSize(
-            180,
+            160,
             26
         )
 
@@ -3312,18 +3590,39 @@ local function WGRBuildAboutSubtabs(
         return button
     end
 
-    local commandsTab =
+    local gettingStartedTab =
         CreateAboutTab(
-            "COMMANDS",
-            "Useful Commands",
+            "GETTING_STARTED",
+            "Getting Started",
             0
+        )
+
+    local routingHelpTab =
+        CreateAboutTab(
+            "ROUTING_HELP",
+            "How Routing Works",
+            170
+        )
+
+    local faqTab =
+        CreateAboutTab(
+            "FAQ",
+            "Help & FAQ",
+            340
         )
 
     local gearTab =
         CreateAboutTab(
             "GEAR",
             "Gear Reference",
-            188
+            510
+        )
+
+    local commandsTab =
+        CreateAboutTab(
+            "COMMANDS",
+            "Useful Commands",
+            680
         )
 
     local commandsPanel =
@@ -3824,6 +4123,1544 @@ local function WGRBuildAboutSubtabs(
         + 30
     )
 
+
+    local function CreateHelpScrollPanel()
+        local panel =
+            CreateFrame(
+                "Frame",
+                nil,
+                aboutPage
+            )
+
+        panel:SetPoint(
+            "TOPLEFT",
+            aboutDescription,
+            "BOTTOMLEFT",
+            0,
+            -58
+        )
+        panel:SetPoint(
+            "BOTTOMRIGHT",
+            aboutPage,
+            "BOTTOMRIGHT",
+            -20,
+            14
+        )
+
+        local scroll =
+            CreateFrame(
+                "ScrollFrame",
+                nil,
+                panel,
+                "UIPanelScrollFrameTemplate"
+            )
+        scroll:SetPoint(
+            "TOPLEFT",
+            0,
+            0
+        )
+        scroll:SetPoint(
+            "BOTTOMRIGHT",
+            -28,
+            0
+        )
+
+        local content =
+            CreateFrame(
+                "Frame",
+                nil,
+                scroll
+            )
+        content:SetHeight(
+            1
+        )
+
+        local function UpdateHelpContentWidth()
+            local scrollWidth =
+                scroll:GetWidth()
+                or 0
+
+            if scrollWidth > 40 then
+                content:SetWidth(
+                    scrollWidth - 16
+                )
+            end
+        end
+
+        scroll:SetScript(
+            "OnSizeChanged",
+            UpdateHelpContentWidth
+        )
+
+        scroll:SetScript(
+            "OnShow",
+            UpdateHelpContentWidth
+        )
+
+        scroll:SetScrollChild(
+            content
+        )
+
+        UpdateHelpContentWidth()
+
+        return panel, scroll, content
+    end
+
+    local function AddHelpHeading(
+        content,
+        text,
+        y
+    )
+        local heading =
+            content:CreateFontString(
+                nil,
+                "OVERLAY",
+                "GameFontNormalLarge"
+            )
+        heading:SetPoint(
+            "TOPLEFT",
+            0,
+            y
+        )
+        heading:SetPoint(
+            "RIGHT",
+            content,
+            "RIGHT",
+            -8,
+            0
+        )
+        heading:SetJustifyH(
+            "LEFT"
+        )
+        heading:SetWordWrap(
+            true
+        )
+        heading:SetNonSpaceWrap(
+            false
+        )
+        heading:SetText(
+            text
+        )
+
+        return heading
+    end
+
+    local function AddHelpBody(
+        content,
+        text,
+        y,
+        width
+    )
+        local body =
+            content:CreateFontString(
+                nil,
+                "OVERLAY",
+                "GameFontHighlight"
+            )
+        body:SetPoint(
+            "TOPLEFT",
+            0,
+            y
+        )
+        body:SetPoint(
+            "RIGHT",
+            content,
+            "RIGHT",
+            -8,
+            0
+        )
+        body:SetJustifyH(
+            "LEFT"
+        )
+        body:SetJustifyV(
+            "TOP"
+        )
+        body:SetWordWrap(
+            true
+        )
+        body:SetNonSpaceWrap(
+            false
+        )
+        body:SetText(
+            text
+        )
+
+        local height =
+            math.max(
+                18,
+                math.ceil(
+                    body:GetStringHeight()
+                    or 0
+                )
+            )
+
+        return body, height
+    end
+
+    local function CreateHelpNavButton(
+        content,
+        text,
+        y,
+        callback
+    )
+        local button =
+            CreateFrame(
+                "Button",
+                nil,
+                content,
+                "UIPanelButtonTemplate"
+            )
+        button:SetSize(
+            190,
+            24
+        )
+        button:SetPoint(
+            "TOPLEFT",
+            0,
+            y
+        )
+        button:SetText(
+            text
+        )
+        button:SetScript(
+            "OnClick",
+            callback
+        )
+
+        return button
+    end
+
+    local routingHelpPanel,
+        routingHelpScroll,
+        routingHelpContent =
+            CreateHelpScrollPanel()
+
+    local routingY = 0
+
+    AddHelpHeading(
+        routingHelpContent,
+        "How Routing Works",
+        routingY
+    )
+    routingY = routingY - 30
+
+    local _, routingIntroHeight =
+        AddHelpBody(
+            routingHelpContent,
+            "WBGR routes gear in a cascade. Higher-priority characters are checked first within the same routing tier.",
+            routingY
+        )
+    routingY =
+        routingY
+        - routingIntroHeight
+        - 18
+
+    local function CreateInfoBox(
+        parent,
+        x,
+        y,
+        width,
+        height,
+        title,
+        subtitle
+    )
+        local box =
+            CreateFrame(
+                "Frame",
+                nil,
+                parent,
+                "BackdropTemplate"
+            )
+
+        box:SetSize(
+            width,
+            height
+        )
+        box:SetPoint(
+            "TOPLEFT",
+            parent,
+            "TOPLEFT",
+            x,
+            y
+        )
+        box:SetBackdrop({
+            bgFile =
+                "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile =
+                "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true,
+            tileSize = 16,
+            edgeSize = 9,
+            insets = {
+                left = 3,
+                right = 3,
+                top = 3,
+                bottom = 3,
+            },
+        })
+        box:SetBackdropColor(
+            0.05,
+            0.05,
+            0.05,
+            0.94
+        )
+
+        local titleText =
+            box:CreateFontString(
+                nil,
+                "OVERLAY",
+                "GameFontNormal"
+            )
+        titleText:SetPoint(
+            "TOP",
+            box,
+            "TOP",
+            0,
+            -8
+        )
+        titleText:SetWidth(
+            width - 16
+        )
+        titleText:SetJustifyH(
+            "CENTER"
+        )
+        titleText:SetWordWrap(
+            true
+        )
+        titleText:SetNonSpaceWrap(
+            false
+        )
+        titleText:SetText(
+            title
+        )
+
+        if subtitle
+            and subtitle ~= ""
+        then
+            local subtitleText =
+                box:CreateFontString(
+                    nil,
+                    "OVERLAY",
+                    "GameFontHighlightSmall"
+                )
+            subtitleText:SetPoint(
+                "TOP",
+                titleText,
+                "BOTTOM",
+                0,
+                -4
+            )
+            subtitleText:SetWidth(
+                width - 18
+            )
+            subtitleText:SetJustifyH(
+                "CENTER"
+            )
+            subtitleText:SetWordWrap(
+                true
+            )
+            subtitleText:SetNonSpaceWrap(
+                false
+            )
+            subtitleText:SetTextColor(
+                0.72,
+                0.72,
+                0.72
+            )
+            subtitleText:SetText(
+                subtitle
+            )
+        end
+
+        return box
+    end
+
+    local function CreateVerticalConnector(
+        parent,
+        centerX,
+        topY,
+        height
+    )
+        local arrow =
+            CreateFrame(
+                "Frame",
+                nil,
+                parent
+            )
+
+        arrow:SetSize(
+            18,
+            height + 10
+        )
+        arrow:SetPoint(
+            "TOPLEFT",
+            parent,
+            "TOPLEFT",
+            centerX - 9,
+            topY
+        )
+
+        arrow:SetFrameLevel(
+            (
+                parent:GetFrameLevel()
+                or 0
+            ) + 50
+        )
+
+        local shaft =
+            arrow:CreateTexture(
+                nil,
+                "OVERLAY"
+            )
+        shaft:SetColorTexture(
+            0.90,
+            0.72,
+            0.20,
+            0.95
+        )
+        shaft:SetWidth(2)
+        shaft:SetHeight(height)
+        shaft:SetPoint(
+            "TOP",
+            arrow,
+            "TOP",
+            0,
+            0
+        )
+
+        local leftHead =
+            arrow:CreateTexture(
+                nil,
+                "OVERLAY"
+            )
+        leftHead:SetColorTexture(
+            0.90,
+            0.72,
+            0.20,
+            0.95
+        )
+        leftHead:SetSize(
+            8,
+            2
+        )
+        leftHead:SetPoint(
+            "CENTER",
+            arrow,
+            "TOP",
+            -3,
+            -height
+        )
+        leftHead:SetRotation(
+            math.rad(
+                -45
+            )
+        )
+
+        local rightHead =
+            arrow:CreateTexture(
+                nil,
+                "OVERLAY"
+            )
+        rightHead:SetColorTexture(
+            0.90,
+            0.72,
+            0.20,
+            0.95
+        )
+        rightHead:SetSize(
+            8,
+            2
+        )
+        rightHead:SetPoint(
+            "CENTER",
+            arrow,
+            "TOP",
+            3,
+            -height
+        )
+        rightHead:SetRotation(
+            math.rad(
+                45
+            )
+        )
+
+        return arrow
+    end
+
+    local function CreateHorizontalConnector(
+        parent,
+        leftX,
+        centerY,
+        width
+    )
+        local arrow =
+            CreateFrame(
+                "Frame",
+                nil,
+                parent
+            )
+
+        arrow:SetSize(
+            width + 10,
+            18
+        )
+        arrow:SetPoint(
+            "TOPLEFT",
+            parent,
+            "TOPLEFT",
+            leftX,
+            centerY + 9
+        )
+
+        arrow:SetFrameLevel(
+            (
+                parent:GetFrameLevel()
+                or 0
+            ) + 50
+        )
+
+        local shaft =
+            arrow:CreateTexture(
+                nil,
+                "OVERLAY"
+            )
+        shaft:SetColorTexture(
+            0.90,
+            0.72,
+            0.20,
+            0.95
+        )
+        shaft:SetHeight(2)
+        shaft:SetWidth(
+            math.max(
+                2,
+                width - 5
+            )
+        )
+        shaft:SetPoint(
+            "LEFT",
+            arrow,
+            "LEFT",
+            0,
+            0
+        )
+
+        local upperHead =
+            arrow:CreateTexture(
+                nil,
+                "OVERLAY"
+            )
+        upperHead:SetColorTexture(
+            0.90,
+            0.72,
+            0.20,
+            0.95
+        )
+        upperHead:SetSize(
+            8,
+            2
+        )
+        upperHead:SetPoint(
+            "CENTER",
+            arrow,
+            "LEFT",
+            width,
+            3
+        )
+        upperHead:SetRotation(
+            math.rad(
+                -45
+            )
+        )
+
+        local lowerHead =
+            arrow:CreateTexture(
+                nil,
+                "OVERLAY"
+            )
+        lowerHead:SetColorTexture(
+            0.90,
+            0.72,
+            0.20,
+            0.95
+        )
+        lowerHead:SetSize(
+            8,
+            2
+        )
+        lowerHead:SetPoint(
+            "CENTER",
+            arrow,
+            "LEFT",
+            width,
+            -3
+        )
+        lowerHead:SetRotation(
+            math.rad(
+                45
+            )
+        )
+
+        return arrow
+    end
+
+    AddHelpHeading(
+        routingHelpContent,
+        "1. Routing Cascade",
+        routingY
+    )
+    routingY = routingY - 32
+
+    local centerX = 180
+    local boxW = 330
+    local boxH = 52
+
+    local cascadeBox1Y = routingY
+    CreateInfoBox(
+        routingHelpContent,
+        centerX,
+        cascadeBox1Y,
+        boxW,
+        boxH,
+        "Item Found",
+        "WBGR checks eligible tracked characters."
+    )
+
+    local cascadeBox2Y =
+        cascadeBox1Y
+        - boxH
+        - 26
+
+    CreateVerticalConnector(
+        routingHelpContent,
+        centerX + math.floor(boxW / 2),
+        cascadeBox2Y + 22,
+        12
+    )
+
+    CreateInfoBox(
+        routingHelpContent,
+        centerX,
+        cascadeBox2Y,
+        boxW,
+        boxH,
+        "Does it meet the upgrade threshold?",
+        "Yes: route as a priority upgrade.  No: keep checking."
+    )
+
+    local cascadeBox3Y =
+        cascadeBox2Y
+        - boxH
+        - 26
+
+    CreateVerticalConnector(
+        routingHelpContent,
+        centerX + math.floor(boxW / 2),
+        cascadeBox3Y + 22,
+        12
+    )
+
+    CreateInfoBox(
+        routingHelpContent,
+        centerX,
+        cascadeBox3Y,
+        boxW,
+        boxH,
+        "Is it still a smaller upgrade?",
+        "Yes: route as a smaller upgrade.  No: keep checking."
+    )
+
+    local cascadeBox4Y =
+        cascadeBox3Y
+        - boxH
+        - 26
+
+    CreateVerticalConnector(
+        routingHelpContent,
+        centerX + math.floor(boxW / 2),
+        cascadeBox4Y + 22,
+        12
+    )
+
+    CreateInfoBox(
+        routingHelpContent,
+        centerX,
+        cascadeBox4Y,
+        boxW,
+        boxH,
+        "Could it still be useful later?",
+        "Yes: reserve it for later.  No: send it onwards or mark it not needed."
+    )
+
+    local tieBracketX =
+        centerX
+        + boxW
+        + 16
+    local tieTopCenterY =
+        cascadeBox2Y
+        - math.floor(boxH / 2)
+    local tieBottomCenterY =
+        cascadeBox4Y
+        - math.floor(boxH / 2)
+    local tieBracketHeight =
+        math.abs(
+            tieBottomCenterY
+            - tieTopCenterY
+        )
+
+    local tieBracket =
+        routingHelpContent:CreateTexture(
+            nil,
+            "ARTWORK"
+        )
+    tieBracket:SetColorTexture(
+        0.90,
+        0.72,
+        0.20,
+        0.95
+    )
+    tieBracket:SetWidth(2)
+    tieBracket:SetHeight(tieBracketHeight)
+    tieBracket:SetPoint(
+        "TOPLEFT",
+        routingHelpContent,
+        "TOPLEFT",
+        tieBracketX,
+        tieTopCenterY
+    )
+
+    local tieTopTick =
+        routingHelpContent:CreateTexture(
+            nil,
+            "ARTWORK"
+        )
+    tieTopTick:SetColorTexture(
+        0.90,
+        0.72,
+        0.20,
+        0.95
+    )
+    tieTopTick:SetSize(10, 2)
+    tieTopTick:SetPoint(
+        "RIGHT",
+        tieBracket,
+        "TOPLEFT",
+        0,
+        0
+    )
+
+    local tieBottomTick =
+        routingHelpContent:CreateTexture(
+            nil,
+            "ARTWORK"
+        )
+    tieBottomTick:SetColorTexture(
+        0.90,
+        0.72,
+        0.20,
+        0.95
+    )
+    tieBottomTick:SetSize(10, 2)
+    tieBottomTick:SetPoint(
+        "RIGHT",
+        tieBracket,
+        "BOTTOMLEFT",
+        0,
+        0
+    )
+
+    local tieMidY =
+        cascadeBox3Y
+        - math.floor(boxH / 2)
+
+    local tieBoxX = tieBracketX + 24
+    local tieBoxW = 225
+    local tieBoxH = 78
+    local tieBoxY =
+        tieMidY
+        + math.floor(tieBoxH / 2)
+
+    CreateHorizontalConnector(
+        routingHelpContent,
+        tieBracketX + 10,
+        tieMidY,
+        tieBoxX - (tieBracketX + 10)
+    )
+
+    CreateInfoBox(
+        routingHelpContent,
+        tieBoxX,
+        tieBoxY,
+        tieBoxW,
+        tieBoxH,
+        "More than one character qualifies?",
+        "Roster Priority breaks the tie within the same routing tier."
+    )
+
+    routingY = cascadeBox4Y - boxH - 20
+
+    local _, cascadeNoteHeight =
+        AddHelpBody(
+            routingHelpContent,
+            "Routing can change after characters equip better gear, change specs, or finish initialization.",
+            routingY
+        )
+    routingY =
+        routingY
+        - cascadeNoteHeight
+        - 30
+
+    AddHelpHeading(
+        routingHelpContent,
+        "2. Recommended Workflow",
+        routingY
+    )
+    routingY = routingY - 34
+
+    local workflowY = routingY
+    local workflowGap = 14
+    local workflowH = 78
+
+    local step1X = 0
+    local step1W = 150
+
+    local step2X =
+        step1X
+        + step1W
+        + workflowGap
+    local step2W = 185
+
+    local step3X =
+        step2X
+        + step2W
+        + workflowGap
+    local step3W = 245
+
+    local step4X =
+        step3X
+        + step3W
+        + workflowGap
+    local step4W = 180
+
+    CreateInfoBox(
+        routingHelpContent,
+        step1X,
+        workflowY,
+        step1W,
+        workflowH,
+        "1. To Do",
+        "Handle mail and routed gear."
+    )
+
+    CreateHorizontalConnector(
+        routingHelpContent,
+        step1X + step1W,
+        workflowY - math.floor(workflowH / 2),
+        workflowGap
+    )
+
+    CreateInfoBox(
+        routingHelpContent,
+        step2X,
+        workflowY,
+        step2W,
+        workflowH,
+        "2. Recommendations",
+        "Equip current upgrades."
+    )
+
+    CreateHorizontalConnector(
+        routingHelpContent,
+        step2X + step2W,
+        workflowY - math.floor(workflowH / 2),
+        workflowGap
+    )
+
+    CreateInfoBox(
+        routingHelpContent,
+        step3X,
+        workflowY,
+        step3W,
+        workflowH,
+        "3. Optional Tools",
+        "Gather Gear: other usable gear.\nGear Search: locate tracked gear."
+    )
+
+    CreateHorizontalConnector(
+        routingHelpContent,
+        step3X + step3W,
+        workflowY - math.floor(workflowH / 2),
+        workflowGap
+    )
+
+    CreateInfoBox(
+        routingHelpContent,
+        step4X,
+        workflowY,
+        step4W,
+        workflowH,
+        "4. Move Leftovers",
+        "Send onwards, store appropriately, or sell if not needed."
+    )
+
+    routingY =
+        routingY
+        - workflowH
+        - 18
+
+    local _, workflowNoteHeight =
+        AddHelpBody(
+            routingHelpContent,
+            "After you equip or move gear, WBGR recalculates the remaining routing cascade.",
+            routingY
+        )
+    routingY =
+        routingY
+        - workflowNoteHeight
+        - 30
+
+    AddHelpHeading(
+        routingHelpContent,
+        "3. Weapon Setup Rules",
+        routingY
+    )
+    routingY = routingY - 30
+
+    local _, weaponIntroHeight =
+        AddHelpBody(
+            routingHelpContent,
+            "WBGR recommends complete usable weapon setups.",
+            routingY
+        )
+    routingY =
+        routingY
+        - weaponIntroHeight
+        - 18
+
+    local weaponRow1Y = routingY
+    local weaponBoxW = 190
+    local weaponBoxH = 54
+    local weaponGap = 24
+
+    -- Top row: 2H family.
+    local topRowWidth =
+        (
+            weaponBoxW * 2
+        )
+        + weaponGap
+    local topStartX =
+        math.floor(
+            (
+                940
+                - topRowWidth
+            ) / 2
+        )
+
+    CreateInfoBox(
+        routingHelpContent,
+        topStartX,
+        weaponRow1Y,
+        weaponBoxW,
+        weaponBoxH,
+        "2H",
+        "Complete by itself"
+    )
+
+    CreateInfoBox(
+        routingHelpContent,
+        topStartX
+            + weaponBoxW
+            + weaponGap,
+        weaponRow1Y,
+        weaponBoxW,
+        weaponBoxH,
+        "2H + 2H",
+        "Complete Fury Dual 2H setup"
+    )
+
+    -- Bottom row: paired 1H family.
+    local bottomRowWidth =
+        (
+            weaponBoxW * 3
+        )
+        + (
+            weaponGap * 2
+        )
+    local bottomStartX =
+        math.floor(
+            (
+                940
+                - bottomRowWidth
+            ) / 2
+        )
+    local bottomY =
+        weaponRow1Y
+        - weaponBoxH
+        - 16
+
+    CreateInfoBox(
+        routingHelpContent,
+        bottomStartX,
+        bottomY,
+        weaponBoxW,
+        weaponBoxH,
+        "1H + 1H",
+        "Complete Dual 1H setup"
+    )
+
+    CreateInfoBox(
+        routingHelpContent,
+        bottomStartX
+            + weaponBoxW
+            + weaponGap,
+        bottomY,
+        weaponBoxW,
+        weaponBoxH,
+        "1H + Shield",
+        "Complete paired setup"
+    )
+
+    CreateInfoBox(
+        routingHelpContent,
+        bottomStartX
+            + (
+                weaponBoxW
+                + weaponGap
+            ) * 2,
+        bottomY,
+        weaponBoxW,
+        weaponBoxH,
+        "1H + Off-hand",
+        "Complete paired setup"
+    )
+
+    routingY =
+        weaponRow1Y
+        - (
+            weaponBoxH * 2
+        )
+        - 38
+
+    local _, weaponRuleHeight =
+        AddHelpBody(
+            routingHelpContent,
+            "WBGR waits until all required pieces are available before recommending the setup.",
+            routingY
+        )
+    routingY =
+        routingY
+        - weaponRuleHeight
+        - 14
+
+    local _, weaponSettingsHeight =
+        AddHelpBody(
+            routingHelpContent,
+            "Weapon routing can also be affected by All Eligible, Saved Setup, Custom Weapons, and class-specific weapon overrides.",
+            routingY
+        )
+    routingY =
+        routingY
+        - weaponSettingsHeight
+        - 30
+
+    local footer =
+        routingHelpContent:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontHighlightSmall"
+        )
+    footer:SetPoint(
+        "TOPLEFT",
+        routingHelpContent,
+        "TOPLEFT",
+        0,
+        routingY
+    )
+    footer:SetPoint(
+        "RIGHT",
+        routingHelpContent,
+        "RIGHT",
+        -8,
+        0
+    )
+    footer:SetJustifyH(
+        "LEFT"
+    )
+    footer:SetTextColor(
+        0.62,
+        0.62,
+        0.62
+    )
+    footer:SetText(
+        "Need setup help? See Getting Started.  Have a question? See Help & FAQ."
+    )
+    routingY = routingY - 24
+
+    routingHelpContent:SetHeight(
+        math.abs(routingY)
+        + 24
+    )
+
+    local gettingStartedPanel,
+        gettingStartedScroll,
+        gettingStartedContent =
+            CreateHelpScrollPanel()
+
+    local jumpLabel =
+        gettingStartedPanel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontNormal"
+        )
+    jumpLabel:SetPoint(
+        "TOPLEFT",
+        0,
+        1
+    )
+    jumpLabel:SetText(
+        "Jump to:"
+    )
+
+    local jumpDropdown =
+        CreateFrame(
+            "Frame",
+            nil,
+            gettingStartedPanel,
+            "UIDropDownMenuTemplate"
+        )
+    jumpDropdown:SetPoint(
+        "LEFT",
+        jumpLabel,
+        "RIGHT",
+        -8,
+        -1
+    )
+    UIDropDownMenu_SetWidth(
+        jumpDropdown,
+        190
+    )
+
+    gettingStartedScroll:ClearAllPoints()
+    gettingStartedScroll:SetPoint(
+        "TOPLEFT",
+        0,
+        -34
+    )
+    gettingStartedScroll:SetPoint(
+        "BOTTOMRIGHT",
+        -28,
+        0
+    )
+
+    local sectionOffsets = {}
+    local gettingY = 0
+
+    local function AddGettingStartedSection(
+        key,
+        title,
+        body,
+        buttonText,
+        buttonCallback
+    )
+        sectionOffsets[key] =
+            math.abs(
+                gettingY
+            )
+
+        AddHelpHeading(
+            gettingStartedContent,
+            title,
+            gettingY
+        )
+        gettingY = gettingY - 28
+
+        local _, bodyHeight =
+            AddHelpBody(
+                gettingStartedContent,
+                body,
+                gettingY
+            )
+        gettingY =
+            gettingY
+            - bodyHeight
+            - 10
+
+        if buttonText
+            and buttonCallback
+        then
+            CreateHelpNavButton(
+                gettingStartedContent,
+                buttonText,
+                gettingY,
+                buttonCallback
+            )
+            gettingY =
+                gettingY - 36
+        else
+            gettingY =
+                gettingY - 12
+        end
+
+        gettingY =
+            gettingY - 16
+    end
+
+    local function OpenMainTab(
+        key
+    )
+        local frame =
+            WGRMailTracker.frame
+
+        if frame
+            and frame.customWeaponsPanel
+        then
+            frame.customWeaponsPanel:Hide()
+        end
+
+        WGRShowMainTab(
+            key
+        )
+    end
+
+    local function OpenRoutingSettings()
+        local frame =
+            WGRMailTracker.frame
+
+        OpenMainTab(
+            "SETTINGS"
+        )
+
+        if frame
+            and frame.ShowSettingsTab
+        then
+            frame.ShowSettingsTab(
+                "ROUTING"
+            )
+        end
+    end
+
+    local function OpenGearFinderView(
+        viewKey
+    )
+        local frame =
+            WGRMailTracker.frame
+
+        OpenMainTab(
+            "GEAR_FINDER"
+        )
+
+        if frame
+            and frame.ShowGearFinderView
+        then
+            frame.ShowGearFinderView(
+                viewKey
+            )
+        end
+    end
+
+    AddGettingStartedSection(
+        "OVERVIEW",
+        "Getting Started",
+        "WBGR works best after you review your roster and a few basic routing settings. The steps below walk through a simple first-time setup. You do not need to configure every optional feature before you start using the addon.",
+        nil,
+        nil
+    )
+
+    AddGettingStartedSection(
+        "ROSTER",
+        "1. Review the Roster and Set Priority",
+        "Open Roster and make sure WBGR is managing the characters you want. Active and Ignored characters stay part of tracked storage, while Removed characters are left out of normal routing (great for bank alts). Arrange the roster in the order you want characters considered when more than one character is equally eligible for an item.",
+        "Open Roster",
+        function()
+            OpenMainTab(
+                "ROSTER"
+            )
+        end
+    )
+
+    AddGettingStartedSection(
+        "SPEC_MODE",
+        "2. Choose Spec Mode",
+        "Settings > Routing controls which specs WBGR considers for each character. Current Spec Only is the simplest starting point. All Specs lets every class spec participate. Custom lets you choose specific specs for individual characters from the Roster. You can also let lower-level characters collect gear for all class specs if you are not sure yet which spec you want to play.",
+        "Open Routing Settings",
+        OpenRoutingSettings
+    )
+
+    AddGettingStartedSection(
+        "WEAPONS",
+        "3. Configure Weapons",
+        "Choose how broadly WBGR should route weapons in Settings > Routing. All Eligible is the most flexible option. Saved Setup limits routing to the weapons your character is currently using, even if other weapons are eligible. For example, if your Mage is using a 2H weapon, WBGR will route 2H weapons to that character but not 1H weapons or off-hands. Per-character Custom Weapons are set from the Roster and can override the global weapon preferences when needed. Settings > Routing also includes special weapon overrides for cases such as Rogue Agility Daggers, Demon Hunter Warglaives, and Fury Dual 2H preferences.",
+        "Open Routing Settings",
+        OpenRoutingSettings
+    )
+
+    AddGettingStartedSection(
+        "THRESHOLD",
+        "4. Set the Upgrade Threshold",
+        "The upgrade threshold controls what WBGR considers a high-priority upgrade. For example, with a threshold of +10, an item that is at least 10 item levels better than the character's current gear qualifies for the highest upgrade tier. Smaller upgrades are not ignored. If no character qualifies for the threshold tier, WBGR can still route an item as a smaller positive upgrade. If an item is not an upgrade right now but may still be useful later, WBGR can reserve it for a character who may need it. Set the default threshold in Settings > Routing. Individual characters can also use a custom threshold set from the Roster.",
+        "Open Routing Settings",
+        OpenRoutingSettings
+    )
+
+    AddGettingStartedSection(
+        "TODO",
+        "5. Work the To Do List",
+        "To Do shows actions that need your attention, such as retrieving mail or moving routed gear out of Bags or Personal Bank. Under Urgency sorting, the character you are currently playing is pinned to the top so you can quickly see what you can handle right now.",
+        "Open To Do",
+        function()
+            OpenMainTab(
+                "MAIL"
+            )
+        end
+    )
+
+    AddGettingStartedSection(
+        "WORKFLOW",
+        "6. Follow the Recommended Workflow",
+        "A simple way to use WBGR is: first, check To Do and handle any mail or routed gear that needs attention. Next, use Recommendations to equip the upgrades WBGR has identified for the current character. Check Gather Gear if you want to look for additional usable gear stored elsewhere in the warband, and use Gear Search whenever you need to find where tracked gear is currently stored. After you equip or move gear, WBGR recalculates what should happen to the remaining items. Because routing can change as higher-priority characters improve, it usually makes sense to work through your roster from higher priority to lower priority.",
+        nil,
+        nil
+    )
+
+    AddGettingStartedSection(
+        "GEAR_FINDER",
+        "7. Use Gear Finder Recommendations",
+        "Recommendations is the normal place to start when you are ready to equip an alt. WBGR shows the strongest currently available upgrades first. It also makes sure weapon recommendations are actually usable. If your spec needs two pieces, such as a one-handed weapon plus an off-hand or shield, WBGR waits until the full setup is available before recommending it. Check To Do first, then use Recommendations to work through the upgrades WBGR has identified.",
+        "Open Recommendations",
+        function()
+            OpenGearFinderView(
+                "RECOMMENDATIONS"
+            )
+        end
+    )
+
+    AddGettingStartedSection(
+        "GATHER",
+        "8. Check Gather Gear When Needed",
+        "Gather Gear is a helpful follow-up when you want to look for other usable gear stored elsewhere in the warband. It is especially useful after changing specs, weapon needs, or roster priority. The results show gear the current character may be able to use. However, they do not mean every item shown is definitely an upgrade.",
+        "Open Gather Gear",
+        function()
+            OpenGearFinderView(
+                "GATHER"
+            )
+        end
+    )
+
+    AddGettingStartedSection(
+        "GEAR_SEARCH",
+        "9. Locate Gear with Gear Search",
+        "Gear Search is the warband-wide storage locator. Use it when you want to find where tracked gear is currently stored across Bags, Personal Bank, Warband Bank, or Mail. Gear Search tells you where an item currently is regardless of who it is being routed to.",
+        "Open Gear Search",
+        function()
+            OpenGearFinderView(
+                "SEARCH"
+            )
+        end
+    )
+
+    gettingStartedContent:SetHeight(
+        math.abs(gettingY)
+        + 24
+    )
+
+    local jumpSections = {
+        {"OVERVIEW", "Overview"},
+        {"ROSTER", "Roster & Priority"},
+        {"SPEC_MODE", "Spec Mode"},
+        {"WEAPONS", "Weapons"},
+        {"THRESHOLD", "Upgrade Threshold"},
+        {"TODO", "To Do & Mail"},
+        {"WORKFLOW", "Recommended Workflow"},
+        {"GEAR_FINDER", "Gear Finder"},
+        {"GATHER", "Gather Gear"},
+        {"GEAR_SEARCH", "Gear Search"},
+    }
+
+    UIDropDownMenu_SetText(
+        jumpDropdown,
+        "Overview"
+    )
+
+    UIDropDownMenu_Initialize(
+        jumpDropdown,
+        function()
+            for _, entry
+                in ipairs(
+                    jumpSections
+                )
+            do
+                local info =
+                    UIDropDownMenu_CreateInfo()
+
+                info.text =
+                    entry[2]
+
+                info.func =
+                    function()
+                        UIDropDownMenu_SetText(
+                            jumpDropdown,
+                            entry[2]
+                        )
+
+                        gettingStartedScroll:SetVerticalScroll(
+                            sectionOffsets[entry[1]]
+                            or 0
+                        )
+                    end
+
+                UIDropDownMenu_AddButton(
+                    info
+                )
+            end
+        end
+    )
+
+
+    local faqPanel,
+        faqScroll,
+        faqContent =
+            CreateHelpScrollPanel()
+
+    local faqY = 0
+
+    AddHelpHeading(
+        faqContent,
+        "Help & FAQ",
+        faqY
+    )
+    faqY = faqY - 34
+
+    local _, faqIntroHeight =
+        AddHelpBody(
+            faqContent,
+            "Common questions about routing, storage, recommendations, and troubleshooting.",
+            faqY
+        )
+    faqY =
+        faqY
+        - faqIntroHeight
+        - 24
+
+    local faqEntries = {
+        {
+            "1. What does WBGR actually do?",
+            "WBGR helps identify and route useful Warbound and Bind on Equip gear among the characters in your roster. It is especially useful for gearing alts and newly leveled characters. WBGR considers things such as item level, armor and weapon eligibility, primary stat, selected specs, weapon setup preferences, role-appropriate trinkets, and roster priority. It does not use stat weights, simulations, or secondary-stat optimization."
+        },
+        {
+            "2. What do the different colors and statuses mean?",
+            "Upgrade (Gold) means the item is a strong current upgrade WBGR recommends. Potential Upgrade (Magenta) means the item may still be useful, but it is not the primary recommendation right now. Reserved (Blue) means the item is not an upgrade right now but may still be useful to a character later. Send Onwards (Red) means the current character should not keep the item and WBGR has another destination for it. Not Needed (Gray) means the item is not currently useful for routing or upgrading. CHECK means WBGR needs more information before it can make a final routing decision."
+        },
+        {
+            "3. What do BAG, PBK, WBK, and MAIL mean?",
+            "BAG = Character Bags. PBK = Personal Bank. WBK = Warband Bank. MAIL = Mailbox. Gear Search shows where WBGR currently believes tracked gear is physically located."
+        },
+        {
+            "4. Why did an item change who it is being routed to?",
+            "Routing is dynamic. If a higher-priority character equips better gear, changes specs, initializes a missing setup, or otherwise stops needing an item, WBGR may route that same item to another character who can now make better use of it. This is normal and is one reason it usually makes sense to work through higher-priority characters first."
+        },
+        {
+            "5. Why is an item marked CHECK?",
+            "CHECK means WBGR does not yet have enough information about one of the characters being considered. This usually means the character or one of its relevant specs has not been fully initialized yet. Log onto that character and make sure its gear and spec information is available to WBGR. The item will then be reevaluated."
+        },
+        {
+            "6. Why is Gear Finder not recommending an item that looks better?",
+            "Several things can affect a recommendation. The item may not meet the current upgrade threshold, another item may already be the stronger recommendation, the current Spec Mode may exclude the spec that could use it, weapon eligibility or Saved Setup may exclude it, a paired weapon setup may not yet be complete, or another character may currently have a stronger routing claim. Check Gather Gear if you want to see other gear the current character may be able to use."
+        },
+        {
+            "7. Why is an item in Gather Gear but not in Recommendations?",
+            "Recommendations shows upgrades WBGR currently recommends equipping. Gather Gear shows gear the current character may be able to use. Gather Gear is a compatibility locator, so not every result is necessarily an upgrade."
+        },
+        {
+            "8. Why does Saved Setup stop some weapons from being routed to my character?",
+            "Saved Setup limits weapon routing to the type of setup that character is using. For example, if a Mage is using a 2H weapon, Saved Setup can restrict that Mage to 2H weapons instead of also routing eligible 1H weapons and off-hands. If you want broader weapon routing, use All Eligible or configure Custom Weapons from the Roster."
+        },
+        {
+            "9. Why won't Gear Finder recommend just one half of a weapon setup?",
+            "Some specs need a complete setup to actually use the upgrade. Examples include 1H + Off-hand, 1H + Shield, Dual 1H, and Fury Dual 2H. WBGR waits until the required pieces are available before treating the setup as a complete recommendation."
+        },
+        {
+            "10. What does the upgrade threshold do?",
+            "The threshold determines what WBGR treats as a high-priority upgrade. For example, with a threshold of +10, an item at least 10 item levels better qualifies for the highest upgrade tier. Smaller upgrades are still useful. If nobody qualifies for the threshold tier, WBGR can still route an item as a smaller positive upgrade. The default threshold is in Settings > Routing, and individual characters can have custom thresholds from the Roster."
+        },
+        {
+            "11. What does Ignored mean on the Roster?",
+            "Ignored characters are excluded from normal routing decisions, but WBGR still tracks eligible gear stored on them. This makes Ignored useful for storage alts or other characters that you do not want receiving routed upgrades but that may hold extra gear you still want to find through Gear Search."
+        },
+        {
+            "12. What are Ignored Items?",
+            "Ignored Items are specific pieces of gear that you have told WBGR not to consider for routing or recommendations. This is useful for items you want to keep for personal reasons, unusual builds, transmog, sentimental gear, or anything else you do not want WBGR trying to move or recommend. To ignore an item, right-click its item icon in Gear Finder > Recommendations and choose WBGR's Ignore option. You can review all ignored items under Settings > Eligible Gear. If you change your mind, click Unignore next to the item and WBGR will begin considering it again. Ignoring an item is different from setting a character to Ignored: an ignored item is excluded from WBGR's gear logic, while an Ignored character can still have its stored gear tracked."
+        },
+        {
+            "13. Why is a Removed character still useful in WBGR?",
+            "Removed characters are excluded from normal routing, which makes the status useful for characters such as bank alts that you do not want participating in gearing decisions. If tracked gear later returns from a Removed character into tracked storage, WBGR can begin tracking it again."
+        },
+        {
+            "14. Why is mail showing in Gear Search or To Do?",
+            "WBGR tracks qualifying gear while it is in the mail. If tracked gear is mailed to a tracked character, Gear Search can show it as MAIL and To Do can remind you to retrieve it. Once the item is collected, returned, or otherwise leaves tracked mail, WBGR updates the location when it can confirm the change."
+        },
+        {
+            "15. Why does a Personal Bank To Do entry remain even when my bank is closed?",
+            "WBGR cannot see the current contents of a closed Personal Bank. It keeps the last known PBK information until the Personal Bank is opened again and can be checked. This prevents valid reminders from disappearing just because you logged in or reloaded."
+        },
+        {
+            "16. Should I use Recommendations, Gather Gear, or Gear Search?",
+            "Recommendations answers: What should I equip? Gather Gear answers: What else might this character be able to use? Gear Search answers: Where is this gear?"
+        },
+        {
+            "17. What should I do if WBGR seems out of date?",
+            "Open or rescan the relevant storage location if available. WBGR updates automatically as it observes Bags, Personal Bank, Warband Bank, Mail, and equipped gear, but some locations cannot be verified while they are closed or inaccessible."
+        },
+        {
+            "18. How does WBGR decide who gets an item first?",
+            "WBGR works through several levels of usefulness. First, it looks for characters who would get a large enough upgrade to meet your configured upgrade threshold. If nobody qualifies for that, WBGR can still route the item to someone who would get a smaller upgrade. If the item is not an upgrade right now but may still be useful later, WBGR can reserve it for a character who may need it. When more than one character qualifies at the same level, your Roster Priority decides who gets it first."
+        },
+        {
+            "19. How do I use the Gear Finder tabs?",
+            "Recommendations is the normal place to start when you are ready to equip the character you are playing. Gather Gear is a helpful follow-up when you want to look for other usable gear stored elsewhere in the warband, especially after changing specs, weapon needs, or roster priority. However, not every item shown in Gather Gear is necessarily an upgrade. Gear Search is the warband-wide storage locator for finding where tracked gear is currently stored."
+        },
+        {
+            "20. How does weapon routing work?",
+            "Weapons are handled a little differently because some specs depend on complete setups. WBGR respects your weapon eligibility settings and any saved weapon setup for the character. For combinations such as 1H + Off-hand, 1H + Shield, Dual 1H, or Fury Dual 2H, WBGR looks at the complete setup instead of treating one weapon by itself as a complete upgrade."
+        },
+        {
+            "21. What does WBGR look at when evaluating gear?",
+            "WBGR mainly looks at item level, whether a character can equip the item, primary-stat compatibility, selected specs, weapon setup preferences, and role-appropriate trinkets. WBGR does not use stat weights, simulations, or secondary-stat optimization."
+        },
+        {
+            "22. Why can an item's destination change after I equip something?",
+            "Routing can change as your characters improve. If a higher-priority character equips better gear, that character may no longer need an item. WBGR can then send that item farther down the roster to someone else who can use it. Because of this, it is usually best to work through your higher-priority characters first."
+        },
+        {
+            "23. How are storage location and routing destination different?",
+            "Gear Search tells you where WBGR currently believes an item is stored. Routing is separate: it decides where that item should go next. An item can stay in the same physical location while its routing destination changes."
+        },
+    }
+
+    for _, entry in ipairs(faqEntries) do
+        AddHelpHeading(
+            faqContent,
+            entry[1],
+            faqY
+        )
+        faqY = faqY - 27
+
+        local _, bodyHeight =
+            AddHelpBody(
+                faqContent,
+                entry[2],
+                faqY
+            )
+        faqY =
+            faqY
+            - bodyHeight
+            - 24
+    end
+
+    faqContent:SetHeight(
+        math.abs(faqY)
+        + 24
+    )
+
     local function ShowAboutSubtab(
         key
     )
@@ -3832,6 +5669,15 @@ local function WGRBuildAboutSubtabs(
         )
         gearPanel:SetShown(
             key == "GEAR"
+        )
+        routingHelpPanel:SetShown(
+            key == "ROUTING_HELP"
+        )
+        gettingStartedPanel:SetShown(
+            key == "GETTING_STARTED"
+        )
+        faqPanel:SetShown(
+            key == "FAQ"
         )
 
         for tabKey, button
@@ -3891,8 +5737,35 @@ local function WGRBuildAboutSubtabs(
         end
     )
 
+    routingHelpTab:SetScript(
+        "OnClick",
+        function()
+            ShowAboutSubtab(
+                "ROUTING_HELP"
+            )
+        end
+    )
+
+    gettingStartedTab:SetScript(
+        "OnClick",
+        function()
+            ShowAboutSubtab(
+                "GETTING_STARTED"
+            )
+        end
+    )
+
+    faqTab:SetScript(
+        "OnClick",
+        function()
+            ShowAboutSubtab(
+                "FAQ"
+            )
+        end
+    )
+
     ShowAboutSubtab(
-        "COMMANDS"
+        "GETTING_STARTED"
     )
 end
 
@@ -5333,6 +7206,29 @@ local function WGRMailCreateTrackerFrame()
             -4
         )
 
+        local action2 =
+            CreateFrame(
+                "Button",
+                nil,
+                row,
+                "UIPanelButtonTemplate"
+            )
+
+        action2:SetSize(
+            88,
+            23
+        )
+
+        action2:SetPoint(
+            "TOPRIGHT",
+            row,
+            "TOPRIGHT",
+            -2,
+            -32
+        )
+
+        action2:Hide()
+
         local actionHelp =
             row:CreateFontString(
                 nil,
@@ -5430,6 +7326,8 @@ local function WGRMailCreateTrackerFrame()
             urgency
         row.action =
             action
+        row.action2 =
+            action2
         row.actionHelp =
             actionHelp
         row.dismiss =
@@ -5526,6 +7424,8 @@ local function WGRMailCreateTrackerFrame()
             local currentName =
                 UnitName("player")
 
+            local todoOffset = 0
+
             for index, entry
                 in ipairs(entries)
             do
@@ -5537,17 +7437,27 @@ local function WGRMailCreateTrackerFrame()
                         index
                     )
 
+                local rowHeight =
+                    entry.action == "SEND_PBK"
+                    and 104
+                    or 76
+
+                row:SetHeight(
+                    rowHeight
+                )
+
                 row:ClearAllPoints()
                 row:SetPoint(
                     "TOPLEFT",
                     todoContent,
                     "TOPLEFT",
                     0,
-                    -(
-                        (index - 1)
-                        * 70
-                    )
+                    -todoOffset
                 )
+
+                todoOffset =
+                    todoOffset
+                    + rowHeight
 
                 row.title:SetText(
                     entry.title
@@ -5560,6 +7470,33 @@ local function WGRMailCreateTrackerFrame()
 
                 row.detail:SetText(
                     baseDetail
+                )
+
+                row.action2:Hide()
+                row.action2:SetScript(
+                    "OnClick",
+                    nil
+                )
+                row.action2:SetScript(
+                    "OnEnter",
+                    nil
+                )
+                row.action2:SetScript(
+                    "OnLeave",
+                    nil
+                )
+
+                row.dismiss:ClearAllPoints()
+                row.dismiss:SetSize(
+                    72,
+                    20
+                )
+                row.dismiss:SetPoint(
+                    "TOPRIGHT",
+                    row.action,
+                    "BOTTOMRIGHT",
+                    0,
+                    -6
                 )
 
                 row.urgency:SetText(
@@ -5658,6 +7595,8 @@ local function WGRMailCreateTrackerFrame()
                     )
 
                 elseif entry.action
+                    == "SEND_BAGS"
+                    or entry.action
                     == "SEND_CONTEXT"
                 then
                     row.action:Show()
@@ -5798,6 +7737,202 @@ local function WGRMailCreateTrackerFrame()
                     end
 
                 elseif entry.action
+                    == "SEND_PBK"
+                then
+                    row.action:Show()
+                    row.action2:Show()
+
+                    local isCurrent =
+                        currentName
+                        and string.lower(
+                            tostring(
+                                currentName
+                            )
+                        )
+                        == string.lower(
+                            tostring(
+                                entry.character
+                            )
+                        )
+
+                    local personalBankOpen =
+                        WGRGearFinderIsPersonalBankOpen
+                        and WGRGearFinderIsPersonalBankOpen()
+
+                    local warbandOpen =
+                        WGRGearFinderIsWarbandBankOpen
+                        and WGRGearFinderIsWarbandBankOpen()
+
+                    -- PBK entries are taller so the source-specific
+                    -- actions form one clean vertical action column.
+                    row.action:SetSize(
+                        118,
+                        23
+                    )
+                    row.action:ClearAllPoints()
+                    row.action:SetPoint(
+                        "TOPRIGHT",
+                        row,
+                        "TOPRIGHT",
+                        -2,
+                        -6
+                    )
+
+                    row.action2:SetSize(
+                        118,
+                        23
+                    )
+                    row.action2:ClearAllPoints()
+                    row.action2:SetPoint(
+                        "TOPRIGHT",
+                        row.action,
+                        "BOTTOMRIGHT",
+                        0,
+                        -5
+                    )
+
+                    row.dismiss:ClearAllPoints()
+                    row.dismiss:SetSize(
+                        88,
+                        20
+                    )
+                    row.dismiss:SetPoint(
+                        "TOPRIGHT",
+                        row.action2,
+                        "BOTTOMRIGHT",
+                        0,
+                        -5
+                    )
+
+                    if not isCurrent then
+                        row.action:SetText(
+                            "Open PBK"
+                        )
+                        row.action:Disable()
+                        row.action2:SetText(
+                            "Move to Bags"
+                        )
+                        row.action2:Disable()
+                        row.detail:SetText(
+                            baseDetail
+                            .. "\nLog onto "
+                            .. tostring(
+                                entry.character
+                            )
+                            .. " and open Personal Bank."
+                        )
+                    elseif not personalBankOpen then
+                        row.action:SetText(
+                            "Open PBK"
+                        )
+                        row.action:Disable()
+                        row.action2:SetText(
+                            "Move to Bags"
+                        )
+                        row.action2:Disable()
+                        row.detail:SetText(
+                            baseDetail
+                            .. "\nOpen Personal Bank to continue."
+                        )
+                    else
+                        row.action:SetText(
+                            "Move to WBK"
+                        )
+                        if warbandOpen then
+                            row.action:Enable()
+                        else
+                            row.action:Disable()
+                        end
+
+                        row.action2:SetText(
+                            "Move to Bags"
+                        )
+                        row.action2:Enable()
+
+                        row.action:SetScript(
+                            "OnClick",
+                            function()
+                                if WGRGearFinderDepositCurrentPersonalBankOutgoingToWarband then
+                                    WGRGearFinderDepositCurrentPersonalBankOutgoingToWarband()
+                                end
+                            end
+                        )
+
+                        row.action2:SetScript(
+                            "OnClick",
+                            function()
+                                if WGRGearFinderMoveCurrentPersonalBankOutgoingToBags then
+                                    WGRGearFinderMoveCurrentPersonalBankOutgoingToBags()
+                                end
+                            end
+                        )
+                    end
+
+                    row.action:SetScript(
+                        "OnEnter",
+                        function(self)
+                            GameTooltip:SetOwner(
+                                self,
+                                "ANCHOR_RIGHT"
+                            )
+                            GameTooltip:AddLine(
+                                warbandOpen
+                                and "Move to WBK"
+                                or "Open Warband Bank",
+                                1.00,
+                                0.82,
+                                0.00
+                            )
+                            GameTooltip:AddLine(
+                                warbandOpen
+                                and "Move routed Personal Bank items directly into shared Warband Bank storage."
+                                or "Warband Bank must be available to use the preferred direct move.",
+                                0.90,
+                                0.90,
+                                0.90
+                            )
+                            GameTooltip:Show()
+                        end
+                    )
+
+                    row.action:SetScript(
+                        "OnLeave",
+                        function()
+                            GameTooltip:Hide()
+                        end
+                    )
+
+                    row.action2:SetScript(
+                        "OnEnter",
+                        function(self)
+                            GameTooltip:SetOwner(
+                                self,
+                                "ANCHOR_RIGHT"
+                            )
+                            GameTooltip:AddLine(
+                                "Move to Bags",
+                                1.00,
+                                0.82,
+                                0.00
+                            )
+                            GameTooltip:AddLine(
+                                "Move routed Personal Bank items to Bags so they can be mailed onward if needed.",
+                                0.90,
+                                0.90,
+                                0.90
+                            )
+                            GameTooltip:Show()
+                        end
+                    )
+
+                    row.action2:SetScript(
+                        "OnLeave",
+                        function()
+                            GameTooltip:Hide()
+                        end
+                    )
+
+                elseif entry.action
                     == "GEAR_FINDER"
                 then
                     row.action:Show()
@@ -5850,7 +7985,7 @@ local function WGRMailCreateTrackerFrame()
             todoContent:SetHeight(
                 math.max(
                     1,
-                    #entries * 70
+                    todoOffset
                 )
             )
 
@@ -9783,6 +11918,7 @@ local function WGRMailCreateTrackerFrame()
 
                                         frame.customSpecsPanel:Hide()
                                         frame.UpdateRoster()
+                                        WGRRefreshGearFinderIfOpen()
                                     end
                                 )
 
@@ -9815,6 +11951,7 @@ local function WGRMailCreateTrackerFrame()
                                             )
 
                                             frame.UpdateRoster()
+                                            WGRRefreshGearFinderIfOpen()
 
                                             if value == "CUSTOM" then
                                                 C_Timer.After(
@@ -10363,6 +12500,9 @@ local function WGRMailCreateTrackerFrame()
         end
     end
 
+    frame.ShowSettingsTab =
+        WGRShowSettingsTab
+
     local function CreateSettingsTab(
         key,
         text,
@@ -10813,9 +12953,12 @@ local function WGRMailCreateTrackerFrame()
         -10
     )
 
-    ignoredScroll:SetSize(
-        650,
-        150
+    ignoredScroll:SetPoint(
+        "BOTTOMRIGHT",
+        eligiblePanel,
+        "BOTTOMRIGHT",
+        -24,
+        0
     )
 
     local ignoredContent =
@@ -10825,16 +12968,44 @@ local function WGRMailCreateTrackerFrame()
             ignoredScroll
         )
 
-    ignoredContent:SetWidth(
-        620
+    ignoredContent:SetPoint(
+        "TOPLEFT",
+        ignoredScroll,
+        "TOPLEFT",
+        0,
+        0
     )
     ignoredContent:SetHeight(
         1
     )
 
+    local function WGRUpdateIgnoredContentWidth()
+        local scrollWidth =
+            ignoredScroll:GetWidth()
+            or 0
+
+        if scrollWidth > 20 then
+            ignoredContent:SetWidth(
+                scrollWidth - 20
+            )
+        end
+    end
+
+    ignoredScroll:SetScript(
+        "OnSizeChanged",
+        WGRUpdateIgnoredContentWidth
+    )
+
+    ignoredScroll:SetScript(
+        "OnShow",
+        WGRUpdateIgnoredContentWidth
+    )
+
     ignoredScroll:SetScrollChild(
         ignoredContent
     )
+
+    WGRUpdateIgnoredContentWidth()
 
     local ignoredRows = {}
 
@@ -10971,9 +13142,8 @@ local function WGRMailCreateTrackerFrame()
                 ignoredContent
             )
 
-        row:SetSize(
-            610,
-            44
+        row:SetHeight(
+            40
         )
 
         row:SetPoint(
@@ -10983,8 +13153,35 @@ local function WGRMailCreateTrackerFrame()
             0,
             -(
                 (index - 1)
-                * 46
+                * 41
             )
+        )
+
+        row:SetPoint(
+            "RIGHT",
+            ignoredContent,
+            "RIGHT",
+            0,
+            0
+        )
+
+        local bg =
+            row:CreateTexture(
+                nil,
+                "BACKGROUND"
+            )
+        bg:SetAllPoints()
+        local shade =
+            index % 2 == 0
+            and 0.10
+            or 0.05
+        bg:SetColorTexture(
+            shade,
+            shade,
+            shade,
+            index % 2 == 0
+                and 0.30
+                or 0.18
         )
 
         local icon =
@@ -10997,7 +13194,7 @@ local function WGRMailCreateTrackerFrame()
             "LEFT",
             row,
             "LEFT",
-            0,
+            4,
             0
         )
 
@@ -11008,13 +13205,13 @@ local function WGRMailCreateTrackerFrame()
                 "GameFontHighlightSmall"
             )
         name:SetPoint(
-            "TOPLEFT",
-            icon,
-            "TOPRIGHT",
-            8,
-            -2
+            "LEFT",
+            row,
+            "LEFT",
+            48,
+            0
         )
-        name:SetWidth(390)
+        name:SetWidth(330)
         name:SetJustifyH("LEFT")
 
         local location =
@@ -11024,13 +13221,13 @@ local function WGRMailCreateTrackerFrame()
                 "GameFontHighlightSmall"
             )
         location:SetPoint(
-            "TOPLEFT",
-            name,
-            "BOTTOMLEFT",
-            0,
-            -3
+            "LEFT",
+            row,
+            "LEFT",
+            390,
+            0
         )
-        location:SetWidth(390)
+        location:SetWidth(360)
         location:SetJustifyH("LEFT")
         location:SetTextColor(
             0.62,
@@ -11055,6 +13252,7 @@ local function WGRMailCreateTrackerFrame()
         )
         remove:SetText("Unignore")
 
+        row.bg = bg
         row.icon = icon
         row.name = name
         row.location = location
@@ -11108,8 +13306,7 @@ local function WGRMailCreateTrackerFrame()
                     liveLocation
 
                 row.location:SetText(
-                    "Last Known Location: "
-                    .. liveLocation
+                    liveLocation
                 )
 
                 row.remove:SetScript(
@@ -11142,7 +13339,7 @@ local function WGRMailCreateTrackerFrame()
             ignoredContent:SetHeight(
                 math.max(
                     1,
-                    #entries * 46
+                    #entries * 41
                 )
             )
 
@@ -11202,7 +13399,7 @@ local function WGRMailCreateTrackerFrame()
 
     local specModeLabel =
         routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
-    specModeLabel:SetPoint("TOPLEFT",routingTitle,"BOTTOMLEFT",0,-10)
+    specModeLabel:SetPoint("TOPLEFT",routingTitle,"BOTTOMLEFT",0,-14)
     specModeLabel:SetText("Default Spec Mode:")
 
     local specModeDropdown = CreateWGRDropdown(routingPanel,175,22)
@@ -11229,6 +13426,7 @@ local function WGRMailCreateTrackerFrame()
                         WarboundGearRouterDB.routingSettings.specMode=value
                         WGRUpdateGlobalSpecModeDropdown()
                         if frame.UpdateRoster then frame.UpdateRoster() end
+                        WGRRefreshGearFinderIfOpen()
                     end
                 )
             end
@@ -11265,7 +13463,7 @@ local function WGRMailCreateTrackerFrame()
     end)
 
     local specModeHelp=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
-    specModeHelp:SetPoint("TOPLEFT",specModeLabel,"BOTTOMLEFT",0,-8)
+    specModeHelp:SetPoint("TOPLEFT",specModeLabel,"BOTTOMLEFT",0,-9)
     specModeHelp:SetWidth(760)
     specModeHelp:SetJustifyH("LEFT")
     specModeHelp:SetTextColor(.68,.68,.68)
@@ -11274,7 +13472,7 @@ local function WGRMailCreateTrackerFrame()
     )
 
     local belowMaxLabel=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
-    belowMaxLabel:SetPoint("TOPLEFT",specModeHelp,"BOTTOMLEFT",0,-12)
+    belowMaxLabel:SetPoint("TOPLEFT",specModeHelp,"BOTTOMLEFT",0,-24)
     belowMaxLabel:SetText("Below Max Level Spec Mode:")
 
     local underMaxAllSpecsButton=CreateFrame("Button",nil,routingPanel,"UIPanelButtonTemplate")
@@ -11286,7 +13484,7 @@ local function WGRMailCreateTrackerFrame()
     end)
 
     local belowMaxHelp=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
-    belowMaxHelp:SetPoint("TOPLEFT",belowMaxLabel,"BOTTOMLEFT",0,-7)
+    belowMaxHelp:SetPoint("TOPLEFT",belowMaxLabel,"BOTTOMLEFT",0,-8)
     belowMaxHelp:SetWidth(760)
     belowMaxHelp:SetJustifyH("LEFT")
     belowMaxHelp:SetTextColor(.68,.68,.68)
@@ -11300,7 +13498,7 @@ local function WGRMailCreateTrackerFrame()
     weaponSection:SetText("")
 
     local weaponDefaultLabel=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
-    weaponDefaultLabel:SetPoint("TOPLEFT",belowMaxHelp,"BOTTOMLEFT",0,-12)
+    weaponDefaultLabel:SetPoint("TOPLEFT",belowMaxHelp,"BOTTOMLEFT",0,-26)
     weaponDefaultLabel:SetText("Default Weapon Eligibility:")
 
     local weaponDefaultDropdown=CreateWGRDropdown(routingPanel,150,22)
@@ -11355,7 +13553,7 @@ local function WGRMailCreateTrackerFrame()
     end)
 
     local weaponDefaultHelp=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
-    weaponDefaultHelp:SetPoint("TOPLEFT",weaponDefaultLabel,"BOTTOMLEFT",0,-8)
+    weaponDefaultHelp:SetPoint("TOPLEFT",weaponDefaultLabel,"BOTTOMLEFT",0,-9)
     weaponDefaultHelp:SetWidth(760)
     weaponDefaultHelp:SetJustifyH("LEFT")
     weaponDefaultHelp:SetTextColor(.68,.68,.68)
@@ -11365,7 +13563,7 @@ local function WGRMailCreateTrackerFrame()
 
     -- Global Overrides -------------------------------------------
     local overrideSection=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
-    overrideSection:SetPoint("TOPLEFT",weaponDefaultHelp,"BOTTOMLEFT",0,-12)
+    overrideSection:SetPoint("TOPLEFT",weaponDefaultHelp,"BOTTOMLEFT",0,-28)
     overrideSection:SetText("Overrides:")
 
     local rogueOverrideX=82
@@ -11452,11 +13650,11 @@ local function WGRMailCreateTrackerFrame()
 
     -- Upgrade Threshold ------------------------------------------
     local thresholdSection=routingPanel:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-    thresholdSection:SetPoint("TOPLEFT",overrideSection,"BOTTOMLEFT",0,-42)
+    thresholdSection:SetPoint("TOPLEFT",overrideSection,"BOTTOMLEFT",0,-38)
     thresholdSection:SetText("")
 
     local thresholdLabel=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
-    thresholdLabel:SetPoint("TOPLEFT",overrideSection,"BOTTOMLEFT",0,-42)
+    thresholdLabel:SetPoint("TOPLEFT",overrideSection,"BOTTOMLEFT",0,-38)
     thresholdLabel:SetText("Default iLvl Upgrade Threshold:")
 
     local thresholdDropdown=CreateWGRDropdown(routingPanel,110,22)

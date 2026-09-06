@@ -3419,6 +3419,12 @@ local function WGRHeldGearClassifyItem(
         subtype
 end
 
+-- Shared read-only classifier used by Gear Search MAIL tracking so mailed
+-- items use the exact same buckets as BAG/PBK/WBK snapshots.
+function WGRClassifyHeldGearItem(itemLink)
+    return WGRHeldGearClassifyItem(itemLink)
+end
+
 local function WGRHeldGearAddEntry(
     location,
     section,
@@ -3512,6 +3518,37 @@ local function WGREquippedItemIsSoulbound(slotID)
     return ok and WGRItemLocationIsSoulbound(itemLocation)
 end
 
+local function WGRHeldGearRawKey(itemLink)
+    if not itemLink then return nil end
+    local section, category, subtype = WGRHeldGearClassifyItem(itemLink)
+    if not section or not category then return nil end
+    return table.concat({
+        tostring(section),
+        tostring(category),
+        tostring(subtype or ""),
+    }, "\031")
+end
+
+local function WGRHeldGearMailContinuityMatches(itemLink)
+    if not itemLink or not WarboundGearRouterDB then return false end
+    local characterName = UnitName("player")
+    if not characterName then return false end
+    local byCharacter = WarboundGearRouterDB.gearSearchMailContinuity
+    local records = byCharacter and byCharacter[string.lower(characterName)]
+    if type(records) ~= "table" then return false end
+
+    local itemID
+    if C_Item and C_Item.GetItemInfoInstant then
+        itemID = C_Item.GetItemInfoInstant(itemLink)
+    end
+    itemID = tonumber(itemID) or tonumber(tostring(itemLink):match("item:(%d+)"))
+    local gearKey = WGRHeldGearRawKey(itemLink)
+    if not itemID or not gearKey then return false end
+
+    local identity = tostring(itemID) .. "\031" .. gearKey
+    return (tonumber(records[identity]) or 0) > 0
+end
+
 local function WGRHeldGearBuildSlotState(
     bagID,
     slotID,
@@ -3559,7 +3596,13 @@ local function WGRHeldGearBuildSlotState(
             or recommendation.kind == "no_current_upgrade"
         )
 
-    if not isDispose then
+    -- Gear Search location continuity is separate from routing. If WBGR
+    -- previously tracked this exact item/category through MAIL, keep indexing
+    -- it after retrieval even when the recipient-side recommendation is now
+    -- sell/no_current_upgrade. This does not broaden normal BAG/PBK indexing.
+    local preserveMailTracked = WGRHeldGearMailContinuityMatches(itemLink)
+
+    if (not isDispose) or preserveMailTracked then
         local section, category, subtype =
             WGRHeldGearClassifyItem(itemLink)
 
@@ -4106,6 +4149,10 @@ function WGRRefreshHeldGearSnapshot(
     ] =
         snapshot
 
+    if WGRNotifyGearSearchChanged then
+        WGRNotifyGearSearchChanged()
+    end
+
     if perfStart > 0 and WGRPerfNow and WGRPerfRecord then
         WGRPerfRecord(
             "held_snapshot_total",
@@ -4347,6 +4394,10 @@ function WGRRefreshWarbandHeldGearSnapshot(dirtyBagIDs)
 
     WarboundGearRouterDB.heldGearSnapshots["__warband_bank"] = snapshot
 
+    if WGRNotifyGearSearchChanged then
+        WGRNotifyGearSearchChanged()
+    end
+
     if perfStart > 0 and WGRPerfNow and WGRPerfRecord then
         local refreshedTabs = 0
         if canRefreshPartial then
@@ -4421,6 +4472,7 @@ function WGRGetHeldGearSummary(
             total = 0,
             bags = 0,
             bank = 0,
+            mail = 0,
             entries = {},
         }
     end
@@ -4439,6 +4491,7 @@ function WGRGetHeldGearSummary(
             total = 0,
             bags = 0,
             bank = 0,
+            mail = 0,
             entries = {},
         }
     end
@@ -4450,6 +4503,7 @@ function WGRGetHeldGearSummary(
         total = 0,
         bags = 0,
         bank = 0,
+        mail = 0,
         entries = {},
         bagsScanned =
             snapshot.bags
@@ -4507,6 +4561,54 @@ function WGRGetHeldGearSummary(
         snapshot.bank,
         "bank"
     )
+
+    -- MAIL is tracked separately from BAG/PBK snapshots. Fold only WBGR's
+    -- item-aware tracked gear into the roster summary; unrelated mailbox
+    -- attachments are intentionally not counted.
+    local mailTracking =
+        WarboundGearRouterDB
+        and WarboundGearRouterDB.mailGearTracking
+        or nil
+
+    if type(mailTracking) == "table" then
+        local mailEntry =
+            mailTracking[
+                string.lower(
+                    characterName
+                )
+            ]
+
+        if type(mailEntry) == "table" then
+            for _, item
+                in ipairs(
+                    mailEntry.items
+                    or {}
+                )
+            do
+                local gearKey =
+                    type(item) == "table"
+                    and item.gearKey
+                    or nil
+
+                if gearKey
+                    and gearKey ~= ""
+                then
+                    summary.mail =
+                        summary.mail + 1
+
+                    summary.total =
+                        summary.total + 1
+
+                    summary.entries[gearKey] =
+                        (
+                            summary.entries[gearKey]
+                            or 0
+                        )
+                        + 1
+                end
+            end
+        end
+    end
 
     return summary
 end

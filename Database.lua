@@ -201,6 +201,10 @@ function InitializeDatabase()
         WarboundGearRouterDB.mailTracking = {}
     end
 
+    if not WarboundGearRouterDB.mailGearTracking then
+        WarboundGearRouterDB.mailGearTracking = {}
+    end
+
     if not WarboundGearRouterDB.recentActivity then
         WarboundGearRouterDB.recentActivity = {}
     end
@@ -215,6 +219,14 @@ function InitializeDatabase()
 
     if not WarboundGearRouterDB.heldGearSnapshots then
         WarboundGearRouterDB.heldGearSnapshots = {}
+    end
+
+    -- Item/category continuity for gear that WBGR already tracked through MAIL.
+    -- This is intentionally separate from routing decisions: Gear Search answers
+    -- where known tracked gear physically is, even if the recipient-side routing
+    -- evaluation later changes.
+    if not WarboundGearRouterDB.gearSearchMailContinuity then
+        WarboundGearRouterDB.gearSearchMailContinuity = {}
     end
 
     if not WarboundGearRouterDB.todoSpecAttempts then
