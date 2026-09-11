@@ -284,6 +284,125 @@ function BuildSimpleAlternatives(
     return WGRFinalizeAlternatives(alternatives, recommendation)
 end
 
+
+-- ============================================================
+-- DETAILED TOOLTIP ROUTING TRACE
+--
+-- Detailed tooltips intentionally show only meaningful routing candidates.
+-- The normal recommendation algorithm remains authoritative; this trace
+-- mirrors its comparison inputs so Shift+Hover can explain why candidates
+-- were bypassed. Upgrade routes append only the first future HOLD candidate;
+-- HOLD routes preserve the remaining HOLD candidates as well.
+-- ============================================================
+
+function BuildSimpleRoutingTrace(
+    newItemLevel,
+    itemMinLevel,
+    priorityList,
+    slotIDs,
+    recommendation,
+    comparisonProvider
+)
+    local trace = {}
+    local firstHolder = nil
+    local holderCandidates = {}
+    local includeAllHolders =
+        recommendation
+        and recommendation.kind == "holder"
+
+    local function CanEquipNow(level)
+        return not itemMinLevel
+            or itemMinLevel <= 0
+            or level >= itemMinLevel
+    end
+
+    for priorityIndex, characterName in ipairs(priorityList or {}) do
+        local character = FindCharacterByName(characterName)
+
+        if character then
+            local level = WGRGetCharacterLevel(character)
+
+            if CanEquipNow(level) then
+                local equippedLevel, status =
+                    (
+                        comparisonProvider
+                        and comparisonProvider(characterName, character)
+                        or GetComparisonForSlots(character, slotIDs)
+                    )
+
+                local comparisonState
+                equippedLevel, status, comparisonState =
+                    WGRNormalizeSimpleComparison(equippedLevel, status)
+
+                if comparisonState == "unknown" then
+                    trace[#trace + 1] = {
+                        kind = "unknown",
+                        name = characterName,
+                        priorityIndex = priorityIndex,
+                        selected = recommendation
+                            and recommendation.name == characterName
+                            and recommendation.kind == "unknown",
+                    }
+                elseif comparisonState == "known" then
+                    local upgrade = newItemLevel - equippedLevel
+                    local threshold = WGRGetCharacterThreshold(characterName)
+
+                    if upgrade > 0 then
+                        trace[#trace + 1] = {
+                            kind = "upgrade",
+                            name = characterName,
+                            upgrade = upgrade,
+                            threshold = threshold,
+                            meetsThreshold = upgrade >= threshold,
+                            priorityIndex = priorityIndex,
+                            selected = recommendation
+                                and recommendation.name == characterName
+                                and recommendation.kind == "upgrade",
+                        }
+                    else
+                        trace[#trace + 1] = {
+                            kind = "no_upgrade",
+                            name = characterName,
+                            comparisonLevel = equippedLevel,
+                            priorityIndex = priorityIndex,
+                        }
+                    end
+                end
+                -- comparisonState == "skip" means this item is not usable for
+                -- the character's effective routed specs, so it is not a
+                -- meaningful Full-tooltip routing candidate.
+            else
+                local holder = {
+                    kind = "holder",
+                    name = characterName,
+                    level = level,
+                    requiredLevel = itemMinLevel,
+                    priorityIndex = priorityIndex,
+                    selected = recommendation
+                        and recommendation.name == characterName
+                        and recommendation.kind == "holder",
+                }
+
+                if includeAllHolders then
+                    holderCandidates[#holderCandidates + 1] = holder
+                elseif not firstHolder then
+                    firstHolder = holder
+                end
+            end
+        end
+    end
+
+    if includeAllHolders then
+        for _, holder in ipairs(holderCandidates) do
+            trace[#trace + 1] = holder
+        end
+    elseif firstHolder then
+        trace[#trace + 1] = firstHolder
+    end
+
+    return trace
+end
+
 function RunEvaluation(
     itemName,
     newItemLevel,

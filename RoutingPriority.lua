@@ -333,6 +333,10 @@ function WGRRemoveCharacter(characterName)
         WarboundGearRouterDB.ownedWeaponComponents[key] = nil
     end
 
+    if WarboundGearRouterDB.ownedTrinketComponents then
+        WarboundGearRouterDB.ownedTrinketComponents[key] = nil
+    end
+
     WarboundGearRouterDB.ignoredCharacters[key] =
         nil
 

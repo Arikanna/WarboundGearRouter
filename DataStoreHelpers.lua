@@ -590,12 +590,85 @@ function IsTransferableGearTooltip(
         return false
     end
 
+    -- Cosmetic-only items are a definitive routing exclusion. Return an
+    -- explicit reason so the tooltip layer does not mistake the exclusion
+    -- for temporarily incomplete tooltip data and schedule RefreshData()
+    -- retries while the item is hovered.
     if itemLink
-        and not WGRQualityAllowed(
+        and WGRItemIsCosmetic
+        and WGRItemIsCosmetic(
             itemLink
         )
     then
-        return false
+        return false, "COSMETIC"
+    end
+
+    -- WBGR only routes equippable gear. Quest items, consumables, decor
+    -- learning items, and other usable inventory objects normally have no
+    -- equip location. Treat that as a final answer instead of forcing a
+    -- tooltip refresh merely because no transferable binding text was found.
+    local instantInfo =
+        itemLink
+        and GetInstantItemInfo(
+            itemLink
+        )
+        or nil
+
+    if not instantInfo then
+        return false, "UNRESOLVED"
+    end
+
+    -- WBGR routes wearable gear only. Some recipes/patterns, housing items,
+    -- trade goods, and other non-gear can expose tooltip text that resembles
+    -- an equippable result. Reject them by Blizzard item class before any
+    -- binding-text inspection or retry logic. Jewelry, cloaks, trinkets,
+    -- shields, off-hands, and normal armor are all Armor-class items; weapons
+    -- are Weapon-class items.
+    local armorClassID =
+        Enum
+        and Enum.ItemClass
+        and Enum.ItemClass.Armor
+        or 4
+
+    local weaponClassID =
+        Enum
+        and Enum.ItemClass
+        and Enum.ItemClass.Weapon
+        or 2
+
+    if instantInfo.classID ~= armorClassID
+        and instantInfo.classID ~= weaponClassID
+    then
+        return false, "NON_GEAR"
+    end
+
+    local equipLoc =
+        tostring(
+            instantInfo.equipLoc
+            or ""
+        )
+
+    if equipLoc == "" then
+        return false, "NON_GEAR"
+    end
+
+    -- Item quality can briefly be unavailable while Blizzard is finishing
+    -- item-data loading. That is one of the few cases where a bounded retry
+    -- is still useful.
+    local _, _, quality =
+        C_Item.GetItemInfo(
+            itemLink
+        )
+
+    if quality == nil then
+        return false, "UNRESOLVED"
+    end
+
+    if not WGRQualityAllowed(
+        itemLink
+    )
+    then
+        return false, "NOT_ELIGIBLE"
     end
 
     local sawWarbound = false
@@ -620,6 +693,14 @@ function IsTransferableGearTooltip(
             true
         ) then
             return "SOULBOUND"
+        end
+
+        if clean:find(
+            "binds when picked up",
+            1,
+            true
+        ) then
+            return "BOP"
         end
 
         if clean:find(
@@ -687,21 +768,35 @@ function IsTransferableGearTooltip(
                         line.rightText,
                     })
                 do
-                    if CheckText(text)
+                    local bindingResult =
+                        CheckText(
+                            text
+                        )
+
+                    if bindingResult
                         == "SOULBOUND"
+                        or bindingResult
+                            == "BOP"
                     then
-                        -- Soulbound is a definitive routing exclusion, not a
-                        -- temporary tooltip-data miss. Return a reason so the
-                        -- tooltip layer does not schedule RefreshData retries.
-                        return false, "SOULBOUND"
+                        -- These are definitive routing exclusions, not
+                        -- temporary tooltip-data misses.
+                        return false, bindingResult
                     end
                 end
             end
 
-            return WGRBindingAllowed(
-                sawWarbound,
-                sawBoE
-            )
+            if sawWarbound
+                or sawBoE
+            then
+                return
+                    WGRBindingAllowed(
+                        sawWarbound,
+                        sawBoE
+                    ),
+                    "BINDING_RESOLVED"
+            end
+
+            return false, "UNRESOLVED"
         end
     end
 
@@ -740,19 +835,34 @@ function IsTransferableGearTooltip(
                     and rightLine:GetText(),
             })
         do
-            if CheckText(text)
+            local bindingResult =
+                CheckText(
+                    text
+                )
+
+            if bindingResult
                 == "SOULBOUND"
+                or bindingResult
+                    == "BOP"
             then
                 -- Same definitive exclusion for compatibility tooltip parsing.
-                return false, "SOULBOUND"
+                return false, bindingResult
             end
         end
     end
 
-    return WGRBindingAllowed(
-        sawWarbound,
-        sawBoE
-    )
+    if sawWarbound
+        or sawBoE
+    then
+        return
+            WGRBindingAllowed(
+                sawWarbound,
+                sawBoE
+            ),
+            "BINDING_RESOLVED"
+    end
+
+    return false, "UNRESOLVED"
 end
 
 function GetHoveredItem()

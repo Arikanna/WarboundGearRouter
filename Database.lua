@@ -345,6 +345,21 @@ function InitializeDatabase()
         WarboundGearRouterDB.specTrinketBaselines = {}
     end
 
+    -- Last-observed physical SOULBOUND trinkets owned by each character.
+    -- Routing derives per-spec trinket floors from this ownership pool so
+    -- wrong-spec equipped trinkets cannot erase useful bag/PBK trinkets and
+    -- old historical per-spec records cannot pretend a missing trinket is
+    -- still physically owned. Each physical record also stores the live
+    -- character-context spec eligibility observed for that trinket; offline
+    -- routing must not reconstruct eligibility from item links alone.
+    -- Warbound/BoE trinkets never enter this cache.
+    if WarboundGearRouterDB.ownedTrinketComponentsSoulboundOnlyVersion ~= 2 then
+        WarboundGearRouterDB.ownedTrinketComponents = {}
+        WarboundGearRouterDB.ownedTrinketComponentsSoulboundOnlyVersion = 2
+    elseif not WarboundGearRouterDB.ownedTrinketComponents then
+        WarboundGearRouterDB.ownedTrinketComponents = {}
+    end
+
     if not WarboundGearRouterDB.eligibleGear then
         WarboundGearRouterDB.eligibleGear = {
             warbound = true,
@@ -412,6 +427,7 @@ function InitializeDatabase()
     if not WarboundGearRouterDB.interface then
         WarboundGearRouterDB.interface = {
             tooltipStyle = "PROMINENT",
+            showSoulboundTrinketSpecs = false,
             gearOverlays = false,
             backgroundOpacity = 50,
             routingPaused = false,
@@ -430,6 +446,14 @@ function InitializeDatabase()
     else
         if not WarboundGearRouterDB.interface.tooltipStyle then
             WarboundGearRouterDB.interface.tooltipStyle = "PROMINENT"
+        elseif WarboundGearRouterDB.interface.tooltipStyle == "FULL" then
+            -- v0.65x internal test name; preserve the user's choice through
+            -- the public-facing rename to Detailed.
+            WarboundGearRouterDB.interface.tooltipStyle = "DETAILED"
+        end
+
+        if WarboundGearRouterDB.interface.showSoulboundTrinketSpecs == nil then
+            WarboundGearRouterDB.interface.showSoulboundTrinketSpecs = false
         end
 
         if WarboundGearRouterDB.interface.gearOverlays == nil then

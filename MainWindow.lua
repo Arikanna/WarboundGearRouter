@@ -3775,9 +3775,9 @@ local function WGRBuildAboutSubtabs(
         {
             class = "Death Knight",
             specs = {
-                {"Blood","Plate","Tank",{"2H Str: Axe/Mace/Sword"}},
-                {"Frost","Plate","DPS / Physical DPS",{"2H Str: Axe/Mace/Sword","Dual 1H Str: Axe/Mace/Sword"}},
-                {"Unholy","Plate","DPS / Physical DPS",{"2H Str: Axe/Mace/Sword"}},
+                {"Blood","Plate","Tank",{"2H Str: Axe/Mace/Sword/Polearm"}},
+                {"Frost","Plate","DPS / Physical DPS",{"2H Str: Axe/Mace/Sword/Polearm","Dual 1H Str: Axe/Mace/Sword"}},
+                {"Unholy","Plate","DPS / Physical DPS",{"2H Str: Axe/Mace/Sword/Polearm"}},
             },
         },
         {
@@ -3810,7 +3810,7 @@ local function WGRBuildAboutSubtabs(
             specs = {
                 {"Beast Mastery","Mail","DPS / Physical DPS",{"Ranged: Bow/Crossbow/Gun"}},
                 {"Marksmanship","Mail","DPS / Physical DPS",{"Ranged: Bow/Crossbow/Gun"}},
-                {"Survival","Mail","DPS / Physical DPS",{"2H Agil: Staff/Polearm","Dual 1H Agil: Axe/Sword"}},
+                {"Survival","Mail","DPS / Physical DPS",{"2H Agil: Staff/Polearm","Dual 1H Agil: Axe/Sword/Dagger"}},
             },
         },
         {
@@ -3825,7 +3825,7 @@ local function WGRBuildAboutSubtabs(
             class = "Monk",
             specs = {
                 {"Brewmaster","Leather","Tank",{"2H Agil: Staff/Polearm","Dual 1H Agil: Axe/Mace/Sword/Fist"}},
-                {"Mistweaver","Leather","Healer",{"2H Int: Staff","1H Int: Mace/Sword + Off-hand"}},
+                {"Mistweaver","Leather","Healer",{"2H Int: Staff","1H Int: Axe/Mace/Sword + Off-hand"}},
                 {"Windwalker","Leather","DPS / Physical DPS",{"2H Agil: Staff/Polearm","Dual 1H Agil: Axe/Mace/Sword/Fist"}},
             },
         },
@@ -3834,7 +3834,7 @@ local function WGRBuildAboutSubtabs(
             specs = {
                 {"Holy","Plate","Healer",{"1H Int: Axe/Mace/Sword + Shield"}},
                 {"Protection","Plate","Tank",{"1H Str: Axe/Mace/Sword + Shield"}},
-                {"Retribution","Plate","DPS / Physical DPS",{"2H Str: Axe/Mace/Sword"}},
+                {"Retribution","Plate","DPS / Physical DPS",{"2H Str: Axe/Mace/Sword/Polearm"}},
             },
         },
         {
@@ -3848,9 +3848,9 @@ local function WGRBuildAboutSubtabs(
         {
             class = "Rogue",
             specs = {
-                {"Assassination","Leather","DPS / Physical DPS",{"Agility Daggers: Dagger/Dagger"}},
+                {"Assassination","Leather","DPS / Physical DPS",{"Agility Daggers: Dagger"}},
                 {"Outlaw","Leather","DPS / Physical DPS",{"Dual 1H Agil: Axe/Mace/Sword/Fist/Dagger"}},
-                {"Subtlety","Leather","DPS / Physical DPS",{"Agility Daggers: Dagger/Dagger"}},
+                {"Subtlety","Leather","DPS / Physical DPS",{"Agility Daggers: Dagger"}},
             },
         },
         {
@@ -3872,8 +3872,8 @@ local function WGRBuildAboutSubtabs(
         {
             class = "Warrior",
             specs = {
-                {"Arms","Plate","DPS / Physical DPS",{"2H Str: Axe/Mace/Sword"}},
-                {"Fury","Plate","DPS / Physical DPS",{"Dual 2H Str: Axe/Mace/Sword","Dual 1H Str: Axe/Mace/Sword"}},
+                {"Arms","Plate","DPS / Physical DPS",{"2H Str: Axe/Mace/Sword/Polearm"}},
+                {"Fury","Plate","DPS / Physical DPS",{"Dual 2H Str: Axe/Mace/Sword/Polearm","Dual 1H Str: Axe/Mace/Sword"}},
                 {"Protection","Plate","Tank",{"1H Str: Axe/Mace/Sword + Shield"}},
             },
         },
@@ -4067,59 +4067,8 @@ local function WGRBuildAboutSubtabs(
             y - 8
     end
 
-    local notesTitle =
-        gearContent:CreateFontString(
-            nil,
-            "OVERLAY",
-            "GameFontNormalLarge"
-        )
-    notesTitle:SetPoint(
-        "TOPLEFT",
-        0,
-        y
-    )
-    notesTitle:SetText(
-        "WBGR Notes"
-    )
-
-    y =
-        y - 30
-
-    local notesText =
-        gearContent:CreateFontString(
-            nil,
-            "OVERLAY",
-            "GameFontHighlight"
-        )
-    notesText:SetPoint(
-        "TOPLEFT",
-        0,
-        y
-    )
-    notesText:SetWidth(
-        1240
-    )
-    notesText:SetJustifyH(
-        "LEFT"
-    )
-    notesText:SetJustifyV(
-        "TOP"
-    )
-    notesText:SetText(
-        "Demon Hunter: The global Warglaive-only preference can restrict otherwise eligible generic 1H weapons. Custom Weapons can override it.\n\n"
-        .. "Fury Warrior: WBGR supports both Dual 2H and Dual 1H setups. Global and per-character weapon preferences determine which setup is preferred.\n\n"
-        .. "Rogue: WBGR can preferentially route Agility Daggers to Rogues when that global preference is enabled."
-    )
-
-    local notesHeight =
-        math.ceil(
-            notesText:GetStringHeight()
-            or 0
-        )
-
     gearContent:SetHeight(
         math.abs(y)
-        + notesHeight
         + 30
     )
 
@@ -13387,22 +13336,105 @@ local function WGRMailCreateTrackerFrame()
     )
     routingTitle:SetText("Routing")
 
+    routingPanel.routingScroll =
+        CreateFrame(
+            "ScrollFrame",
+            nil,
+            routingPanel,
+            "UIPanelScrollFrameTemplate"
+        )
+    routingPanel.routingScroll:SetPoint(
+        "TOPLEFT",
+        routingTitle,
+        "BOTTOMLEFT",
+        0,
+        -2
+    )
+    routingPanel.routingScroll:SetPoint(
+        "BOTTOMRIGHT",
+        routingPanel,
+        "BOTTOMRIGHT",
+        -28,
+        0
+    )
+
+    routingPanel.routingContent =
+        CreateFrame(
+            "Frame",
+            nil,
+            routingPanel.routingScroll
+        )
+    routingPanel.routingContent:SetPoint(
+        "TOPLEFT",
+        routingPanel.routingScroll,
+        "TOPLEFT",
+        0,
+        0
+    )
+    routingPanel.routingContent:SetHeight(
+        720
+    )
+    routingPanel.routingContent:SetWidth(
+        math.max(
+            900,
+            (
+                routingPanel.routingScroll:GetWidth()
+                or 0
+            )
+            - 8
+        )
+    )
+    routingPanel.routingScroll:SetScrollChild(
+        routingPanel.routingContent
+    )
+
+    routingPanel:HookScript(
+        "OnShow",
+        function()
+            routingPanel.routingContent:SetWidth(
+                math.max(
+                    900,
+                    (
+                        routingPanel.routingScroll:GetWidth()
+                        or 0
+                    )
+                    - 8
+                )
+            )
+        end
+    )
+    routingPanel:HookScript(
+        "OnSizeChanged",
+        function()
+            routingPanel.routingContent:SetWidth(
+                math.max(
+                    900,
+                    (
+                        routingPanel.routingScroll:GetWidth()
+                        or 0
+                    )
+                    - 8
+                )
+            )
+        end
+    )
+
     -- Spec Modes -------------------------------------------------
     local specSection =
-        routingPanel:CreateFontString(
+        routingPanel.routingContent:CreateFontString(
             nil,
             "OVERLAY",
             "GameFontNormalSmall"
         )
-    specSection:SetPoint("TOPLEFT", routingTitle, "BOTTOMLEFT", 0, -1)
+    specSection:SetPoint("TOPLEFT", routingPanel.routingContent, "TOPLEFT", 0, -50)
     specSection:SetText("")
 
     local specModeLabel =
-        routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
-    specModeLabel:SetPoint("TOPLEFT",routingTitle,"BOTTOMLEFT",0,-14)
+        routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+    specModeLabel:SetPoint("TOPLEFT",routingPanel.routingContent,"TOPLEFT",0,-62)
     specModeLabel:SetText("Default Spec Mode:")
 
-    local specModeDropdown = CreateWGRDropdown(routingPanel,175,22)
+    local specModeDropdown = CreateWGRDropdown(routingPanel.routingContent,175,22)
     specModeDropdown:SetPoint("LEFT",specModeLabel,"RIGHT",14,0)
 
     local function WGRUpdateGlobalSpecModeDropdown()
@@ -13454,7 +13486,7 @@ local function WGRMailCreateTrackerFrame()
         )
     end
 
-    local resetSpecModesButton=CreateFrame("Button",nil,routingPanel,"UIPanelButtonTemplate")
+    local resetSpecModesButton=CreateFrame("Button",nil,routingPanel.routingContent,"UIPanelButtonTemplate")
     resetSpecModesButton:SetPoint("LEFT",specModeDropdown,"RIGHT",10,0)
     resetSpecModesButton:SetText("Reset All Specs to Default")
     WGRSizeResetButtonToText(resetSpecModesButton)
@@ -13462,7 +13494,7 @@ local function WGRMailCreateTrackerFrame()
         StaticPopup_Show("WGR_CONFIRM_RESET_ALL_SPEC_MODES",nil,nil,{frame=frame})
     end)
 
-    local specModeHelp=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+    local specModeHelp=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
     specModeHelp:SetPoint("TOPLEFT",specModeLabel,"BOTTOMLEFT",0,-9)
     specModeHelp:SetWidth(760)
     specModeHelp:SetJustifyH("LEFT")
@@ -13471,11 +13503,11 @@ local function WGRMailCreateTrackerFrame()
         "Configure Custom Specs in the Roster."
     )
 
-    local belowMaxLabel=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
-    belowMaxLabel:SetPoint("TOPLEFT",specModeHelp,"BOTTOMLEFT",0,-24)
+    local belowMaxLabel=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+    belowMaxLabel:SetPoint("TOPLEFT",specModeHelp,"BOTTOMLEFT",0,-18)
     belowMaxLabel:SetText("Below Max Level Spec Mode:")
 
-    local underMaxAllSpecsButton=CreateFrame("Button",nil,routingPanel,"UIPanelButtonTemplate")
+    local underMaxAllSpecsButton=CreateFrame("Button",nil,routingPanel.routingContent,"UIPanelButtonTemplate")
     underMaxAllSpecsButton:SetSize(120,22)
     underMaxAllSpecsButton:SetPoint("LEFT",belowMaxLabel,"RIGHT",14,0)
     underMaxAllSpecsButton:SetText("Set to All Specs")
@@ -13483,7 +13515,7 @@ local function WGRMailCreateTrackerFrame()
         StaticPopup_Show("WGR_CONFIRM_UNDERMAX_ALL_SPECS",nil,nil,{frame=frame})
     end)
 
-    local belowMaxHelp=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+    local belowMaxHelp=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
     belowMaxHelp:SetPoint("TOPLEFT",belowMaxLabel,"BOTTOMLEFT",0,-8)
     belowMaxHelp:SetWidth(760)
     belowMaxHelp:SetJustifyH("LEFT")
@@ -13493,15 +13525,15 @@ local function WGRMailCreateTrackerFrame()
     )
 
     -- Weapon Eligibility -----------------------------------------
-    local weaponSection=routingPanel:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+    local weaponSection=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
     weaponSection:SetPoint("TOPLEFT",belowMaxHelp,"BOTTOMLEFT",0,-1)
     weaponSection:SetText("")
 
-    local weaponDefaultLabel=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
-    weaponDefaultLabel:SetPoint("TOPLEFT",belowMaxHelp,"BOTTOMLEFT",0,-26)
+    local weaponDefaultLabel=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+    weaponDefaultLabel:SetPoint("TOPLEFT",belowMaxHelp,"BOTTOMLEFT",0,-24)
     weaponDefaultLabel:SetText("Default Weapon Eligibility:")
 
-    local weaponDefaultDropdown=CreateWGRDropdown(routingPanel,150,22)
+    local weaponDefaultDropdown=CreateWGRDropdown(routingPanel.routingContent,150,22)
     weaponDefaultDropdown:SetPoint("LEFT",weaponDefaultLabel,"RIGHT",14,0)
 
     local function WGRUpdateDefaultWeaponDropdown()
@@ -13544,7 +13576,7 @@ local function WGRMailCreateTrackerFrame()
     end)
     WGRUpdateDefaultWeaponDropdown()
 
-    local resetWeaponsButton=CreateFrame("Button",nil,routingPanel,"UIPanelButtonTemplate")
+    local resetWeaponsButton=CreateFrame("Button",nil,routingPanel.routingContent,"UIPanelButtonTemplate")
     resetWeaponsButton:SetPoint("LEFT",weaponDefaultDropdown,"RIGHT",10,0)
     resetWeaponsButton:SetText("Reset All Weapons to Default")
     WGRSizeResetButtonToText(resetWeaponsButton)
@@ -13552,7 +13584,7 @@ local function WGRMailCreateTrackerFrame()
         StaticPopup_Show("WGR_CONFIRM_RESET_ALL_WEAPONS",nil,nil,{frame=frame})
     end)
 
-    local weaponDefaultHelp=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+    local weaponDefaultHelp=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
     weaponDefaultHelp:SetPoint("TOPLEFT",weaponDefaultLabel,"BOTTOMLEFT",0,-9)
     weaponDefaultHelp:SetWidth(760)
     weaponDefaultHelp:SetJustifyH("LEFT")
@@ -13562,22 +13594,22 @@ local function WGRMailCreateTrackerFrame()
     )
 
     -- Global Overrides -------------------------------------------
-    local overrideSection=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
-    overrideSection:SetPoint("TOPLEFT",weaponDefaultHelp,"BOTTOMLEFT",0,-28)
+    local overrideSection=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+    overrideSection:SetPoint("TOPLEFT",weaponDefaultHelp,"BOTTOMLEFT",0,-22)
     overrideSection:SetText("Overrides:")
 
-    local rogueOverrideX=82
-    local dhOverrideX=400
-    local furyOverrideX=680
+    local rogueOverrideX=78
+    local dhOverrideX=390
+    local furyOverrideX=650
 
-    local rogueOverrideHelpWidth=285
-    local dhOverrideHelpWidth=245
-    local furyOverrideHelpWidth=205
+    local rogueOverrideHelpWidth=270
+    local dhOverrideHelpWidth=230
+    local furyOverrideHelpWidth=190
 
-    local rogueDaggerCheck=CreateFrame("CheckButton",nil,routingPanel,"UICheckButtonTemplate")
+    local rogueDaggerCheck=CreateFrame("CheckButton",nil,routingPanel.routingContent,"UICheckButtonTemplate")
     rogueDaggerCheck:SetPoint("LEFT",overrideSection,"LEFT",rogueOverrideX,0)
     rogueDaggerCheck:SetChecked(WarboundGearRouterDB.routingSettings.prioritizeRogueAgilityDaggers==true)
-    local rogueDaggerLabel=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+    local rogueDaggerLabel=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlight")
     rogueDaggerLabel:SetPoint("LEFT",rogueDaggerCheck,"RIGHT",2,0)
     rogueDaggerLabel:SetWidth(275)
     rogueDaggerLabel:SetJustifyH("LEFT")
@@ -13589,16 +13621,16 @@ local function WGRMailCreateTrackerFrame()
         if frame.UpdateGlobalWeaponOverrideHelp then frame.UpdateGlobalWeaponOverrideHelp() end
     end)
 
-    local rogueOverrideHelp=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+    local rogueOverrideHelp=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
     rogueOverrideHelp:SetPoint("TOPLEFT",rogueDaggerCheck,"BOTTOMLEFT",28,-2)
     rogueOverrideHelp:SetWidth(rogueOverrideHelpWidth)
     rogueOverrideHelp:SetJustifyH("LEFT")
     rogueOverrideHelp:SetTextColor(.85,.72,.25)
 
-    local dhGlaiveCheck=CreateFrame("CheckButton",nil,routingPanel,"UICheckButtonTemplate")
+    local dhGlaiveCheck=CreateFrame("CheckButton",nil,routingPanel.routingContent,"UICheckButtonTemplate")
     dhGlaiveCheck:SetPoint("LEFT",overrideSection,"LEFT",dhOverrideX,0)
     dhGlaiveCheck:SetChecked(WarboundGearRouterDB.routingSettings.preferWarglaivesForDemonHunters==true)
-    local dhGlaiveLabel=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+    local dhGlaiveLabel=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlight")
     dhGlaiveLabel:SetPoint("LEFT",dhGlaiveCheck,"RIGHT",2,0)
     dhGlaiveLabel:SetWidth(235)
     dhGlaiveLabel:SetJustifyH("LEFT")
@@ -13610,16 +13642,16 @@ local function WGRMailCreateTrackerFrame()
         if frame.UpdateGlobalWeaponOverrideHelp then frame.UpdateGlobalWeaponOverrideHelp() end
     end)
 
-    local dhOverrideHelp=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+    local dhOverrideHelp=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
     dhOverrideHelp:SetPoint("TOPLEFT",dhGlaiveCheck,"BOTTOMLEFT",28,-2)
     dhOverrideHelp:SetWidth(dhOverrideHelpWidth)
     dhOverrideHelp:SetJustifyH("LEFT")
     dhOverrideHelp:SetTextColor(.85,.72,.25)
 
-    local furyCheck=CreateFrame("CheckButton",nil,routingPanel,"UICheckButtonTemplate")
+    local furyCheck=CreateFrame("CheckButton",nil,routingPanel.routingContent,"UICheckButtonTemplate")
     furyCheck:SetPoint("LEFT",overrideSection,"LEFT",furyOverrideX,0)
     furyCheck:SetChecked(WarboundGearRouterDB.routingSettings.preferDual2HForFury==true)
-    local furyLabel=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+    local furyLabel=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlight")
     furyLabel:SetPoint("LEFT",furyCheck,"RIGHT",2,0)
     furyLabel:SetWidth(195)
     furyLabel:SetJustifyH("LEFT")
@@ -13631,7 +13663,7 @@ local function WGRMailCreateTrackerFrame()
         if frame.UpdateGlobalWeaponOverrideHelp then frame.UpdateGlobalWeaponOverrideHelp() end
     end)
 
-    local furyOverrideHelp=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+    local furyOverrideHelp=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
     furyOverrideHelp:SetPoint("TOPLEFT",furyCheck,"BOTTOMLEFT",28,-2)
     furyOverrideHelp:SetWidth(furyOverrideHelpWidth)
     furyOverrideHelp:SetJustifyH("LEFT")
@@ -13648,16 +13680,89 @@ local function WGRMailCreateTrackerFrame()
     frame.UpdateGlobalWeaponOverrideHelp=WGRUpdateGlobalWeaponOverrideHelp
     WGRUpdateGlobalWeaponOverrideHelp()
 
+    routingPanel.overrideNotes =
+        routingPanel.routingContent:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontHighlight"
+        )
+    routingPanel.overrideNotes:SetPoint(
+        "TOPLEFT",
+        overrideSection,
+        "BOTTOMLEFT",
+        0,
+        -66
+    )
+    routingPanel.overrideNotes:SetJustifyH(
+        "LEFT"
+    )
+    routingPanel.overrideNotes:SetJustifyV(
+        "TOP"
+    )
+    routingPanel.overrideNotes:SetWordWrap(
+        true
+    )
+    routingPanel.overrideNotes:SetNonSpaceWrap(
+        false
+    )
+    routingPanel.overrideNotes:SetWidth(
+        math.max(
+            520,
+            (
+                routingPanel.routingScroll:GetWidth()
+                or 0
+            )
+            - 18
+        )
+    )
+
+    routingPanel:HookScript(
+        "OnShow",
+        function()
+            routingPanel.overrideNotes:SetWidth(
+                math.max(
+                    520,
+                    (
+                        routingPanel.routingScroll:GetWidth()
+                        or 0
+                    )
+                    - 18
+                )
+            )
+        end
+    )
+    routingPanel:HookScript(
+        "OnSizeChanged",
+        function()
+            routingPanel.overrideNotes:SetWidth(
+                math.max(
+                    520,
+                    (
+                        routingPanel.routingScroll:GetWidth()
+                        or 0
+                    )
+                    - 18
+                )
+            )
+        end
+    )
+
+    routingPanel.overrideNotes:SetText(
+        "|cff66ccffRogue Agility Daggers:|r When |cffffd100Prioritize Eligible Rogues for Agility Daggers|r is enabled, WBGR reserves Agility daggers for Assassination and Subtlety Rogues before considering other specs that can use them, such as Outlaw Rogue or Survival Hunter.\n\n"
+        .. "|cff66ccffDemon Hunters:|r When |cffffd100Demon Hunters only get Warglaives|r is enabled, WBGR restricts Demon Hunters to Warglaives and will not route other compatible one-handed weapons to them. This helps preserve axes, swords, and other weapons for characters that cannot use Warglaives.\n\n"
+        .. "|cff66ccffFury Warriors:|r When |cffffd100Fury Warriors only get Dual 2H|r is enabled, WBGR restricts Fury to Dual 2H weapon setups and will not route Dual 1H setups to that character."
+    )
+
     -- Upgrade Threshold ------------------------------------------
-    local thresholdSection=routingPanel:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-    thresholdSection:SetPoint("TOPLEFT",overrideSection,"BOTTOMLEFT",0,-38)
+    local thresholdSection=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+    thresholdSection:SetPoint("TOPLEFT",routingPanel.routingContent,"TOPLEFT",0,-1)
     thresholdSection:SetText("")
 
-    local thresholdLabel=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlight")
-    thresholdLabel:SetPoint("TOPLEFT",overrideSection,"BOTTOMLEFT",0,-38)
+    local thresholdLabel=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+    thresholdLabel:SetPoint("TOPLEFT",routingPanel.routingContent,"TOPLEFT",0,-14)
     thresholdLabel:SetText("Default iLvl Upgrade Threshold:")
 
-    local thresholdDropdown=CreateWGRDropdown(routingPanel,110,22)
+    local thresholdDropdown=CreateWGRDropdown(routingPanel.routingContent,110,22)
     thresholdDropdown:SetPoint("LEFT",thresholdLabel,"RIGHT",14,0)
 
     local function WGRUpdateGlobalThresholdDropdown()
@@ -13703,7 +13808,7 @@ local function WGRMailCreateTrackerFrame()
     end)
     WGRUpdateGlobalThresholdDropdown()
 
-    local resetThresholdsButton=CreateFrame("Button",nil,routingPanel,"UIPanelButtonTemplate")
+    local resetThresholdsButton=CreateFrame("Button",nil,routingPanel.routingContent,"UIPanelButtonTemplate")
     resetThresholdsButton:SetPoint("LEFT",thresholdDropdown,"RIGHT",14,0)
     resetThresholdsButton:SetText("Reset All Thresholds to Default")
     WGRSizeResetButtonToText(resetThresholdsButton)
@@ -13711,7 +13816,7 @@ local function WGRMailCreateTrackerFrame()
         StaticPopup_Show("WGR_CONFIRM_RESET_CHARACTER_THRESHOLDS",nil,nil,{frame=frame})
     end)
 
-    local resetThresholdsHelp=routingPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+    local resetThresholdsHelp=routingPanel.routingContent:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
     resetThresholdsHelp:SetPoint("TOPLEFT",thresholdLabel,"BOTTOMLEFT",0,-8)
     resetThresholdsHelp:SetTextColor(.68,.68,.68)
     resetThresholdsHelp:SetText("Sets the minimum for a priority upgrade. Smaller upgrades may still be routed.")
@@ -13732,6 +13837,9 @@ local function WGRMailCreateTrackerFrame()
         0
     )
     appearanceTitle:SetText("Appearance")
+    routingTitle:SetFontObject(
+        appearanceTitle:GetFontObject()
+    )
 
     local tooltipLabel =
         appearancePanel:CreateFontString(
@@ -13750,6 +13858,7 @@ local function WGRMailCreateTrackerFrame()
     tooltipLabel:SetText("Tooltip Style:")
 
     local tooltipNames = {
+        DETAILED = "Detailed",
         PROMINENT = "Prominent",
         COMPACT = "Compact",
         MINIMAL = "Minimal",
@@ -13771,12 +13880,14 @@ local function WGRMailCreateTrackerFrame()
     )
 
     local tooltipDescriptions = {
+        DETAILED =
+            "Prominently displays recommendations. Shift + Hover shows routing decisions.",
         PROMINENT =
-            "Shows the full WBGR recommendation prominently in the normal tooltip.",
+            "Prominently displays recommendations. Shift + Hover shows alternate destinations.",
         COMPACT =
-            "Shows a smaller WBGR recommendation in the normal tooltip.",
+            "Smaller recommendation display. Shift + Hover shows alternate destinations.",
         MINIMAL =
-            "Shows WBGR routing details only with Shift + Hover.",
+            "No recommendations on tooltip. Shift + Hover shows alternate destinations.",
     }
 
     local tooltipDescription =
@@ -13833,6 +13944,7 @@ local function WGRMailCreateTrackerFrame()
 
                     for _, mode
                         in ipairs({
+                            "DETAILED",
                             "PROMINENT",
                             "COMPACT",
                             "MINIMAL",
@@ -13887,7 +13999,60 @@ local function WGRMailCreateTrackerFrame()
         0.68
     )
     tooltipTip:SetText(
-        "Tip: Hold Shift while hovering over gear with a WBGR recommendation to view the full routing details."
+        "Tip: Hold Shift while hovering for more information."
+    )
+
+    -- Optional Soulbound trinket spec labels live with Tooltip Style. Use
+    -- panel fields rather than new parent-function locals because the main
+    -- window setup function is already close to Lua's 200-local limit.
+    appearancePanel.soulboundTrinketSpecsCheck =
+        CreateFrame(
+            "CheckButton",
+            nil,
+            appearancePanel,
+            "UICheckButtonTemplate"
+        )
+
+    appearancePanel.soulboundTrinketSpecsCheck:SetPoint(
+        "TOPLEFT",
+        tooltipTip,
+        "BOTTOMLEFT",
+        -4,
+        -8
+    )
+
+    appearancePanel.soulboundTrinketSpecsLabel =
+        appearancePanel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontHighlight"
+        )
+
+    appearancePanel.soulboundTrinketSpecsLabel:SetPoint(
+        "LEFT",
+        appearancePanel.soulboundTrinketSpecsCheck,
+        "RIGHT",
+        2,
+        0
+    )
+
+    appearancePanel.soulboundTrinketSpecsLabel:SetText(
+        "Show Trinket Specs on Soulbound Tooltips"
+    )
+
+    appearancePanel.soulboundTrinketSpecsCheck:SetChecked(
+        WarboundGearRouterDB.interface.showSoulboundTrinketSpecs
+        == true
+    )
+
+    appearancePanel.soulboundTrinketSpecsCheck:SetScript(
+        "OnClick",
+        function(self)
+            WarboundGearRouterDB.interface.showSoulboundTrinketSpecs =
+                self:GetChecked()
+                and true
+                or false
+        end
     )
 
     local backgroundOpacityLabel =
@@ -13899,10 +14064,10 @@ local function WGRMailCreateTrackerFrame()
 
     backgroundOpacityLabel:SetPoint(
         "TOPLEFT",
-        tooltipTip,
+        appearancePanel.soulboundTrinketSpecsCheck,
         "BOTTOMLEFT",
-        0,
-        -24
+        4,
+        -18
     )
 
     backgroundOpacityLabel:SetText(

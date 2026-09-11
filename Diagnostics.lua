@@ -131,14 +131,234 @@ local function WGRTrinketDiagnosticDirectBaseline(
             level = tonumber(
                 baseline.trinket1Level
             ) or 0,
+            sourceSlot = baseline.trinket1SourceSlot,
         },
         {
             item = baseline.trinket2,
             level = tonumber(
                 baseline.trinket2Level
             ) or 0,
+            sourceSlot = baseline.trinket2SourceSlot,
         },
+        updated = tonumber(baseline.updated) or 0,
+        dataStoreBootstrap = baseline.dataStoreBootstrap == true,
     }
+end
+
+local function WGRTrinketDiagnosticBindingFromTooltipData(data)
+    if not data or not data.lines then
+        return "UNKNOWN"
+    end
+
+    if TooltipUtil and TooltipUtil.SurfaceArgs then
+        pcall(TooltipUtil.SurfaceArgs, data)
+    end
+
+    local result = "UNKNOWN"
+    for _, line in ipairs(data.lines) do
+        if TooltipUtil and TooltipUtil.SurfaceArgs then
+            pcall(TooltipUtil.SurfaceArgs, line)
+        end
+        for _, value in ipairs({ line.leftText, line.rightText }) do
+            if value then
+                local clean = tostring(value)
+                    :gsub("|c%x%x%x%x%x%x%x%x", "")
+                    :gsub("|r", "")
+                    :lower()
+                if clean:find("soulbound", 1, true) then
+                    return "SOULBOUND"
+                elseif clean:find("binds when picked up", 1, true) then
+                    return "BOP"
+                elseif clean:find("warbound until equipped", 1, true) then
+                    result = "WARBOUND"
+                elseif clean:find("binds when equipped", 1, true) then
+                    result = "BOE"
+                end
+            end
+        end
+    end
+    return result
+end
+
+local function WGRTrinketDiagnosticSpecLabels(itemLink, classID, specIDs)
+    local labels = {}
+    for _, specID in ipairs(specIDs or {}) do
+        local fits =
+            WGRItemFitsSpecificSpec
+            and WGRItemFitsSpecificSpec(
+                itemLink,
+                classID,
+                specID
+            )
+            or nil
+        if fits == true then
+            labels[#labels + 1] = {
+                name = WGRSpecNamesByID[specID] or tostring(specID),
+                label =
+                    WGRGetCompactSpecAbbreviation
+                    and WGRGetCompactSpecAbbreviation(classID, specID)
+                    or (WGRSpecNamesByID[specID] or tostring(specID)),
+            }
+        end
+    end
+    table.sort(labels, function(a, b)
+        return string.lower(tostring(a.name)) < string.lower(tostring(b.name))
+    end)
+    local out = {}
+    for _, entry in ipairs(labels) do
+        out[#out + 1] = entry.label
+    end
+    return #out > 0 and table.concat(out, "/") or "none"
+end
+
+local function WGRTrinketDiagnosticPersonalBankIDs()
+    local ids = {}
+    if Enum and Enum.BagIndex then
+        for name, bagID in pairs(Enum.BagIndex) do
+            if type(name) == "string"
+                and type(bagID) == "number"
+                and name:find("CharacterBankTab", 1, true)
+            then
+                ids[#ids + 1] = bagID
+            end
+        end
+    end
+    table.sort(ids)
+    if #ids == 0 then
+        for bagID = 6, 11 do
+            ids[#ids + 1] = bagID
+        end
+    end
+    return ids
+end
+
+local function WGRPrintLiveOwnedTrinketsForDiagnostic(
+    characterName,
+    classID,
+    specIDs
+)
+    local currentName = UnitName("player")
+    if not currentName
+        or string.lower(tostring(currentName))
+            ~= string.lower(tostring(characterName))
+    then
+        print("|cff999999Live physical trinkets: target character is offline/not current; no live container scan performed.|r")
+        return
+    end
+
+    print("|cffffff00Live physical trinkets (current character):|r")
+    local count = 0
+
+    local function PrintEntry(itemLink, location, binding)
+        if not itemLink then return end
+        local info = GetInstantItemInfo(itemLink)
+        if not info or info.equipLoc ~= "INVTYPE_TRINKET" then return end
+        count = count + 1
+        print(
+            "    "
+            .. tostring(location)
+            .. ": "
+            .. WGRTrinketDiagnosticItemName(itemLink)
+            .. " ["
+            .. tostring(GetItemLevel(itemLink) or 0)
+            .. "] | "
+            .. tostring(binding or "UNKNOWN")
+            .. " | specs "
+            .. WGRTrinketDiagnosticSpecLabels(
+                itemLink,
+                classID,
+                specIDs
+            )
+        )
+    end
+
+    for _, slotID in ipairs({ 13, 14 }) do
+        local itemLink = GetInventoryItemLink("player", slotID)
+        if itemLink then
+            local data = nil
+            if C_TooltipInfo and C_TooltipInfo.GetInventoryItem then
+                local ok, returned = pcall(C_TooltipInfo.GetInventoryItem, "player", slotID)
+                if ok then data = returned end
+            end
+            local binding = WGRTrinketDiagnosticBindingFromTooltipData(data)
+            if binding == "UNKNOWN"
+                and ItemLocation
+                and ItemLocation.CreateFromEquipmentSlot
+                and C_Item
+                and C_Item.IsBound
+            then
+                local okLoc, loc = pcall(
+                    ItemLocation.CreateFromEquipmentSlot,
+                    ItemLocation,
+                    slotID
+                )
+                local okBound, isBound = false, false
+                if okLoc then
+                    okBound, isBound = pcall(C_Item.IsBound, loc)
+                end
+                if okBound and isBound then binding = "SOULBOUND/BOUND" end
+            end
+            PrintEntry(itemLink, "EQ" .. tostring(slotID), binding)
+        end
+    end
+
+    if C_Container
+        and C_Container.GetContainerNumSlots
+        and C_Container.GetContainerItemLink
+    then
+        for bagID = 0, 5 do
+            local slots = C_Container.GetContainerNumSlots(bagID) or 0
+            for slotID = 1, slots do
+                local itemLink = C_Container.GetContainerItemLink(bagID, slotID)
+                if itemLink then
+                    local info = GetInstantItemInfo(itemLink)
+                    if info and info.equipLoc == "INVTYPE_TRINKET" then
+                        local data = nil
+                        if C_TooltipInfo and C_TooltipInfo.GetBagItem then
+                            local ok, returned = pcall(C_TooltipInfo.GetBagItem, bagID, slotID)
+                            if ok then data = returned end
+                        end
+                        PrintEntry(
+                            itemLink,
+                            "BAG " .. tostring(bagID) .. ":" .. tostring(slotID),
+                            WGRTrinketDiagnosticBindingFromTooltipData(data)
+                        )
+                    end
+                end
+            end
+        end
+
+        local bankReadable = false
+        for _, bagID in ipairs(WGRTrinketDiagnosticPersonalBankIDs()) do
+            local slots = C_Container.GetContainerNumSlots(bagID) or 0
+            if slots > 0 then bankReadable = true end
+            for slotID = 1, slots do
+                local itemLink = C_Container.GetContainerItemLink(bagID, slotID)
+                if itemLink then
+                    local info = GetInstantItemInfo(itemLink)
+                    if info and info.equipLoc == "INVTYPE_TRINKET" then
+                        local data = nil
+                        if C_TooltipInfo and C_TooltipInfo.GetBagItem then
+                            local ok, returned = pcall(C_TooltipInfo.GetBagItem, bagID, slotID)
+                            if ok then data = returned end
+                        end
+                        PrintEntry(
+                            itemLink,
+                            "PBK " .. tostring(bagID) .. ":" .. tostring(slotID),
+                            WGRTrinketDiagnosticBindingFromTooltipData(data)
+                        )
+                    end
+                end
+            end
+        end
+        if not bankReadable then
+            print("    |cff999999PBK not currently readable; open Personal Bank to include it.|r")
+        end
+    end
+
+    if count == 0 then
+        print("    (none found in readable equipped/BAG/PBK locations)")
+    end
 end
 
 function WGRRunTrinketBaselineDiagnostic(
@@ -370,31 +590,64 @@ function WGRRunTrinketBaselineDiagnostic(
                     )
 
                 if direct then
+                    local updatedText = "unknown"
+                    if direct.updated and direct.updated > 0 and date then
+                        updatedText = date("%Y-%m-%d %H:%M:%S", direct.updated)
+                    end
                     print(
                         "    Direct saved: "
-                        .. WGRTrinketDiagnosticItemName(
-                            direct[1].item
-                        )
-                        .. " ["
-                        .. tostring(
-                            direct[1].level
-                        )
-                        .. "] / "
-                        .. WGRTrinketDiagnosticItemName(
-                            direct[2].item
-                        )
-                        .. " ["
-                        .. tostring(
-                            direct[2].level
-                        )
-                        .. "]"
+                        .. WGRTrinketDiagnosticItemName(direct[1].item)
+                        .. " [" .. tostring(direct[1].level) .. "]"
+                        .. " {slot " .. tostring(direct[1].sourceSlot or "-") .. "}"
+                        .. " / "
+                        .. WGRTrinketDiagnosticItemName(direct[2].item)
+                        .. " [" .. tostring(direct[2].level) .. "]"
+                        .. " {slot " .. tostring(direct[2].sourceSlot or "-") .. "}"
+                        .. " | saved " .. tostring(updatedText)
+                        .. (direct.dataStoreBootstrap and " | DataStore bootstrap" or "")
                     )
                 else
+                    print("    Direct saved: (none)")
+                end
+
+                local details =
+                    WGRGetResolvedSpecTrinketDiagnosticDetails
+                    and WGRGetResolvedSpecTrinketDiagnosticDetails(
+                        characterName,
+                        character,
+                        specID
+                    )
+                    or nil
+
+                local function PrintResolvedSource(index, entry)
+                    if not entry then
+                        print("    Resolved #" .. tostring(index) .. ": (empty)")
+                        return
+                    end
+                    local sources =
+                        entry.sources
+                        and #entry.sources > 0
+                        and table.concat(entry.sources, ", ")
+                        or "unknown source"
                     print(
-                        "    Direct saved: (none)"
+                        "    Resolved #" .. tostring(index) .. ": "
+                        .. WGRTrinketDiagnosticItemName(entry.item)
+                        .. " [" .. tostring(entry.level or 0) .. "]"
+                        .. " <- " .. tostring(sources)
                     )
                 end
+
+                if details then
+                    PrintResolvedSource(1, details.first)
+                    PrintResolvedSource(2, details.second)
+                end
             end
+
+            WGRPrintLiveOwnedTrinketsForDiagnostic(
+                characterName,
+                classID,
+                specIDs
+            )
 
             print(
                 "|cffffff00Final mode comparison: |r"

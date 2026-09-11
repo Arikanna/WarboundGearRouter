@@ -199,7 +199,68 @@ function WGRGetUniqueEquippedSameItemLevel(characterName, character, itemLink, s
     return bestSameLevel
 end
 
-local function FormatTooltipRecommendation(result, tooltip, displayContext)
+local function WGRGetTooltipTrinketCharacterSummary(
+    characterName,
+    itemLink
+)
+    if not characterName
+        or not itemLink
+        or not WGRGetTrinketSpecSummary
+    then
+        return nil
+    end
+
+    local instantInfo = GetInstantItemInfo(itemLink)
+    if not instantInfo
+        or instantInfo.equipLoc ~= "INVTYPE_TRINKET"
+    then
+        return nil
+    end
+
+    local character = FindCharacterByName(characterName)
+    if not character then
+        return nil
+    end
+
+    return WGRGetTrinketSpecSummary(
+        characterName,
+        character,
+        itemLink
+    )
+end
+
+local function WGRGetTooltipTrinketUpgradeSummary(
+    characterName,
+    itemLink
+)
+    if not characterName
+        or not itemLink
+        or not WGRGetTrinketTooltipUpgradeSummary
+    then
+        return nil
+    end
+
+    local instantInfo = GetInstantItemInfo(itemLink)
+    if not instantInfo
+        or instantInfo.equipLoc ~= "INVTYPE_TRINKET"
+    then
+        return nil
+    end
+
+    local character = FindCharacterByName(characterName)
+    if not character then
+        return nil
+    end
+
+    return WGRGetTrinketTooltipUpgradeSummary(
+        characterName,
+        character,
+        itemLink,
+        GetItemLevel(itemLink)
+    )
+end
+
+local function FormatTooltipRecommendation(result, tooltip, displayContext, itemLink)
     if not result then return nil end
 
     local currentCharacter = UnitName("player")
@@ -216,9 +277,9 @@ local function FormatTooltipRecommendation(result, tooltip, displayContext)
     if result.kind == "upgrade" then
         if result.setupIncomplete == true then
             if isCurrentCharacter then
-                return "POTENTIAL UPGRADE  (paired setup incomplete)", 1.00, 0.35, 0.82
+                return "UPGRADE?  (paired setup incomplete)", 1.00, 0.35, 0.82
             end
-            return string.format("SEND TO: %s  (paired setup incomplete)", result.name), 0.20, 1.00, 0.20
+            return string.format("SEND TO: %s  (paired setup incomplete)", result.name), 1.00, 0.20, 0.20
         end
         local averageSuffix =
             result.weaponAverage
@@ -227,21 +288,45 @@ local function FormatTooltipRecommendation(result, tooltip, displayContext)
             and " - over weap avg"
             or ""
 
+        local trinketSummary =
+            WGRGetTooltipTrinketUpgradeSummary(
+                result.name,
+                itemLink
+            )
+
         if isCurrentCharacter then
+            if trinketSummary and trinketSummary ~= "" then
+                return string.format(
+                    "UPGRADE? (%s)",
+                    trinketSummary
+                ),
+                    1.00, 0.35, 0.82
+            end
+
             return string.format(
-                "POTENTIAL UPGRADE  (+%d ilvl%s)",
+                "UPGRADE?  (+%d ilvl%s)",
                 result.upgrade,
                 averageSuffix
             ),
                 1.00, 0.35, 0.82
         end
+
+        if trinketSummary and trinketSummary ~= "" then
+            return string.format(
+                "SEND TO: %s  (%s)",
+                result.name,
+                trinketSummary
+            ),
+                1.00, 0.20, 0.20
+        end
+
         return string.format(
             "SEND TO: %s  (+%d ilvl%s)",
             result.name,
             result.upgrade,
             averageSuffix
         ),
-            0.20, 1.00, 0.20
+            1.00, 0.20, 0.20
     end
 
     if result.kind == "future_upgrade" then
@@ -251,34 +336,57 @@ local function FormatTooltipRecommendation(result, tooltip, displayContext)
             or result.weaponOverAverage
             and " - over weap avg"
             or ""
+        local specSummary =
+            WGRGetTooltipTrinketCharacterSummary(
+                result.name,
+                itemLink
+            )
+        local specPrefix =
+            specSummary
+            and specSummary ~= ""
+            and (specSummary .. ", ")
+            or ""
 
         -- Future-level gear is storage, not an actionable current upgrade.
         -- If it is already on the intended character, present it with the
         -- same HOLD semantics as other holder gear rather than magenta.
         if isHeldHere then
             return string.format(
-                "HOLD HERE  (LEVEL %d, +%d ilvl%s)",
+                "HOLD HERE  (%sLEVEL %d, +%d ilvl%s)",
+                specPrefix,
                 result.requiredLevel,
                 result.upgrade,
                 averageSuffix
             ),
-                0.20, 1.00, 0.20
+                0.20, 0.60, 1.00
         end
         return string.format(
-            "HOLD ON: %s  (LEVEL %d, +%d ilvl%s)",
+            "HOLD ON: %s  (%sLEVEL %d, +%d ilvl%s)",
             result.name,
+            specPrefix,
             result.requiredLevel,
             result.upgrade,
             averageSuffix
         ),
-            0.20, 1.00, 0.20
+            0.20, 0.60, 1.00
     end
 
     if result.kind == "holder" then
+        local specSummary =
+            WGRGetTooltipTrinketCharacterSummary(
+                result.name,
+                itemLink
+            )
+        local suffix =
+            specSummary
+            and specSummary ~= ""
+            and string.format("  (%s)", specSummary)
+            or ""
+
         if isHeldHere then
-            return "HOLD HERE", 0.20, 1.00, 0.20
+            return "HOLD HERE" .. suffix, 0.20, 0.60, 1.00
         end
-        return string.format("HOLD ON: %s", result.name), 0.20, 1.00, 0.20
+        return string.format("HOLD ON: %s%s", result.name, suffix), 0.20, 0.60, 1.00
     end
 
     if result.kind == "unresolved" then
@@ -286,7 +394,22 @@ local function FormatTooltipRecommendation(result, tooltip, displayContext)
     end
 
     if result.kind == "unknown" then
-        return string.format("WBGR: CHECK %s", tostring(result.name or "ROUTING")),
+        local specSummary =
+            WGRGetTooltipTrinketCharacterSummary(
+                result.name,
+                itemLink
+            )
+        local suffix =
+            specSummary
+            and specSummary ~= ""
+            and string.format(" (%s)", specSummary)
+            or ""
+
+        return string.format(
+            "WBGR: CHECK %s%s",
+            tostring(result.name or "ROUTING"),
+            suffix
+        ),
             1.00, 0.75, 0.20
     end
 
@@ -295,6 +418,281 @@ local function FormatTooltipRecommendation(result, tooltip, displayContext)
     end
 
     return nil
+end
+
+local function WGRDetailedSelectedAction(
+    option,
+    currentCharacter,
+    displayContext
+)
+    if not option
+        or option.selected ~= true
+    then
+        return nil
+    end
+
+    if option.kind == "upgrade"
+        or option.kind == "incomplete"
+    then
+        local isCurrent =
+            currentCharacter
+            and option.name
+            and string.lower(tostring(option.name))
+                == string.lower(tostring(currentCharacter))
+
+        return isCurrent
+            and "UPGRADE?"
+            or "SEND TO"
+    end
+
+    if option.kind == "holder" then
+        local source = displayContext and displayContext.source
+        local isSharedWarbandSource = source == "WARBAND_BANK"
+        local isCurrent =
+            currentCharacter
+            and option.name
+            and string.lower(tostring(option.name))
+                == string.lower(tostring(currentCharacter))
+
+        return isCurrent and not isSharedWarbandSource
+            and "HOLD HERE"
+            or "HOLD ON"
+    end
+
+    if option.kind == "unknown"
+        or option.kind == "unresolved"
+    then
+        return "CHECK"
+    end
+
+    return nil
+end
+
+local function WGRAddDetailedRoutingTrace(
+    tooltip,
+    trace,
+    result,
+    itemLink,
+    displayContext
+)
+    tooltip:AddLine(
+        "Routing path:",
+        1.00,
+        0.82,
+        0.00
+    )
+
+    if not trace or #trace == 0 then
+        tooltip:AddLine(
+            "No other meaningful routing candidates",
+            0.72,
+            0.72,
+            0.72
+        )
+        return
+    end
+
+    local currentCharacter =
+        UnitName
+        and UnitName("player")
+        or nil
+
+    for _, option in ipairs(trace) do
+        local selectedAction =
+            WGRDetailedSelectedAction(
+                option,
+                currentCharacter,
+                displayContext
+            )
+        local actionText =
+            selectedAction
+            and ("  - " .. selectedAction)
+            or ""
+        local specSummary =
+            option.name
+            and WGRGetTooltipTrinketCharacterSummary(
+                option.name,
+                itemLink
+            )
+            or nil
+
+        if option.kind == "upgrade" then
+            local belowThreshold = option.meetsThreshold == false
+            local suffix
+
+            if option.selected == true then
+                suffix =
+                    belowThreshold
+                    and "below-threshold fallback"
+                    or nil
+            elseif result and result.kind == "unknown" then
+                suffix =
+                    belowThreshold
+                    and "below threshold; CHECK ahead"
+                    or "CHECK ahead"
+            elseif belowThreshold then
+                suffix =
+                    result
+                    and result.kind == "upgrade"
+                    and result.meetsThreshold == false
+                    and "below threshold, lower priority"
+                    or "below threshold"
+            else
+                suffix = "lower priority"
+            end
+
+            local usesAverage =
+                option.weaponAverage
+                and " - weap avg"
+                or option.weaponOverAverage
+                and " - over weap avg"
+                or ""
+
+            local valueText =
+                option.name
+                and WGRGetTooltipTrinketUpgradeSummary(
+                    option.name,
+                    itemLink
+                )
+                or nil
+
+            if not valueText or valueText == "" then
+                valueText = string.format(
+                    "+%d ilvl%s",
+                    tonumber(option.upgrade) or 0,
+                    usesAverage
+                )
+            end
+
+            local detailText = valueText
+            if suffix and suffix ~= "" then
+                detailText = detailText .. ", " .. suffix
+            end
+
+            local line = string.format(
+                "%s  (%s)%s",
+                tostring(option.name),
+                detailText,
+                actionText
+            )
+
+            if option.selected == true then
+                local selectedIsCurrent =
+                    currentCharacter
+                    and option.name
+                    and string.lower(tostring(option.name))
+                        == string.lower(tostring(currentCharacter))
+
+                if selectedIsCurrent then
+                    tooltip:AddLine(line, 1.00, 0.35, 0.82)
+                else
+                    tooltip:AddLine(line, 1.00, 0.20, 0.20)
+                end
+            else
+                tooltip:AddLine(line, 1.00, 0.35, 0.82)
+            end
+
+        elseif option.kind == "no_upgrade" then
+            local prefix =
+                specSummary
+                and specSummary ~= ""
+                and (specSummary .. ", ")
+                or ""
+
+            tooltip:AddLine(
+                string.format(
+                    "%s  (%sno upgrade)",
+                    tostring(option.name),
+                    prefix
+                ),
+                0.72,
+                0.72,
+                0.72
+            )
+
+        elseif option.kind == "incomplete" then
+            local line = string.format(
+                "%s  (paired setup incomplete)%s",
+                tostring(option.name),
+                actionText
+            )
+
+            if option.selected == true
+                and selectedAction == "SEND TO"
+            then
+                tooltip:AddLine(line, 1.00, 0.20, 0.20)
+            else
+                tooltip:AddLine(line, 1.00, 0.35, 0.82)
+            end
+
+        elseif option.kind == "holder" then
+            local levelText =
+                option.requiredLevel
+                and option.level
+                and string.format(
+                    "LEVEL %d / requires %d",
+                    tonumber(option.level) or 0,
+                    tonumber(option.requiredLevel) or 0
+                )
+                or "future use"
+            local prefix =
+                specSummary
+                and specSummary ~= ""
+                and (specSummary .. ", ")
+                or ""
+
+            tooltip:AddLine(
+                string.format(
+                    "%s  (%sHOLD: %s)%s",
+                    tostring(option.name),
+                    prefix,
+                    levelText,
+                    actionText
+                ),
+                0.20,
+                0.60,
+                1.00
+            )
+
+        elseif option.kind == "unresolved" then
+            local prefix =
+                specSummary
+                and specSummary ~= ""
+                and (specSummary .. ", ")
+                or ""
+
+            tooltip:AddLine(
+                string.format(
+                    "%s  (%sCHECK: future eligibility unresolved)%s",
+                    tostring(option.name),
+                    prefix,
+                    actionText
+                ),
+                1.00,
+                0.55,
+                0.10
+            )
+
+        elseif option.kind == "unknown" then
+            local prefix =
+                specSummary
+                and specSummary ~= ""
+                and (specSummary .. ", ")
+                or ""
+
+            tooltip:AddLine(
+                string.format(
+                    "%s  (%sCHECK: unable to evaluate)%s",
+                    tostring(option.name),
+                    prefix,
+                    actionText
+                ),
+                1.00,
+                0.55,
+                0.10
+            )
+        end
+    end
 end
 
 local function AddWGRLineToTooltip(
@@ -311,6 +709,12 @@ local function AddWGRLineToTooltip(
         WarboundGearRouterDB.interface
         and WarboundGearRouterDB.interface.tooltipStyle
         or "PROMINENT"
+
+    -- v0.65x used the temporary internal name FULL. Treat it as Detailed so
+    -- an existing test SavedVariable continues to work after the rename.
+    if tooltipStyle == "FULL" then
+        tooltipStyle = "DETAILED"
+    end
 
     local shiftDown =
         IsShiftKeyDown
@@ -348,7 +752,8 @@ local function AddWGRLineToTooltip(
         FormatTooltipRecommendation(
             result,
             tooltip,
-            displayContext
+            displayContext,
+            itemLink
         )
 
     if not text then
@@ -363,47 +768,59 @@ local function AddWGRLineToTooltip(
         if result
             and result.name
         then
+            local currentCharacter =
+                UnitName
+                and UnitName("player")
+                or nil
+            local isCurrentCharacter =
+                currentCharacter
+                and string.lower(tostring(result.name))
+                    == string.lower(tostring(currentCharacter))
+
             if result.kind == "upgrade"
-                and (
-                    displayContext
-                    and displayContext.classification == "COMPARE"
-                    or WGRIsTiedBestTooltip(
-                        tooltip
-                    )
-                )
+                and isCurrentCharacter
             then
+                -- Tooltip presentation stays intentionally independent of
+                -- Gear Finder's Gold/Magenta ranking. For the logged-in
+                -- character, a positive routed candidate is simply an
+                -- UPGRADE?; Gear Finder remains the place that says CURRENT
+                -- BEST / EQUIP NOW or presents tied-best choices.
                 tooltip:AddLine(
-                    "|cffff9900WBGR: TIED BEST ILVL: COMPARE|r",
+                    "|cff00ff00WBGR:|r UPGRADE?",
                     1.00,
-                    0.60,
-                    0.00
-                )
-            elseif result.kind == "upgrade"
-                and (
-                    displayContext
-                    and displayContext.classification == "BEST"
-                    or WGRIsGoldTooltip(
-                        tooltip
-                    )
-                )
-            then
-                tooltip:AddLine(
-                    "|cfffff273WBGR: CURRENT BEST: EQUIP NOW|r",
                     1.00,
-                    0.82,
-                    0.00
+                    1.00
                 )
             else
-                local verb =
-                    result.kind == "holder"
-                    and "HOLD ON"
-                    or "SEND TO"
+                local verb
+
+                if result.kind == "holder"
+                    or result.kind == "future_upgrade"
+                then
+                    local source =
+                        displayContext
+                        and displayContext.source
+                    local isSharedWarbandSource =
+                        source == "WARBAND_BANK"
+
+                    verb =
+                        isCurrentCharacter
+                        and not isSharedWarbandSource
+                        and "HOLD HERE"
+                        or "HOLD ON"
+                else
+                    verb = "SEND TO"
+                end
+
+                local targetSuffix =
+                    verb == "HOLD HERE"
+                    and ""
+                    or (" " .. tostring(result.name))
 
                 tooltip:AddLine(
                     "|cff00ff00WBGR:|r "
                     .. verb
-                    .. " "
-                    .. tostring(result.name),
+                    .. targetSuffix,
                     1.00,
                     1.00,
                     1.00
@@ -432,10 +849,18 @@ tooltip:AddLine(" ")
         b
     )
 
-    if IsShiftKeyDown() then
+    if shiftDown then
         tooltip:AddLine(" ")
 
-        if alternatives and #alternatives > 0 then
+        if tooltipStyle == "DETAILED" then
+            WGRAddDetailedRoutingTrace(
+                tooltip,
+                alternatives,
+                result,
+                itemLink,
+                displayContext
+            )
+        elseif alternatives and #alternatives > 0 then
             tooltip:AddLine(
                 "Other options:",
                 1.00,
@@ -446,49 +871,106 @@ tooltip:AddLine(" ")
             for _, option in ipairs(alternatives) do
                 if option.kind == "upgrade" then
                     if option.setupIncomplete == true then
-                        tooltip:AddLine(string.format("%s  (Paired setup incomplete)", option.name), 1.00, 0.82, 0.20)
+                        tooltip:AddLine(
+                            string.format(
+                                "%s  (Paired setup incomplete)",
+                                option.name
+                            ),
+                            1.00,
+                            0.35,
+                            0.82
+                        )
                     else
-                    local belowThreshold =
-                        option.meetsThreshold == false
+                        local belowThreshold =
+                            option.meetsThreshold == false
+                        local trinketSummary =
+                            WGRGetTooltipTrinketUpgradeSummary(
+                                option.name,
+                                itemLink
+                            )
+                        local valueText =
+                            trinketSummary
+                            and trinketSummary ~= ""
+                            and trinketSummary
+                            or string.format(
+                                "+%d ilvl",
+                                tonumber(option.upgrade) or 0
+                            )
+
+                        tooltip:AddLine(
+                            string.format(
+                                belowThreshold
+                                and "%s  (%s, below threshold)"
+                                or "%s  (%s)",
+                                option.name,
+                                valueText
+                            ),
+                            1.00,
+                            0.35,
+                            0.82
+                        )
+                    end
+                elseif option.kind == "holder" then
+                    local specSummary =
+                        WGRGetTooltipTrinketCharacterSummary(
+                            option.name,
+                            itemLink
+                        )
+                    local holdText =
+                        specSummary
+                        and specSummary ~= ""
+                        and string.format("%s, Hold", specSummary)
+                        or "Hold"
 
                     tooltip:AddLine(
                         string.format(
-                            belowThreshold
-                            and "%s  (+%d ilvl, below threshold)"
-                            or "%s  (+%d ilvl)",
+                            "%s  (%s)",
                             option.name,
-                            option.upgrade
-                        ),
-                        belowThreshold and 1.00 or 0.20,
-                        belowThreshold and 0.82 or 1.00,
-                        0.20
-                    )
-                    end
-                elseif option.kind == "holder" then
-                    tooltip:AddLine(
-                        string.format(
-                            "%s  (Hold)",
-                            option.name
+                            holdText
                         ),
                         0.20,
-                        1.00,
-                        0.20
+                        0.60,
+                        1.00
                     )
                 elseif option.kind == "unresolved" then
+                    local specSummary =
+                        WGRGetTooltipTrinketCharacterSummary(
+                            option.name,
+                            itemLink
+                        )
+                    local prefix =
+                        specSummary
+                        and specSummary ~= ""
+                        and (specSummary .. ", ")
+                        or ""
+
                     tooltip:AddLine(
                         string.format(
-                            "%s  (Holder unresolved)",
-                            option.name
+                            "%s  (%sHolder unresolved)",
+                            option.name,
+                            prefix
                         ),
                         1.00,
                         0.55,
                         0.10
                     )
                 elseif option.kind == "unknown" then
+                    local specSummary =
+                        WGRGetTooltipTrinketCharacterSummary(
+                            option.name,
+                            itemLink
+                        )
+                    local prefix =
+                        specSummary
+                        and specSummary ~= ""
+                        and (specSummary .. ", ")
+                        or ""
+
                     tooltip:AddLine(
                         string.format(
-                            "%s  (Unable to evaluate)",
-                            option.name
+                            "%s  (%sUnable to evaluate)",
+                            option.name,
+                            prefix
                         ),
                         1.00,
                         0.55,
@@ -553,6 +1035,18 @@ local function BuildTooltipRecommendation(
     skipEquippedPreload
 )
     local resolved = false
+
+    local configuredTooltipStyle =
+        WarboundGearRouterDB
+        and WarboundGearRouterDB.interface
+        and WarboundGearRouterDB.interface.tooltipStyle
+        or "PROMINENT"
+    local fullTraceRequested =
+        (configuredTooltipStyle == "DETAILED"
+            or configuredTooltipStyle == "FULL")
+        and IsShiftKeyDown
+        and IsShiftKeyDown()
+        or false
 
     local function Resolve(
         result,
@@ -664,7 +1158,15 @@ local function BuildTooltipRecommendation(
                     else
                         Resolve(
                             recommendation,
-                            BuildSimpleAlternatives(
+                            fullTraceRequested
+                            and BuildSimpleRoutingTrace(
+                                newItemLevel,
+                                itemMinLevel,
+                                GetArmorPriorityList(armorType),
+                                { armorSlotID },
+                                recommendation
+                            )
+                            or BuildSimpleAlternatives(
                                 newItemLevel,
                                 itemMinLevel,
                                 GetArmorPriorityList(armorType),
@@ -719,7 +1221,16 @@ local function BuildTooltipRecommendation(
                     else
                         Resolve(
                             recommendation,
-                            BuildSimpleAlternatives(
+                            fullTraceRequested
+                            and BuildSimpleRoutingTrace(
+                                newItemLevel,
+                                itemMinLevel,
+                                priorityList,
+                                globalSlots,
+                                recommendation,
+                                comparisonProvider
+                            )
+                            or BuildSimpleAlternatives(
                                 newItemLevel,
                                 itemMinLevel,
                                 priorityList,
@@ -753,7 +1264,14 @@ local function BuildTooltipRecommendation(
                     else
                         Resolve(
                             recommendation,
-                            BuildOffhandAlternatives(
+                            fullTraceRequested
+                            and BuildOffhandRoutingTrace(
+                                itemLink,
+                                newItemLevel,
+                                itemMinLevel,
+                                recommendation
+                            )
+                            or BuildOffhandAlternatives(
                                 itemLink,
                                 newItemLevel,
                                 itemMinLevel,
@@ -785,7 +1303,14 @@ local function BuildTooltipRecommendation(
                     else
                         Resolve(
                             recommendation,
-                            BuildWeaponAlternatives(
+                            fullTraceRequested
+                            and BuildWeaponRoutingTrace(
+                                itemLink,
+                                newItemLevel,
+                                itemMinLevel,
+                                recommendation
+                            )
+                            or BuildWeaponAlternatives(
                                 itemLink,
                                 newItemLevel,
                                 itemMinLevel,
@@ -3570,6 +4095,12 @@ local function WGRHeldGearBuildSlotState(
             state.ownedWeaponLink = itemLink
             state.ownedWeaponLevel = tonumber(GetItemLevel(itemLink)) or 0
         end
+
+        local instant = GetInstantItemInfo and GetInstantItemInfo(itemLink) or nil
+        if instant and instant.equipLoc == "INVTYPE_TRINKET" then
+            state.ownedTrinketLink = itemLink
+            state.ownedTrinketLevel = tonumber(GetItemLevel(itemLink)) or 0
+        end
     end
 
     if not itemLink
@@ -3812,6 +4343,119 @@ local function WGRRefreshOwnedWeaponComponentsForCurrentCharacter(
     owned.equippedObserved = true
     owned.updated = time()
     WarboundGearRouterDB.ownedWeaponComponents[key] = owned
+end
+
+local function WGRCollectOwnedTrinketsFromHeldCache(cacheGroup)
+    local result = {}
+    local group = WGRHeldSlotCaches[cacheGroup] or {}
+
+    for bagID, slots in pairs(group) do
+        for slotID, state in pairs(slots or {}) do
+            if state and state.ownedTrinketLink then
+                local level = tonumber(state.ownedTrinketLevel) or 0
+                if level <= 0 then
+                    level = tonumber(GetItemLevel(state.ownedTrinketLink)) or 0
+                    state.ownedTrinketLevel = level
+                end
+
+                if level > 0 then
+                    result[#result + 1] = {
+                        link = state.ownedTrinketLink,
+                        level = level,
+                        bagID = tonumber(bagID),
+                        slotID = tonumber(slotID),
+                    }
+                end
+            end
+        end
+    end
+
+    return result
+end
+
+local function WGRApplyLiveTrinketSpecEligibility(
+    records,
+    classID
+)
+    if not WGRGetLiveTrinketSpecEligibilitySnapshot
+        or not classID
+    then
+        return
+    end
+
+    for _, data in ipairs(records or {}) do
+        if data and data.link then
+            local eligibility, complete =
+                WGRGetLiveTrinketSpecEligibilitySnapshot(
+                    data.link,
+                    classID
+                )
+
+            data.specEligibility = eligibility or {}
+            data.specEligibilityComplete = complete == true
+            data.specEligibilityUpdated = time()
+        end
+    end
+end
+
+local function WGRRefreshOwnedTrinketComponentsForCurrentCharacter(
+    characterName,
+    updateBags,
+    updateBank
+)
+    InitializeDatabase()
+    if not characterName then return end
+
+    local key = string.lower(characterName)
+    local owned = WarboundGearRouterDB.ownedTrinketComponents[key] or {
+        character = characterName,
+        bags = {},
+        bank = {},
+        equipped = {},
+    }
+
+    owned.character = characterName
+
+    local classID =
+        UnitClass
+        and select(3, UnitClass("player"))
+        or nil
+
+    if updateBags then
+        owned.bags = WGRCollectOwnedTrinketsFromHeldCache("BAGS")
+        WGRApplyLiveTrinketSpecEligibility(owned.bags, classID)
+        owned.bagsObserved = true
+    end
+
+    if updateBank then
+        owned.bank = WGRCollectOwnedTrinketsFromHeldCache("PERSONAL_BANK")
+        WGRApplyLiveTrinketSpecEligibility(owned.bank, classID)
+        owned.bankObserved = true
+    end
+
+    local equipped = {}
+    for _, slotID in ipairs({ 13, 14 }) do
+        local itemLink = GetInventoryItemLink and GetInventoryItemLink("player", slotID) or nil
+        if itemLink and WGREquippedItemIsSoulbound(slotID) then
+            local instant = GetInstantItemInfo and GetInstantItemInfo(itemLink) or nil
+            if instant and instant.equipLoc == "INVTYPE_TRINKET" then
+                local level = tonumber(GetItemLevel(itemLink)) or 0
+                if level > 0 then
+                    equipped[#equipped + 1] = {
+                        link = itemLink,
+                        level = level,
+                        slotID = slotID,
+                    }
+                end
+            end
+        end
+    end
+
+    WGRApplyLiveTrinketSpecEligibility(equipped, classID)
+    owned.equipped = equipped
+    owned.equippedObserved = true
+    owned.updated = time()
+    WarboundGearRouterDB.ownedTrinketComponents[key] = owned
 end
 
 local function WGRHeldGearScanBagIDs(
@@ -4136,6 +4780,14 @@ function WGRRefreshHeldGearSnapshot(
     -- dirty-container work we already performed. No additional bag/bank scan
     -- is introduced here. Equipped slots are only two direct lookups.
     WGRRefreshOwnedWeaponComponentsForCurrentCharacter(
+        characterName,
+        scanBags == true,
+        includePersonalBank and scanPersonalBank == true
+    )
+
+    -- Trinkets use the same already-built dirty-slot cache as weapons, so
+    -- keeping a Soulbound ownership pool adds no extra container scan.
+    WGRRefreshOwnedTrinketComponentsForCurrentCharacter(
         characterName,
         scanBags == true,
         includePersonalBank and scanPersonalBank == true
@@ -5282,6 +5934,8 @@ function WGRRenderRecommendationForItemTooltip(
 end
 
 
+local WGR_TOOLTIP_MAX_RETRIES = 2
+
 local function WGRScheduleTooltipRetry(
     tooltip,
     itemLink
@@ -5297,6 +5951,30 @@ local function WGRScheduleTooltipRetry(
     then
         return
     end
+
+    if tooltip.__WGRRetryCountItemLink
+        ~= itemLink
+    then
+        tooltip.__WGRRetryCountItemLink =
+            itemLink
+        tooltip.__WGRRetryCount =
+            0
+    end
+
+    if (
+        tooltip.__WGRRetryCount
+        or 0
+    ) >= WGR_TOOLTIP_MAX_RETRIES
+    then
+        return
+    end
+
+    tooltip.__WGRRetryCount =
+        (
+            tooltip.__WGRRetryCount
+            or 0
+        )
+        + 1
 
     tooltip.__WGRRetryItemLink =
         itemLink
@@ -5415,23 +6093,85 @@ function ProcessTooltip(tooltip)
         )
 
     if not transferable then
-        -- Soulbound is a final answer. Retrying by forcing Blizzard to
-        -- RefreshData() can create a rapid tooltip-refresh loop and taint
-        -- errors on some complex Soulbound item tooltips. Only retain the
-        -- legacy retry behavior for unresolved/non-definitive failures.
-        if transferReason ~= "SOULBOUND" then
+        -- Optional informational line for physically bound trinkets. Some
+        -- already-Soulbound items can still surface their original BoP binding
+        -- metadata first in Blizzard structured tooltip data, so accept both
+        -- SOULBOUND and BOP terminal reasons for this display-only feature.
+        -- Bound gear remains a terminal routing exclusion; this only
+        -- shows which of the current character's effective specs Blizzard
+        -- considers the trinket usable for.
+        if (
+            transferReason == "SOULBOUND"
+            or transferReason == "BOP"
+        )
+            and WarboundGearRouterDB.interface
+            and WarboundGearRouterDB.interface.showSoulboundTrinketSpecs == true
+            and WGRGetSoulboundTrinketSpecSummary
+        then
+            local instantInfo =
+                GetInstantItemInfo(
+                    itemLink
+                )
+
+            if instantInfo
+                and instantInfo.equipLoc == "INVTYPE_TRINKET"
+                and tooltip.__WGRSoulboundTrinketSpecsItemLink ~= itemLink
+            then
+                local character =
+                    currentName
+                    and FindCharacterByName(
+                        currentName
+                    )
+                    or nil
+
+                local summary =
+                    character
+                    and WGRGetSoulboundTrinketSpecSummary(
+                        currentName,
+                        character,
+                        itemLink
+                    )
+                    or nil
+
+                if summary and summary ~= "" then
+                    tooltip:AddLine(
+                        "WBGR Specs: " .. summary,
+                        1.00,
+                        0.35,
+                        0.82
+                    )
+                    tooltip.__WGRSoulboundTrinketSpecsItemLink =
+                        itemLink
+                    tooltip:Show()
+                end
+            end
+        end
+
+        -- Retry only when the classifier explicitly says Blizzard's item or
+        -- binding data is unresolved. Definitive exclusions (Cosmetic,
+        -- Soulbound, BoP, non-gear, disabled quality/binding, etc.) must not
+        -- force tooltip RefreshData(). Retries are also hard-capped per
+        -- tooltip/item by WGRScheduleTooltipRetry().
+        if transferReason
+            == "UNRESOLVED"
+        then
             WGRScheduleTooltipRetry(
                 tooltip,
                 itemLink
             )
         else
-            tooltip.__WGRRetryItemLink = nil
+            tooltip.__WGRRetryItemLink =
+                nil
         end
         return
     end
 
     tooltip.__WGRRetryItemLink =
         nil
+    tooltip.__WGRRetryCountItemLink =
+        itemLink
+    tooltip.__WGRRetryCount =
+        0
 
     tooltipSerial =
         tooltipSerial + 1
@@ -5518,11 +6258,36 @@ function InstallTooltipHook()
                 self.__WGRIgnoredItemLink =
                     nil
 
+                self.__WGRSoulboundTrinketSpecsItemLink =
+                    nil
+
+                -- Do not clear retry-count state here. Blizzard RefreshData()
+                -- can clear/rebuild the tooltip while the cursor remains on
+                -- the same item; clearing the count here would turn the
+                -- intended two-retry cap into repeated two-retry cycles.
+                -- The pending marker is safe to clear because the scheduled
+                -- retry already clears it immediately before RefreshData().
                 self.__WGRRetryItemLink =
                     nil
 
                 tooltipSerial =
                     tooltipSerial + 1
+            end
+        )
+
+        GameTooltip:HookScript(
+            "OnHide",
+            function(self)
+                -- A genuine hover session ended. Allow a fresh bounded retry
+                -- budget the next time an item is hovered. Item-link changes
+                -- while the tooltip stays shown are handled separately by
+                -- WGRScheduleTooltipRetry().
+                self.__WGRRetryItemLink =
+                    nil
+                self.__WGRRetryCountItemLink =
+                    nil
+                self.__WGRRetryCount =
+                    nil
             end
         )
     end

@@ -358,18 +358,19 @@ eventFrame:SetScript(
             ==
             "MODIFIER_STATE_CHANGED"
         then
+            -- Pause suppresses WBGR tooltip presentation work. In particular,
+            -- never force Blizzard to rebuild an unrelated tooltip while WBGR
+            -- is paused; paused mode only keeps the targeted state/bookkeeping
+            -- paths that are intentionally allowed elsewhere.
+            if WGRRoutingIsPaused
+                and WGRRoutingIsPaused()
+            then
+                return
+            end
+
             if GameTooltip
                 and GameTooltip:IsShown()
             then
-                GameTooltip.__WGRLineAdded =
-                    false
-
-                GameTooltip.__WGRIgnoredItemLink =
-                    nil
-
-                tooltipSerial =
-                    tooltipSerial + 1
-
                 local owner =
                     GameTooltip:GetOwner()
 
@@ -380,24 +381,58 @@ eventFrame:SetScript(
                     and owner.__WGRGearFinderButton
                     and owner.WGRShowTooltip
                 then
-                    owner:WGRShowTooltip()
-                -- Retail bank tooltips carry important item context in the
-                -- tooltip data itself. Ask Blizzard to rebuild those in place.
-                elseif type(GameTooltip.RefreshData)
-                    == "function"
-                then
-                    GameTooltip:RefreshData()
-                elseif owner
-                    and owner.bag ~= nil
-                then
-                    GameTooltip:SetOwner(
-                        owner,
-                        GameTooltip:GetAnchorType()
-                    )
+                    GameTooltip.__WGRLineAdded =
+                        false
 
-                    ProcessTooltip(
-                        GameTooltip
-                    )
+                    GameTooltip.__WGRIgnoredItemLink =
+                        nil
+
+                    tooltipSerial =
+                        tooltipSerial + 1
+
+                    owner:WGRShowTooltip()
+                else
+                    -- MODIFIER_STATE_CHANGED fires while many kinds of
+                    -- GameTooltip are visible (units, NPCs, spells, etc.).
+                    -- RefreshData() on those unrelated tooltips can make
+                    -- Blizzard rebuild protected/secret unit data from addon
+                    -- execution. Only touch a tooltip when Blizzard confirms
+                    -- that it currently represents an item.
+                    local _, itemLink =
+                        GameTooltip:GetItem()
+
+                    if not itemLink then
+                        return
+                    end
+
+                    GameTooltip.__WGRLineAdded =
+                        false
+
+                    GameTooltip.__WGRIgnoredItemLink =
+                        nil
+
+                    tooltipSerial =
+                        tooltipSerial + 1
+
+                    -- Retail bank item tooltips carry important item context
+                    -- in the tooltip data itself. Ask Blizzard to rebuild only
+                    -- confirmed item tooltips in place.
+                    if type(GameTooltip.RefreshData)
+                        == "function"
+                    then
+                        GameTooltip:RefreshData()
+                    elseif owner
+                        and owner.bag ~= nil
+                    then
+                        GameTooltip:SetOwner(
+                            owner,
+                            GameTooltip:GetAnchorType()
+                        )
+
+                        ProcessTooltip(
+                            GameTooltip
+                        )
+                    end
                 end
             end
 

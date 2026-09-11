@@ -617,6 +617,381 @@ function BuildOffhandAlternatives(
     return WGRFinalizeAlternatives(alternatives, recommendation)
 end
 
+
+-- ============================================================
+-- DETAILED TOOLTIP ROUTING TRACES
+--
+-- These are display-only mirrors of the existing weapon/off-hand comparison
+-- paths. They do not choose the routing result. Detailed tooltip mode uses
+-- them on Shift+Hover to explain meaningful candidates. Upgrade routes append
+-- only the first future HOLD candidate; HOLD routes preserve all HOLD options.
+-- ============================================================
+
+local function WGRTraceCanEquipNow(level, itemMinLevel)
+    return not itemMinLevel
+        or itemMinLevel <= 0
+        or level >= itemMinLevel
+end
+
+local function WGRAppendWeaponTraceCandidate(
+    trace,
+    characterName,
+    priorityIndex,
+    recommendation,
+    upgrade,
+    status,
+    usesAverage,
+    isOverAverage,
+    setupIncomplete
+)
+    if status == "unknown" then
+        trace[#trace + 1] = {
+            kind = "unknown",
+            name = characterName,
+            priorityIndex = priorityIndex,
+            selected = recommendation
+                and recommendation.name == characterName
+                and recommendation.kind == "unknown",
+        }
+        return
+    end
+
+    if status ~= "known" then
+        return
+    end
+
+    upgrade = tonumber(upgrade) or 0
+    if upgrade > 0 then
+        local threshold = WGRGetCharacterThreshold(characterName)
+        trace[#trace + 1] = {
+            kind = "upgrade",
+            name = characterName,
+            upgrade = upgrade,
+            threshold = threshold,
+            meetsThreshold = upgrade >= threshold,
+            weaponAverage = usesAverage == true,
+            weaponOverAverage = isOverAverage == true,
+            priorityIndex = priorityIndex,
+            selected = recommendation
+                and recommendation.name == characterName
+                and recommendation.kind == "upgrade",
+        }
+    elseif setupIncomplete == true then
+        trace[#trace + 1] = {
+            kind = "incomplete",
+            name = characterName,
+            priorityIndex = priorityIndex,
+            selected = recommendation
+                and recommendation.name == characterName
+                and recommendation.kind == "upgrade",
+        }
+    else
+        trace[#trace + 1] = {
+            kind = "no_upgrade",
+            name = characterName,
+            priorityIndex = priorityIndex,
+        }
+    end
+end
+
+function BuildWeaponRoutingTrace(
+    itemLink,
+    newItemLevel,
+    itemMinLevel,
+    recommendation
+)
+    local trace = {}
+    local firstHolder = nil
+    local firstSpecialistHolder = nil
+    local firstUnresolvedHolder = nil
+    local holderCandidates = {}
+    local includeAllHolders =
+        recommendation
+        and recommendation.kind == "holder"
+    local isDaggerOverride = IsDaggerItem(itemLink)
+    local selectedIsSpecialist =
+        isDaggerOverride
+        and recommendation
+        and recommendation.name
+        and IsDaggerSpecialistSpec(recommendation.name)
+        or false
+
+    for priorityIndex, characterName in ipairs(GetActiveRoutingPriority()) do
+        local character = FindCharacterByName(characterName)
+
+        if character then
+            local level = WGRGetCharacterLevel(character)
+            local specIDs = WGRGetRoutingSpecIDs(characterName, character)
+            local specialist =
+                isDaggerOverride
+                and IsDaggerSpecialistSpec(characterName)
+                or false
+
+            -- When the Rogue-dagger override actually selected a specialist,
+            -- non-specialist weapon users are deliberately outside the active
+            -- routing pool and are therefore omitted from Full details.
+            local includePool =
+                not selectedIsSpecialist
+                or specialist
+
+            if includePool then
+                if #specIDs > 0 then
+                    local fits, fitStatus =
+                        FutureHolderWeaponMatchesSpec(characterName, itemLink)
+
+                    if fitStatus == "rule_unknown"
+                        or fitStatus == "stat_rule_unknown"
+                    then
+                        if WGRTraceCanEquipNow(level, itemMinLevel) then
+                            trace[#trace + 1] = {
+                                kind = "unknown",
+                                name = characterName,
+                                priorityIndex = priorityIndex,
+                                selected = recommendation
+                                    and recommendation.name == characterName
+                                    and recommendation.kind == "unknown",
+                            }
+                        elseif not firstUnresolvedHolder then
+                            firstUnresolvedHolder = {
+                                kind = "unresolved",
+                                name = characterName,
+                                level = level,
+                                priorityIndex = priorityIndex,
+                                selected = recommendation
+                                    and recommendation.name == characterName
+                                    and recommendation.kind == "unresolved",
+                            }
+                        end
+                    elseif fits == true then
+                        if WGRTraceCanEquipNow(level, itemMinLevel) then
+                            local upgrade, status, usesAverage, isOverAverage, setupIncomplete =
+                                WGRGetIncomingWeaponUpgradeForMode(
+                                    characterName,
+                                    character,
+                                    itemLink,
+                                    newItemLevel,
+                                    "WEAPON"
+                                )
+
+                            WGRAppendWeaponTraceCandidate(
+                                trace,
+                                characterName,
+                                priorityIndex,
+                                recommendation,
+                                upgrade,
+                                status,
+                                usesAverage,
+                                isOverAverage,
+                                setupIncomplete
+                            )
+                        else
+                            local holder = {
+                                kind = "holder",
+                                name = characterName,
+                                level = level,
+                                requiredLevel = itemMinLevel,
+                                priorityIndex = priorityIndex,
+                                selected = recommendation
+                                    and recommendation.name == characterName
+                                    and recommendation.kind == "holder",
+                            }
+
+                            if includeAllHolders then
+                                holderCandidates[#holderCandidates + 1] = holder
+                            elseif specialist and not firstSpecialistHolder then
+                                firstSpecialistHolder = holder
+                            elseif not specialist and not firstHolder then
+                                firstHolder = holder
+                            end
+                        end
+                    end
+                else
+                    local couldUse = CouldItemFitUnknownCharacter(
+                        itemLink,
+                        characterName,
+                        character
+                    )
+
+                    if couldUse == true then
+                        if WGRTraceCanEquipNow(level, itemMinLevel) then
+                            trace[#trace + 1] = {
+                                kind = "unknown",
+                                name = characterName,
+                                priorityIndex = priorityIndex,
+                                selected = recommendation
+                                    and recommendation.name == characterName
+                                    and recommendation.kind == "unknown",
+                            }
+                        elseif not firstUnresolvedHolder then
+                            firstUnresolvedHolder = {
+                                kind = "unresolved",
+                                name = characterName,
+                                level = level,
+                                priorityIndex = priorityIndex,
+                                selected = recommendation
+                                    and recommendation.name == characterName
+                                    and recommendation.kind == "unresolved",
+                            }
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if includeAllHolders and #holderCandidates > 0 then
+        for _, holder in ipairs(holderCandidates) do
+            trace[#trace + 1] = holder
+        end
+    else
+        local firstMeaningfulHolder =
+            selectedIsSpecialist
+            and (firstSpecialistHolder or firstUnresolvedHolder)
+            or (firstHolder or firstSpecialistHolder or firstUnresolvedHolder)
+
+        if firstMeaningfulHolder then
+            trace[#trace + 1] = firstMeaningfulHolder
+        end
+    end
+
+    return trace
+end
+
+function BuildOffhandRoutingTrace(
+    itemLink,
+    newItemLevel,
+    itemMinLevel,
+    recommendation
+)
+    local trace = {}
+    local firstHolder = nil
+    local firstUnresolvedHolder = nil
+    local holderCandidates = {}
+    local includeAllHolders =
+        recommendation
+        and recommendation.kind == "holder"
+
+    for priorityIndex, characterName in ipairs(GetActiveRoutingPriority()) do
+        local character = FindCharacterByName(characterName)
+
+        if character then
+            local level = WGRGetCharacterLevel(character)
+            local specIDs = WGRGetRoutingSpecIDs(characterName, character)
+
+            if #specIDs > 0 then
+                local fits, fitStatus =
+                    FutureHolderOffhandMatchesSpec(characterName, itemLink)
+
+                if fitStatus == "rule_unknown"
+                    or fitStatus == "stat_rule_unknown"
+                then
+                    if WGRTraceCanEquipNow(level, itemMinLevel) then
+                        trace[#trace + 1] = {
+                            kind = "unknown",
+                            name = characterName,
+                            priorityIndex = priorityIndex,
+                            selected = recommendation
+                                and recommendation.name == characterName
+                                and recommendation.kind == "unknown",
+                        }
+                    elseif not firstUnresolvedHolder then
+                        firstUnresolvedHolder = {
+                            kind = "unresolved",
+                            name = characterName,
+                            level = level,
+                            priorityIndex = priorityIndex,
+                            selected = recommendation
+                                and recommendation.name == characterName
+                                and recommendation.kind == "unresolved",
+                        }
+                    end
+                elseif fits == true then
+                    if WGRTraceCanEquipNow(level, itemMinLevel) then
+                        local upgrade, status, usesAverage, isOverAverage, setupIncomplete =
+                            WGRGetIncomingWeaponUpgradeForMode(
+                                characterName,
+                                character,
+                                itemLink,
+                                newItemLevel,
+                                "OFFHAND"
+                            )
+
+                        WGRAppendWeaponTraceCandidate(
+                            trace,
+                            characterName,
+                            priorityIndex,
+                            recommendation,
+                            upgrade,
+                            status,
+                            usesAverage,
+                            isOverAverage,
+                            setupIncomplete
+                        )
+                    else
+                        local holder = {
+                            kind = "holder",
+                            name = characterName,
+                            level = level,
+                            requiredLevel = itemMinLevel,
+                            priorityIndex = priorityIndex,
+                            selected = recommendation
+                                and recommendation.name == characterName
+                                and recommendation.kind == "holder",
+                        }
+
+                        if includeAllHolders then
+                            holderCandidates[#holderCandidates + 1] = holder
+                        elseif not firstHolder then
+                            firstHolder = holder
+                        end
+                    end
+                end
+            else
+                local couldUse = CouldItemFitUnknownCharacter(
+                    itemLink,
+                    characterName,
+                    character
+                )
+
+                if couldUse == true then
+                    if WGRTraceCanEquipNow(level, itemMinLevel) then
+                        trace[#trace + 1] = {
+                            kind = "unknown",
+                            name = characterName,
+                            priorityIndex = priorityIndex,
+                            selected = recommendation
+                                and recommendation.name == characterName
+                                and recommendation.kind == "unknown",
+                        }
+                    elseif not firstUnresolvedHolder then
+                        firstUnresolvedHolder = {
+                            kind = "unresolved",
+                            name = characterName,
+                            level = level,
+                            priorityIndex = priorityIndex,
+                            selected = recommendation
+                                and recommendation.name == characterName
+                                and recommendation.kind == "unresolved",
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    if includeAllHolders and #holderCandidates > 0 then
+        for _, holder in ipairs(holderCandidates) do
+            trace[#trace + 1] = holder
+        end
+    elseif firstHolder then
+        trace[#trace + 1] = firstHolder
+    elseif firstUnresolvedHolder then
+        trace[#trace + 1] = firstUnresolvedHolder
+    end
+
+    return trace
+end
+
 -- ============================================================
 -- WEAPON DIAGNOSTIC
 -- ============================================================
