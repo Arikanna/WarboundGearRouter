@@ -3666,6 +3666,8 @@ local function WGRBuildAboutSubtabs(
         {"/wbgr", "Open Warbound Gear Router."},
         {"/wbgr mailrouter", "Open the Mail Router while at a mailbox."},
         {"/wbgr cleanup", "Rescan and refresh WBGR gear overlays."},
+        {"/wbgr ignore", "Ignore the item currently under your mouse."},
+        {"/wbgr unignore", "Stop ignoring the item currently under your mouse."},
         {"/wbgr pause", "Pause live tooltips, overlays, Gear Finder, and BAG-only routing while keeping tracking active."},
         {"/wbgr resume", "Resume live routing and rebuild overlays."},
         {"/wbgr help", "Show normal WBGR command help."},
@@ -5537,7 +5539,7 @@ local function WGRBuildAboutSubtabs(
         },
         {
             "12. What are Ignored Items?",
-            "Ignored Items are specific pieces of gear that you have told WBGR not to consider for routing or recommendations. This is useful for items you want to keep for personal reasons, unusual builds, transmog, sentimental gear, or anything else you do not want WBGR trying to move or recommend. To ignore an item, right-click its item icon in Gear Finder > Recommendations and choose WBGR's Ignore option. You can review all ignored items under Settings > Eligible Gear. If you change your mind, click Unignore next to the item and WBGR will begin considering it again. Ignoring an item is different from setting a character to Ignored: an ignored item is excluded from WBGR's gear logic, while an Ignored character can still have its stored gear tracked."
+            "Ignored Items are specific pieces of gear that you have told WBGR not to consider for routing or recommendations. This is useful for items you want to keep for personal reasons, unusual builds, transmog, sentimental gear, or anything else you do not want WBGR trying to move or recommend. To ignore an item, right-click its item icon in Gear Finder > Recommendations, or hover over the item anywhere WoW provides an item tooltip and use /wbgr ignore. You can review all ignored items under Settings > Eligible Gear. To restore an item, click Unignore there or hover over it and use /wbgr unignore. Ignoring an item is different from setting a character to Ignored: an ignored item is excluded from WBGR's gear logic, while an Ignored character can still have its stored gear tracked."
         },
         {
             "13. Why is a Removed character still useful in WBGR?",
@@ -5572,15 +5574,19 @@ local function WGRBuildAboutSubtabs(
             "Weapons are handled a little differently because some specs depend on complete setups. WBGR respects your weapon eligibility settings and any saved weapon setup for the character. For combinations such as 1H + Off-hand, 1H + Shield, Dual 1H, or Fury Dual 2H, WBGR looks at the complete setup instead of treating one weapon by itself as a complete upgrade."
         },
         {
-            "21. What does WBGR look at when evaluating gear?",
+            "21. How does trinket routing work?",
+            "WBGR checks whether the new trinket would improve any of the character's selected specs. It compares it with the best trinkets that character already has and makes sure the new combination is actually usable. That includes checking spec restrictions and Unique-Equipped rules, so WBGR won't recommend a trinket that can't be equipped together with what the character already owns."
+        },
+        {
+            "22. What does WBGR look at when evaluating gear?",
             "WBGR mainly looks at item level, whether a character can equip the item, primary-stat compatibility, selected specs, weapon setup preferences, and role-appropriate trinkets. WBGR does not use stat weights, simulations, or secondary-stat optimization."
         },
         {
-            "22. Why can an item's destination change after I equip something?",
-            "Routing can change as your characters improve. If a higher-priority character equips better gear, that character may no longer need an item. WBGR can then send that item farther down the roster to someone else who can use it. Because of this, it is usually best to work through your higher-priority characters first."
+            "23. Why did an item get sent back to a higher-priority character?",
+            "WBGR recalculates routing as characters equip upgrades. A higher-priority character can be skipped at first if someone else qualifies for a bigger upgrade tier. After that character equips an item, the leftovers may no longer qualify for that higher tier, so WBGR checks smaller upgrades again. At that point, the higher-priority character may become the best destination."
         },
         {
-            "23. How are storage location and routing destination different?",
+            "24. How are storage location and routing destination different?",
             "Gear Search tells you where WBGR currently believes an item is stored. Routing is separate: it decides where that item should go next. An item can stay in the same physical location while its routing destination changes."
         },
     }
@@ -12808,40 +12814,6 @@ local function WGRMailCreateTrackerFrame()
         WGRUpdateEligibleGear
     )
 
-    if not StaticPopupDialogs[
-        "WGR_CONFIRM_UNIGNORE_ITEM"
-    ]
-    then
-        StaticPopupDialogs[
-            "WGR_CONFIRM_UNIGNORE_ITEM"
-        ] = {
-            text =
-                "Stop ignoring %s?\n\nLast Known Location: %s\n\nWBGR will begin routing all copies of this item again.",
-            button1 =
-                "Unignore",
-            button2 =
-                "Cancel",
-            OnAccept =
-                function(
-                    self,
-                    data
-                )
-                    if data
-                        and data.itemID
-                    then
-                        WGRSetItemIgnored(
-                            data.itemID,
-                            false
-                        )
-                    end
-                end,
-            timeout = 0,
-            whileDead = true,
-            hideOnEscape = true,
-            preferredIndex = 3,
-        }
-    end
-
     local ignoredTitle =
         eligiblePanel:CreateFontString(
             nil,
@@ -12869,12 +12841,14 @@ local function WGRMailCreateTrackerFrame()
         )
 
     ignoredHelp:SetPoint(
-        "LEFT",
+        "TOPLEFT",
         ignoredTitle,
-        "RIGHT",
-        10,
-        0
+        "BOTTOMLEFT",
+        0,
+        -6
     )
+    ignoredHelp:SetWidth(900)
+    ignoredHelp:SetJustifyH("LEFT")
 
     ignoredHelp:SetTextColor(
         0.68,
@@ -12883,8 +12857,55 @@ local function WGRMailCreateTrackerFrame()
     )
 
     ignoredHelp:SetText(
-        "Right-click an item in Gear Finder to ignore it."
+        "Right-click in Gear Finder, or hover an item and use /wbgr ignore. Use Unignore below or /wbgr unignore to restore it."
     )
+
+    eligiblePanel.ignoredItemHeader =
+        eligiblePanel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontNormalSmall"
+        )
+    eligiblePanel.ignoredItemHeader:SetPoint(
+        "TOPLEFT",
+        ignoredHelp,
+        "BOTTOMLEFT",
+        48,
+        -10
+    )
+    eligiblePanel.ignoredItemHeader:SetText("Item")
+
+    eligiblePanel.ignoredLocationHeader =
+        eligiblePanel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontNormalSmall"
+        )
+    eligiblePanel.ignoredLocationHeader:SetPoint(
+        "LEFT",
+        eligiblePanel.ignoredItemHeader,
+        "LEFT",
+        342,
+        0
+    )
+    eligiblePanel.ignoredLocationHeader:SetText("Last Known Location")
+
+    eligiblePanel.ignoredUnignoreHeader =
+        eligiblePanel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontNormalSmall"
+        )
+    eligiblePanel.ignoredUnignoreHeader:SetWidth(86)
+    eligiblePanel.ignoredUnignoreHeader:SetJustifyH("CENTER")
+    eligiblePanel.ignoredUnignoreHeader:SetPoint(
+        "TOPLEFT",
+        ignoredHelp,
+        "BOTTOMLEFT",
+        777,
+        -10
+    )
+    eligiblePanel.ignoredUnignoreHeader:SetText("Unignore")
 
     local ignoredScroll =
         CreateFrame(
@@ -12896,10 +12917,10 @@ local function WGRMailCreateTrackerFrame()
 
     ignoredScroll:SetPoint(
         "TOPLEFT",
-        ignoredTitle,
+        eligiblePanel.ignoredItemHeader,
         "BOTTOMLEFT",
-        0,
-        -10
+        -48,
+        -6
     )
 
     ignoredScroll:SetPoint(
@@ -13261,16 +13282,12 @@ local function WGRMailCreateTrackerFrame()
                 row.remove:SetScript(
                     "OnClick",
                     function()
-                        StaticPopup_Show(
-                            "WGR_CONFIRM_UNIGNORE_ITEM",
+                        WGRShowUnignoreItemConfirmation(
+                            entry.itemID,
                             itemName,
                             liveLocation
                                 or entry.lastKnownLocation
-                                or "Unknown",
-                            {
-                                itemID =
-                                    entry.itemID,
-                            }
+                                or "Unknown"
                         )
                     end
                 )
@@ -13292,32 +13309,52 @@ local function WGRMailCreateTrackerFrame()
                 )
             )
 
-            if #entries == 0 then
-                ignoredHelp:SetText(
-                    "None. Right-click an item in Gear Finder to ignore it."
-                )
-            else
-                ignoredHelp:SetText(
-                    tostring(#entries)
-                    .. " ignored item"
-                    .. (
-                        #entries == 1
-                        and ""
-                        or "s"
-                    )
-                    .. " (alphabetical)"
-                )
-            end
+            ignoredTitle:SetText(
+                "Ignored Items ("
+                .. tostring(#entries)
+                .. "):"
+            )
         end
 
-    WGRRefreshIgnoredItemsUI()
-
+    -- Ignored-item locations are display-only information for
+    -- Settings > Eligible Gear.  Do not rescan bags/banks for every
+    -- Gear Finder refresh while this panel is hidden.
     WGRRefreshIgnoredItemLocations =
         function()
+            if not eligiblePanel:IsVisible() then
+                return
+            end
+
             if WGRRefreshIgnoredItemsUI then
                 WGRRefreshIgnoredItemsUI()
             end
         end
+
+    -- Populate/refresh the ignored-item list when the user actually
+    -- opens Settings > Eligible Gear.  This keeps its displayed
+    -- locations current without putting that scan on Gear Finder's
+    -- normal refresh path.
+    settingsPage:HookScript(
+        "OnShow",
+        function()
+            if eligiblePanel:IsVisible()
+                and WGRRefreshIgnoredItemsUI
+            then
+                WGRRefreshIgnoredItemsUI()
+            end
+        end
+    )
+
+    eligiblePanel:HookScript(
+        "OnShow",
+        function()
+            if settingsPage:IsVisible()
+                and WGRRefreshIgnoredItemsUI
+            then
+                WGRRefreshIgnoredItemsUI()
+            end
+        end
+    )
 
     -- ROUTING
     local routingTitle =
@@ -15200,6 +15237,8 @@ function WGRRefreshRosterIfOpen()
 
     if not frame
         or not frame:IsShown()
+        or not frame.rosterPage
+        or not frame.rosterPage:IsVisible()
         or not frame.UpdateRoster
     then
         return

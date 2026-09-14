@@ -56,6 +56,14 @@ SlashCmdList[
         )
 
         print(
+            "|cffffff00/wbgr ignore|r - ignore the item currently under your mouse"
+        )
+
+        print(
+            "|cffffff00/wbgr unignore|r - stop ignoring the item currently under your mouse"
+        )
+
+        print(
             "|cffffff00/wbgr pause|r - pause live routing tooltips and overlay scans"
         )
 
@@ -113,10 +121,17 @@ SlashCmdList[
             "held_bank_scan",
             "held_bank_scan_routing",
             "warband_snapshot_total",
-            "warband_scan",
-            "warband_scan_routing",
+            "warband_tab_scan",
+            "warband_tab_scan_routing",
             "roster_refresh",
             "bagnon_overlays",
+            "gear_finder_ignored_locations",
+            "gear_finder_bag_scan",
+            "gear_finder_bag_signature",
+            "gear_finder_personal_scan",
+            "gear_finder_personal_signature",
+            "gear_finder_warband_scan",
+            "gear_finder_warband_signature",
             "gear_finder_refresh",
         }
 
@@ -133,6 +148,86 @@ SlashCmdList[
         end
 
         print("Use |cffffff00/wbgr perf reset|r before a clean test if needed.")
+        return
+    end
+
+    if command == "ignore"
+        or command == "unignore"
+    then
+        local itemLink =
+            GetHoveredItem
+            and GetHoveredItem()
+            or nil
+
+        if not itemLink then
+            print(
+                "|cffaaaaaaWBGR:|r Hover over an item, then use /wbgr "
+                .. command
+                .. "."
+            )
+            return
+        end
+
+        local isIgnored =
+            WGRItemIsIgnored
+            and WGRItemIsIgnored(
+                itemLink
+            )
+            or false
+
+        if command == "ignore" then
+            if isIgnored then
+                print(
+                    "|cffaaaaaaWBGR:|r "
+                    .. tostring(itemLink)
+                    .. " is already ignored."
+                )
+                return
+            end
+
+            local changed =
+                WGRSetItemIgnored
+                and WGRSetItemIgnored(
+                    itemLink,
+                    true
+                )
+
+            if changed then
+                print(
+                    "|cffaaaaaaWBGR:|r Ignoring "
+                    .. tostring(itemLink)
+                    .. "."
+                )
+            else
+                print(
+                    "|cffaaaaaaWBGR:|r Could not ignore the hovered item."
+                )
+            end
+
+            return
+        end
+
+        if not isIgnored then
+            print(
+                "|cffaaaaaaWBGR:|r "
+                .. tostring(itemLink)
+                .. " is not currently ignored."
+            )
+            return
+        end
+
+        local shown =
+            WGRShowUnignoreItemConfirmation
+            and WGRShowUnignoreItemConfirmation(
+                itemLink
+            )
+
+        if not shown then
+            print(
+                "|cffaaaaaaWBGR:|r Could not unignore the hovered item."
+            )
+        end
+
         return
     end
 
@@ -247,7 +342,9 @@ SlashCmdList[
 
             print(
                 "|cffffff00/wbgr test trinket [ITEMID]|r - show roster eligibility after Current/All/Custom spec filtering"
-,
+            )
+
+            print(
                 "|cffffff00/wbgr test trinketbaseline [CharacterName]|r - show per-spec trinket baselines and final comparison for the hovered trinket"
             )
 
@@ -386,25 +483,25 @@ SlashCmdList[
     end
 
     if command == "currentspec" then
-        local specIndex =
-            GetSpecialization
-            and GetSpecialization()
+        local specInfo =
+            GetCurrentSpecInfo
+            and GetCurrentSpecInfo()
             or nil
 
-        local specID,
-              specName =
-            nil,
-            nil
+        local specIndex =
+            specInfo
+            and specInfo.index
+            or nil
 
-        if specIndex
-            and GetSpecializationInfo
-        then
-            specID,
-            specName =
-                GetSpecializationInfo(
-                    specIndex
-                )
-        end
+        local specID =
+            specInfo
+            and specInfo.id
+            or nil
+
+        local specName =
+            specInfo
+            and specInfo.name
+            or nil
 
         print(
             "|cff00ff00WBGR Live Current Spec:|r index "
@@ -600,20 +697,14 @@ SlashCmdList[
                 "player"
             )
 
-        local specIndex =
-            GetSpecialization
-            and GetSpecialization()
+        local specInfo =
+            GetCurrentSpecInfo
+            and GetCurrentSpecInfo()
             or nil
 
         local specID =
-            specIndex
-            and GetSpecializationInfo
-            and select(
-                1,
-                GetSpecializationInfo(
-                    specIndex
-                )
-            )
+            specInfo
+            and specInfo.id
             or nil
 
         local existingBaseline =

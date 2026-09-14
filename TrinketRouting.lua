@@ -1641,15 +1641,14 @@ function WGRGetSpecificSpecTrinketComparisonLevel(
             and UnitName("player")
             or nil
 
-        local currentSpecIndex =
-            GetSpecialization
-            and GetSpecialization()
+        local currentSpecInfo =
+            GetCurrentSpecInfo
+            and GetCurrentSpecInfo()
             or nil
 
         local currentSpecID =
-            currentSpecIndex
-            and GetSpecializationInfo
-            and select(1, GetSpecializationInfo(currentSpecIndex))
+            currentSpecInfo
+            and currentSpecInfo.id
             or nil
 
         if currentName

@@ -173,15 +173,18 @@ function GetItemLevel(item)
         return baseItemLevel
     end
 
-    -- Fallback for older API behavior.
-    local _, _, _, fallbackLevel =
-        GetItemInfo(item)
+    -- Legacy fallback while Blizzard still exposes the old global API.
+    -- Keep it guarded so removal of the compatibility global cannot call nil.
+    if GetItemInfo then
+        local _, _, _, fallbackLevel =
+            GetItemInfo(item)
 
-    if fallbackLevel
-        and fallbackLevel > 0
-    then
-        if cache then cache.itemLevels[cacheKey] = fallbackLevel end
-        return fallbackLevel
+        if fallbackLevel
+            and fallbackLevel > 0
+        then
+            if cache then cache.itemLevels[cacheKey] = fallbackLevel end
+            return fallbackLevel
+        end
     end
 
     if cache then cache.itemLevels[cacheKey] = false end
@@ -451,6 +454,104 @@ function WGRSetItemIgnored(
     if WGRRefreshIgnoredItemsUI then
         WGRRefreshIgnoredItemsUI()
     end
+
+    return true
+end
+
+if not StaticPopupDialogs[
+    "WGR_CONFIRM_UNIGNORE_ITEM"
+]
+then
+    StaticPopupDialogs[
+        "WGR_CONFIRM_UNIGNORE_ITEM"
+    ] = {
+        text =
+            "Stop ignoring %s?\n\nLast Known Location: %s\n\nWBGR will begin routing all copies of this item again.",
+        button1 =
+            "Unignore",
+        button2 =
+            "Cancel",
+        OnAccept =
+            function(
+                self,
+                data
+            )
+                if data
+                    and data.itemID
+                then
+                    WGRSetItemIgnored(
+                        data.itemID,
+                        false
+                    )
+                end
+            end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+        preferredIndex = 3,
+    }
+end
+
+function WGRShowUnignoreItemConfirmation(
+    item,
+    itemName,
+    lastKnownLocation
+)
+    local itemID =
+        WGRGetItemID(
+            item
+        )
+
+    if not itemID then
+        return false
+    end
+
+    local ignoredEntry = nil
+
+    for _, entry
+        in ipairs(
+            WGRGetIgnoredItems()
+        )
+    do
+        if tonumber(entry.itemID)
+            == tonumber(itemID)
+        then
+            ignoredEntry = entry
+            break
+        end
+    end
+
+    if not ignoredEntry then
+        return false
+    end
+
+    local displayName =
+        itemName
+        or ignoredEntry.name
+        or (
+            C_Item.GetItemInfo(
+                item
+            )
+        )
+        or (
+            "Item "
+            .. tostring(itemID)
+        )
+
+    local displayLocation =
+        lastKnownLocation
+        or ignoredEntry.lastKnownLocation
+        or "Unknown"
+
+    StaticPopup_Show(
+        "WGR_CONFIRM_UNIGNORE_ITEM",
+        displayName,
+        displayLocation,
+        {
+            itemID =
+                itemID,
+        }
+    )
 
     return true
 end

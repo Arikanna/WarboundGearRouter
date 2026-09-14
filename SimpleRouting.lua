@@ -406,21 +406,76 @@ end
 function RunEvaluation(
     itemName,
     newItemLevel,
+    itemMinLevel,
     priorityList,
     slotIDs,
-    label
+    label,
+    comparisonProvider
 )
     PreloadItems(
         priorityList,
         slotIDs,
         function()
-            EvaluateAgainstPriority(
-                itemName,
-                newItemLevel,
-                priorityList,
-                slotIDs,
-                label
+            local result =
+                BuildSimpleRecommendation(
+                    newItemLevel,
+                    itemMinLevel,
+                    priorityList,
+                    slotIDs,
+                    comparisonProvider
+                )
+
+            print(
+                "|cff00ff00Warbound Gear Router - Recommendation Test|r"
             )
+
+            print(string.format(
+                "%s - %s - ilvl %d",
+                tostring(itemName or "Item"),
+                tostring(label or "Gear"),
+                tonumber(newItemLevel) or 0
+            ))
+
+            if result
+                and result.kind == "upgrade"
+            then
+                print(string.format(
+                    "|cff00ff00Recommended: %s +%d ilvl|r",
+                    tostring(result.name),
+                    tonumber(result.upgrade) or 0
+                ))
+
+                if not result.meetsThreshold then
+                    print(
+                        "|cffffff00No character met their upgrade threshold; using highest-priority upgrade.|r"
+                    )
+                end
+
+            elseif result
+                and result.kind == "holder"
+            then
+                print(string.format(
+                    "|cff00ff00Hold on: %s (Level %d)|r",
+                    tostring(result.name),
+                    tonumber(result.level) or 0
+                ))
+
+            elseif result
+                and (
+                    result.kind == "unknown"
+                    or result.kind == "unresolved"
+                )
+            then
+                print(string.format(
+                    "|cffff8800Unable to safely recommend: %s has incomplete routing data.|r",
+                    tostring(result.name or "unknown character")
+                ))
+
+            else
+                print(
+                    "|cffff5555No recipient found / Sell|r"
+                )
+            end
         end,
         false
     )

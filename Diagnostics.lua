@@ -1121,6 +1121,47 @@ end
 -- /WGR ITEM
 -- ============================================================
 
+local function WGRDiagnosticComparisonProviderForJewelry(
+    itemLink,
+    equipLoc,
+    globalSlots
+)
+    local isTrinket =
+        equipLoc == "INVTYPE_TRINKET"
+
+    local isRing =
+        equipLoc == "INVTYPE_FINGER"
+
+    return function(characterName, character)
+        if isTrinket or isRing then
+            local sameUniqueLevel =
+                WGRGetUniqueEquippedSameItemLevel(
+                    characterName,
+                    character,
+                    itemLink,
+                    globalSlots
+                )
+
+            if sameUniqueLevel then
+                return sameUniqueLevel, "known"
+            end
+        end
+
+        if isTrinket then
+            return WGRGetTrinketComparisonLevelForMode(
+                characterName,
+                character,
+                itemLink
+            )
+        end
+
+        return GetComparisonForSlots(
+            character,
+            globalSlots
+        )
+    end
+end
+
 function EvaluateItem(itemLink)
     if not itemLink then
         print(
@@ -1206,6 +1247,7 @@ function EvaluateItem(itemLink)
             RunEvaluation(
                 itemName,
                 newItemLevel,
+                itemMinLevel,
                 GetArmorPriorityList(armorType),
                 { armorSlotID },
                 armorType
@@ -1253,9 +1295,15 @@ function EvaluateItem(itemLink)
             RunEvaluation(
                 itemName,
                 newItemLevel,
+                itemMinLevel,
                 priorityList,
                 globalSlots,
-                label
+                label,
+                WGRDiagnosticComparisonProviderForJewelry(
+                    itemLink,
+                    equipLoc,
+                    globalSlots
+                )
             )
 
             return
@@ -1933,6 +1981,7 @@ function WGRRunTestItem(
                 RunEvaluation(
                     itemName,
                     effectiveLevel,
+                    itemMinLevel,
                     priority,
                     { armorSlotID },
                     armorType
@@ -1970,9 +2019,15 @@ function WGRRunTestItem(
                 RunEvaluation(
                     itemName,
                     effectiveLevel,
+                    itemMinLevel,
                     priorityList,
                     globalSlots,
-                    label
+                    label,
+                    WGRDiagnosticComparisonProviderForJewelry(
+                        itemLink,
+                        equipLoc,
+                        globalSlots
+                    )
                 )
 
                 return

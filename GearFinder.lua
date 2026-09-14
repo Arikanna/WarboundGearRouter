@@ -568,15 +568,303 @@ local function WGRGearFinderSpecFitsItem(
     return true
 end
 
+-- Gear Finder scans accessible storage repeatedly while Recommendations is
+-- visible. Binding text for an unchanged physical slot is stable, while
+-- minimum-quality/ignored-item/include-Warbound/include-BoE settings may
+-- change independently. Cache only Blizzard's parsed binding state so the
+-- expensive tooltip read does not repeat for every unchanged gear slot on
+-- every refresh. Current eligibility settings are still applied fresh below.
+local WGRGearFinderBindingCache = {
+    BAGS = {},
+    PERSONAL_BANK = {},
+    WARBAND_BANK = {},
+}
+
+local function WGRGearFinderClearBindingCache()
+    WGRGearFinderBindingCache = {
+        BAGS = {},
+        PERSONAL_BANK = {},
+        WARBAND_BANK = {},
+    }
+end
+
+local function WGRGearFinderReadBindingState(
+    bagID,
+    slotID
+)
+    if not C_TooltipInfo
+        or not C_TooltipInfo.GetBagItem
+    then
+        return nil
+    end
+
+    local data =
+        C_TooltipInfo.GetBagItem(
+            bagID,
+            slotID
+        )
+
+    if not data
+        or not data.lines
+    then
+        return nil
+    end
+
+    if TooltipUtil
+        and TooltipUtil.SurfaceArgs
+    then
+        TooltipUtil.SurfaceArgs(
+            data
+        )
+    end
+
+    local state = {
+        soulbound = false,
+        warbound = false,
+        boe = false,
+    }
+
+    local resolvedBinding = false
+
+    for _, line
+        in ipairs(data.lines)
+    do
+        if TooltipUtil
+            and TooltipUtil.SurfaceArgs
+        then
+            TooltipUtil.SurfaceArgs(
+                line
+            )
+        end
+
+        for _, text
+            in ipairs({
+                line.leftText,
+                line.rightText,
+            })
+        do
+            if text then
+                local clean =
+                    tostring(text)
+                    :gsub(
+                        "|c%x%x%x%x%x%x%x%x",
+                        ""
+                    )
+                    :gsub(
+                        "|r",
+                        ""
+                    )
+                    :lower()
+
+                if clean:find(
+                    "soulbound",
+                    1,
+                    true
+                )
+                then
+                    state.soulbound = true
+                    resolvedBinding = true
+                end
+
+                if clean:find(
+                    "warbound until equipped",
+                    1,
+                    true
+                )
+                then
+                    state.warbound = true
+                    resolvedBinding = true
+                end
+
+                if clean:find(
+                    "binds when equipped",
+                    1,
+                    true
+                )
+                then
+                    state.boe = true
+                    resolvedBinding = true
+                end
+            end
+        end
+    end
+
+    -- A tooltip object can exist before its binding line is fully available.
+    -- Treat that as unresolved rather than caching a false non-transferable
+    -- result indefinitely.
+    if not resolvedBinding then
+        return nil
+    end
+
+    return state
+end
+
+local function WGRGearFinderPrepareBindingCacheSlot(
+    cacheGroup,
+    bagID,
+    slotID,
+    itemLink,
+    isBound
+)
+    local group =
+        WGRGearFinderBindingCache[
+            cacheGroup
+        ]
+
+    if not group then
+        return
+    end
+
+    local bag = group[bagID]
+    if not bag then
+        return
+    end
+
+    local cached = bag[slotID]
+
+    if cached
+        and (
+            cached.itemLink ~= itemLink
+            or cached.isBound ~= (isBound == true)
+        )
+    then
+        bag[slotID] = nil
+    elseif not itemLink then
+        bag[slotID] = nil
+    end
+end
+
+local function WGRGearFinderBindingAllowedCached(
+    cacheGroup,
+    bagID,
+    slotID,
+    itemLink,
+    isBound
+)
+    local group =
+        WGRGearFinderBindingCache[
+            cacheGroup
+        ]
+
+    if not group then
+        group = {}
+        WGRGearFinderBindingCache[
+            cacheGroup
+        ] = group
+    end
+
+    local bag = group[bagID]
+    if not bag then
+        bag = {}
+        group[bagID] = bag
+    end
+
+    local cached = bag[slotID]
+
+    -- A different link (or an empty slot) invalidates the physical-slot
+    -- binding cache. This matches WBGR's existing dirty-slot identity model.
+    if not itemLink then
+        bag[slotID] = nil
+        return false, false
+    end
+
+    local boundNow = isBound == true
+
+    if cached
+        and (
+            cached.itemLink ~= itemLink
+            or cached.isBound ~= boundNow
+        )
+    then
+        bag[slotID] = nil
+        cached = nil
+    end
+
+    -- ContainerItemInfo exposes whether this specific copy is already bound
+    -- to the current character. Use that authoritative per-copy state before
+    -- consulting the cached tooltip classification so identical item links
+    -- with different binding states cannot be confused.
+    if boundNow then
+        if cached
+            and cached.itemLink == itemLink
+            and cached.isBound == true
+        then
+            return false, true
+        end
+
+        bag[slotID] = {
+            itemLink = itemLink,
+            isBound = true,
+            state = {
+                soulbound = true,
+                warbound = false,
+                boe = false,
+            },
+        }
+        return false, false
+    end
+
+    if cached
+        and cached.itemLink
+            == itemLink
+        and cached.isBound == false
+        and cached.state
+    then
+        local state = cached.state
+
+        if state.soulbound then
+            return false, true
+        end
+
+        return
+            WGRBindingAllowed(
+                state.warbound,
+                state.boe
+            ),
+            true
+    end
+
+    local state =
+        WGRGearFinderReadBindingState(
+            bagID,
+            slotID
+        )
+
+    -- Missing tooltip data remains retryable; never cache an unresolved read.
+    if not state then
+        return false, false
+    end
+
+    bag[slotID] = {
+        itemLink = itemLink,
+        isBound = false,
+        state = state,
+    }
+
+    if state.soulbound then
+        return false, false
+    end
+
+    return
+        WGRBindingAllowed(
+            state.warbound,
+            state.boe
+        ),
+        false
+end
+
 local function WGRGearFinderScanBags()
     local items = {}
+    local signatureParts = {}
+    local bindingCacheHits = 0
+    local bindingCacheMisses = 0
 
     local currentName = WGRGearFinderCurrentName()
     if currentName
         and WGRIsCharacterRemoved
         and WGRIsCharacterRemoved(currentName)
     then
-        return items
+        return items, bindingCacheHits, bindingCacheMisses, ""
     end
 
     for bagID = 0, 4 do
@@ -586,34 +874,108 @@ local function WGRGearFinderScanBags()
             )
             or 0
 
+        signatureParts[#signatureParts + 1] =
+            "B"
+            .. tostring(bagID)
+            .. ":"
+            .. tostring(slots)
+
         for slotID = 1, slots do
-            local itemLink =
-                C_Container.GetContainerItemLink(
+            -- One container-info read supplies both the Gear Finder item link
+            -- and the itemID/count used by the change-detection signature.
+            -- This avoids immediately walking the same storage a second time
+            -- after every visible Recommendations refresh.
+            local info =
+                C_Container.GetContainerItemInfo(
                     bagID,
                     slotID
                 )
+
+            local itemLink =
+                info
+                and info.hyperlink
+                or nil
+
+            if not itemLink
+                and info
+                and info.itemID
+            then
+                itemLink =
+                    C_Container.GetContainerItemLink(
+                        bagID,
+                        slotID
+                    )
+            end
+
+            if info
+                and info.itemID
+            then
+                signatureParts[#signatureParts + 1] =
+                    tostring(slotID)
+                    .. ":"
+                    .. tostring(info.itemID)
+                    .. ":"
+                    .. tostring(
+                        info.stackCount
+                        or 1
+                    )
+            else
+                signatureParts[#signatureParts + 1] =
+                    tostring(slotID)
+                    .. ":0"
+            end
+
+            WGRGearFinderPrepareBindingCacheSlot(
+                "BAGS",
+                bagID,
+                slotID,
+                itemLink,
+                info and info.isBound
+            )
 
             if itemLink
                 and WGRGearFinderIsSupportedGear(
                     itemLink
                 )
-                and IsTransferableContainerItem(
-                    bagID,
-                    slotID,
+                and WGRQualityAllowed(
                     itemLink
                 )
             then
-                items[#items + 1] = {
-                    itemLink = itemLink,
-                    bagID = bagID,
-                    slotID = slotID,
-                    source = "BAGS",
-                }
+                local allowed, cacheHit =
+                    WGRGearFinderBindingAllowedCached(
+                        "BAGS",
+                        bagID,
+                        slotID,
+                        itemLink,
+                        info and info.isBound
+                    )
+
+                if cacheHit then
+                    bindingCacheHits = bindingCacheHits + 1
+                else
+                    bindingCacheMisses = bindingCacheMisses + 1
+                end
+
+                if allowed then
+                    items[#items + 1] = {
+                        itemLink = itemLink,
+                        bagID = bagID,
+                        slotID = slotID,
+                        source = "BAGS",
+                    }
+                end
             end
         end
     end
 
-    return items
+    return
+        items,
+        bindingCacheHits,
+        bindingCacheMisses,
+        table.concat(
+            signatureParts,
+            "|"
+        )
 end
 
 local function WGRGearFinderGetBankTabIDs(
@@ -743,20 +1105,23 @@ end
 
 local function WGRGearFinderScanPersonalBank()
     local items = {}
+    local signatureParts = {}
+    local bindingCacheHits = 0
+    local bindingCacheMisses = 0
 
     local currentName = WGRGearFinderCurrentName()
     if currentName
         and WGRIsCharacterRemoved
         and WGRIsCharacterRemoved(currentName)
     then
-        return items
+        return items, bindingCacheHits, bindingCacheMisses, ""
     end
 
     local tabIDs =
         WGRGearFinderGetPersonalBankTabIDs()
 
     if type(tabIDs) ~= "table" then
-        return items
+        return items, bindingCacheHits, bindingCacheMisses, nil
     end
 
     for _, bagID
@@ -768,34 +1133,104 @@ local function WGRGearFinderScanPersonalBank()
             )
             or 0
 
+        signatureParts[#signatureParts + 1] =
+            "PB"
+            .. tostring(bagID)
+            .. ":"
+            .. tostring(slots)
+
         for slotID = 1, slots do
-            local itemLink =
-                C_Container.GetContainerItemLink(
+            local info =
+                C_Container.GetContainerItemInfo(
                     bagID,
                     slotID
                 )
+
+            local itemLink =
+                info
+                and info.hyperlink
+                or nil
+
+            if not itemLink
+                and info
+                and info.itemID
+            then
+                itemLink =
+                    C_Container.GetContainerItemLink(
+                        bagID,
+                        slotID
+                    )
+            end
+
+            if info
+                and info.itemID
+            then
+                signatureParts[#signatureParts + 1] =
+                    tostring(slotID)
+                    .. ":"
+                    .. tostring(info.itemID)
+                    .. ":"
+                    .. tostring(
+                        info.stackCount
+                        or 1
+                    )
+            else
+                signatureParts[#signatureParts + 1] =
+                    tostring(slotID)
+                    .. ":0"
+            end
+
+            WGRGearFinderPrepareBindingCacheSlot(
+                "PERSONAL_BANK",
+                bagID,
+                slotID,
+                itemLink,
+                info and info.isBound
+            )
 
             if itemLink
                 and WGRGearFinderIsSupportedGear(
                     itemLink
                 )
-                and IsTransferableContainerItem(
-                    bagID,
-                    slotID,
+                and WGRQualityAllowed(
                     itemLink
                 )
             then
-                items[#items + 1] = {
-                    itemLink = itemLink,
-                    bagID = bagID,
-                    slotID = slotID,
-                    source = "PERSONAL_BANK",
-                }
+                local allowed, cacheHit =
+                    WGRGearFinderBindingAllowedCached(
+                        "PERSONAL_BANK",
+                        bagID,
+                        slotID,
+                        itemLink,
+                        info and info.isBound
+                    )
+
+                if cacheHit then
+                    bindingCacheHits = bindingCacheHits + 1
+                else
+                    bindingCacheMisses = bindingCacheMisses + 1
+                end
+
+                if allowed then
+                    items[#items + 1] = {
+                        itemLink = itemLink,
+                        bagID = bagID,
+                        slotID = slotID,
+                        source = "PERSONAL_BANK",
+                    }
+                end
             end
         end
     end
 
-    return items
+    return
+        items,
+        bindingCacheHits,
+        bindingCacheMisses,
+        table.concat(
+            signatureParts,
+            "|"
+        )
 end
 
 local function WGRGearFinderIsWarbandBankAvailable()
@@ -827,117 +1262,29 @@ end
 local function WGRGearFinderWarbandBindingAllowed(
     bagID,
     slotID,
-    itemLink
+    itemLink,
+    isBound
 )
-    if not itemLink
-        or type(bagID) ~= "number"
-        or type(slotID) ~= "number"
-    then
-        return false
-    end
-
-    if not C_TooltipInfo
-        or not C_TooltipInfo.GetBagItem
-    then
-        return false
-    end
-
-    local data =
-        C_TooltipInfo.GetBagItem(
+    return
+        WGRGearFinderBindingAllowedCached(
+            "WARBAND_BANK",
             bagID,
-            slotID
+            slotID,
+            itemLink,
+            isBound
         )
-
-    if not data
-        or not data.lines
-    then
-        return false
-    end
-
-    if TooltipUtil
-        and TooltipUtil.SurfaceArgs
-    then
-        TooltipUtil.SurfaceArgs(
-            data
-        )
-    end
-
-    local sawWarbound = false
-    local sawBoE = false
-
-    for _, line
-        in ipairs(data.lines)
-    do
-        if TooltipUtil
-            and TooltipUtil.SurfaceArgs
-        then
-            TooltipUtil.SurfaceArgs(
-                line
-            )
-        end
-
-        for _, text
-            in ipairs({
-                line.leftText,
-                line.rightText,
-            })
-        do
-            if text then
-                local clean =
-                    tostring(text)
-                    :gsub(
-                        "|c%x%x%x%x%x%x%x%x",
-                        ""
-                    )
-                    :gsub(
-                        "|r",
-                        ""
-                    )
-                    :lower()
-
-                if clean:find(
-                    "soulbound",
-                    1,
-                    true
-                )
-                then
-                    return false
-                end
-
-                if clean:find(
-                    "warbound until equipped",
-                    1,
-                    true
-                )
-                then
-                    sawWarbound = true
-                end
-
-                if clean:find(
-                    "binds when equipped",
-                    1,
-                    true
-                )
-                then
-                    sawBoE = true
-                end
-            end
-        end
-    end
-
-    return WGRBindingAllowed(
-        sawWarbound,
-        sawBoE
-    )
 end
 
 local function WGRGearFinderScanWarbandBank()
     local items = {}
+    local signatureParts = {}
+    local bindingCacheHits = 0
+    local bindingCacheMisses = 0
     local tabIDs =
         WGRGearFinderGetWarbandBankTabIDs()
 
     if type(tabIDs) ~= "table" then
-        return items
+        return items, bindingCacheHits, bindingCacheMisses, nil
     end
 
     for _, bagID
@@ -949,12 +1296,60 @@ local function WGRGearFinderScanWarbandBank()
             )
             or 0
 
+        signatureParts[#signatureParts + 1] =
+            "WB"
+            .. tostring(bagID)
+            .. ":"
+            .. tostring(slots)
+
         for slotID = 1, slots do
-            local itemLink =
-                C_Container.GetContainerItemLink(
+            local info =
+                C_Container.GetContainerItemInfo(
                     bagID,
                     slotID
                 )
+
+            local itemLink =
+                info
+                and info.hyperlink
+                or nil
+
+            if not itemLink
+                and info
+                and info.itemID
+            then
+                itemLink =
+                    C_Container.GetContainerItemLink(
+                        bagID,
+                        slotID
+                    )
+            end
+
+            if info
+                and info.itemID
+            then
+                signatureParts[#signatureParts + 1] =
+                    tostring(slotID)
+                    .. ":"
+                    .. tostring(info.itemID)
+                    .. ":"
+                    .. tostring(
+                        info.stackCount
+                        or 1
+                    )
+            else
+                signatureParts[#signatureParts + 1] =
+                    tostring(slotID)
+                    .. ":0"
+            end
+
+            WGRGearFinderPrepareBindingCacheSlot(
+                "WARBAND_BANK",
+                bagID,
+                slotID,
+                itemLink,
+                info and info.isBound
+            )
 
             if itemLink
                 and WGRGearFinderIsSupportedGear(
@@ -963,23 +1358,41 @@ local function WGRGearFinderScanWarbandBank()
                 and WGRQualityAllowed(
                     itemLink
                 )
-                and WGRGearFinderWarbandBindingAllowed(
-                    bagID,
-                    slotID,
-                    itemLink
-                )
             then
-                items[#items + 1] = {
-                    itemLink = itemLink,
-                    bagID = bagID,
-                    slotID = slotID,
-                    source = "WARBAND_BANK",
-                }
+                local allowed, cacheHit =
+                    WGRGearFinderWarbandBindingAllowed(
+                        bagID,
+                        slotID,
+                        itemLink,
+                        info and info.isBound
+                    )
+
+                if cacheHit then
+                    bindingCacheHits = bindingCacheHits + 1
+                else
+                    bindingCacheMisses = bindingCacheMisses + 1
+                end
+
+                if allowed then
+                    items[#items + 1] = {
+                        itemLink = itemLink,
+                        bagID = bagID,
+                        slotID = slotID,
+                        source = "WARBAND_BANK",
+                    }
+                end
             end
         end
     end
 
-    return items
+    return
+        items,
+        bindingCacheHits,
+        bindingCacheMisses,
+        table.concat(
+            signatureParts,
+            "|"
+        )
 end
 
 
@@ -2516,6 +2929,68 @@ local function WGRGearFinderClassify(
 
         other =
             uniqueOther
+    end
+
+    -- OTHER USEFUL GEAR is normally informational. If a slot/group has no
+    -- Gold recommendation at all, promote only the strongest positive
+    -- Magenta item(s) for that group to actionable Get/Equip choices. This
+    -- lets a below-threshold upgrade remain easy to finish after a larger
+    -- Gold upgrade changes the baseline, without competing with Gold when a
+    -- Gold choice still exists for that group.
+    do
+        local goldGroups = {}
+        local bestOtherUpgradeByGroup = {}
+
+        for _, spec in ipairs(specs) do
+            local bucket = bySpec[spec.id]
+
+            for _, candidate in ipairs(bucket.best or {}) do
+                if candidate.group then
+                    goldGroups[candidate.group] = true
+                end
+            end
+
+            for _, candidate in ipairs(bucket.weaponCandidates or {}) do
+                if candidate.classification == "BEST"
+                    and candidate.group
+                then
+                    goldGroups[candidate.group] = true
+                end
+            end
+        end
+
+        for _, record in ipairs(other) do
+            local group = record.group
+            local upgrade = tonumber(record.upgrade) or 0
+            local canEquip = record.blockedByUniqueEquipped ~= true
+
+            record.magentaActionable = nil
+
+            if group
+                and not goldGroups[group]
+                and upgrade > 0
+                and canEquip
+            then
+                local currentBest = bestOtherUpgradeByGroup[group]
+                if currentBest == nil or upgrade > currentBest then
+                    bestOtherUpgradeByGroup[group] = upgrade
+                end
+            end
+        end
+
+        for _, record in ipairs(other) do
+            local group = record.group
+            local upgrade = tonumber(record.upgrade) or 0
+            local bestUpgrade = group and bestOtherUpgradeByGroup[group]
+
+            if bestUpgrade ~= nil
+                and math.abs(upgrade - bestUpgrade) < 0.001
+                and record.blockedByUniqueEquipped ~= true
+            then
+                record.magentaActionable = true
+            end
+        end
+
     end
 
     table.sort(
@@ -4145,7 +4620,7 @@ end
 local function WGRGearFinderActionItemName(record)
     if not record or not record.itemLink then return "item" end
     return (C_Item and C_Item.GetItemInfo and C_Item.GetItemInfo(record.itemLink))
-        or GetItemInfo(record.itemLink)
+        or (GetItemInfo and GetItemInfo(record.itemLink))
         or "item"
 end
 
@@ -5749,13 +6224,66 @@ local function WGRGearFinderRender(
         end
 
         if anyWeapons then
+            local weaponSectionRecords = {}
+
+            for _, spec in ipairs(activeSpecs) do
+                local display = classified.bySpec[spec.id].weaponDisplay
+
+                if display and display.hasCompleteUpgrade then
+                    for _, cfg in ipairs(display.configs or {}) do
+                        for _, record in ipairs(cfg.mainOptions or {}) do
+                            if not record.ownedBaseline then
+                                weaponSectionRecords[#weaponSectionRecords + 1] = record
+                            end
+                        end
+
+                        for _, record in ipairs(cfg.offOptions or {}) do
+                            if not record.ownedBaseline then
+                                weaponSectionRecords[#weaponSectionRecords + 1] = record
+                            end
+                        end
+                    end
+                end
+            end
+
             WGRGearFinderAddHeading(
                 content,
                 "WEAPONS",
                 y,
                 WGRGearFinderColors.BEST
             )
-            y = y - 22
+
+            WGRGearFinderCreateMoveButton(
+                content,
+                weaponSectionRecords,
+                156,
+                y + 4,
+                "Move All to Bags",
+                "weapon upgrade item(s)",
+                true
+            )
+
+            WGRGearFinderCreateDepositButton(
+                content,
+                weaponSectionRecords,
+                384,
+                y + 4,
+                "Move to Warbank",
+                "weapon upgrade item(s)",
+                true
+            )
+
+            WGRGearFinderCreatePersonalBankButton(
+                content,
+                weaponSectionRecords,
+                612,
+                y + 4
+            )
+
+            -- Keep the Weapons section consistent with the other Gear Finder
+            -- sections: bulk movement controls own the heading row and spec
+            -- headings begin on the next line.
+            y = y - 30
 
             for index, spec in ipairs(activeSpecs) do
                 local heading = content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -5898,10 +6426,26 @@ local function WGRGearFinderRender(
 
                                 local mainMultiple = #cfg.mainOptions > 1
                                 local offMultiple = #cfg.offOptions > 1
-                                local mainActionHeight = AddWeaponSingleAction(mainLeft, lineY, sideWidth, cfg.mainOptions, 16)
-                                local offActionHeight = AddWeaponSingleAction(offLeft, lineY, sideWidth, cfg.offOptions, 17)
-                                local actionHeight = math.max(mainActionHeight, offActionHeight)
                                 local selectHeight = (mainMultiple or offMultiple) and 20 or 0
+
+                                -- When only one side has CHOOSE ONE, reserve that
+                                -- same choice row on the single-choice side. This
+                                -- keeps its Get/KEEP action aligned with the per-item
+                                -- Equip buttons instead of one row too high.
+                                local mainActionY = lineY
+                                local offActionY = lineY
+                                if selectHeight > 0 then
+                                    if #cfg.mainOptions == 1 and not mainMultiple then
+                                        mainActionY = lineY - selectHeight
+                                    end
+                                    if #cfg.offOptions == 1 and not offMultiple then
+                                        offActionY = lineY - selectHeight
+                                    end
+                                end
+
+                                local mainActionHeight = AddWeaponSingleAction(mainLeft, mainActionY, sideWidth, cfg.mainOptions, 16)
+                                local offActionHeight = AddWeaponSingleAction(offLeft, offActionY, sideWidth, cfg.offOptions, 17)
+                                local actionHeight = math.max(mainActionHeight, offActionHeight)
                                 local itemsTopY = lineY - actionHeight - selectHeight
                                 local rowStep = 55 + ((mainMultiple or offMultiple) and 20 or 0)
 
@@ -6064,12 +6608,16 @@ local function WGRGearFinderRender(
     local function RenderWrappedGroupedItems(
         groups,
         startY,
-        valueTextFunc
+        valueTextFunc,
+        showMagentaActions
     )
         local startX = 8
         local x = startX
         local lineY = startY
-        local lineHeight = 72
+        -- Actionable Magenta groups reserve a little extra vertical space so
+        -- CHOOSE ONE can stay on one line with breathing room above the
+        -- Get/Equip buttons and icons.
+        local lineHeight = showMagentaActions and 116 or 72
         local usedLines = 1
         local maxX = contentWidth - 8
         local iconSpacing = 38
@@ -6148,18 +6696,67 @@ local function WGRGearFinderRender(
                         )
                     )
 
+                local actionableIndices = {}
+                if showMagentaActions then
+                    for itemIndex, record in ipairs(group.records) do
+                        if record.magentaActionable then
+                            actionableIndices[#actionableIndices + 1] = itemIndex
+                        end
+                    end
+
+                    if #actionableIndices > 1 then
+                        local firstIndex = actionableIndices[1] - 1
+                        local lastIndex = actionableIndices[#actionableIndices] - 1
+                        local firstColumn = firstIndex % iconsPerLine
+                        local lastColumn = lastIndex % iconsPerLine
+                        local choose = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+                        local chooseCenterX =
+                            startX
+                            + math.floor(((firstColumn + lastColumn) * iconSpacing) / 2)
+                            + 21
+                        local chooseWidth = 100
+                        choose:SetPoint(
+                            "TOPLEFT",
+                            content,
+                            "TOPLEFT",
+                            chooseCenterX - math.floor(chooseWidth / 2),
+                            lineY - 18
+                        )
+                        choose:SetWidth(chooseWidth)
+                        choose:SetJustifyH("CENTER")
+                        choose:SetText("CHOOSE ONE")
+                        WGRGearFinderTrackChild(content, choose)
+                    end
+                end
+
                 for itemIndex, record
                     in ipairs(group.records)
                 do
                     local zeroIndex = itemIndex - 1
                     local itemColumn = zeroIndex % iconsPerLine
                     local itemRow = math.floor(zeroIndex / iconsPerLine)
+                    local itemX = startX + (itemColumn * iconSpacing)
+                    local itemY =
+                        lineY
+                        - (showMagentaActions and 60 or 14)
+                        - (itemRow * lineHeight)
+
+                    if showMagentaActions and record.magentaActionable then
+                        WGRGearFinderCreateRecommendationActionButton(
+                            content,
+                            itemX + 4,
+                            lineY - 39 - (itemRow * lineHeight),
+                            34,
+                            "Equip",
+                            record
+                        )
+                    end
 
                     WGRGearFinderCreateItemButton(
                         content,
                         record,
-                        startX + (itemColumn * iconSpacing),
-                        lineY - 14 - (itemRow * lineHeight),
+                        itemX,
+                        itemY,
                         valueTextFunc
                             and valueTextFunc(record)
                             or ""
@@ -6181,14 +6778,59 @@ local function WGRGearFinderRender(
                 -- icon row.
                 x = maxX
             else
+                local actionableIndices = {}
+                if showMagentaActions then
+                    for itemIndex, record in ipairs(group.records) do
+                        if record.magentaActionable then
+                            actionableIndices[#actionableIndices + 1] = itemIndex
+                        end
+                    end
+
+                    if #actionableIndices > 1 then
+                        local firstIndex = actionableIndices[1] - 1
+                        local lastIndex = actionableIndices[#actionableIndices] - 1
+                        local choose = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+                        local chooseCenterX =
+                            x
+                            + math.floor(((firstIndex + lastIndex) * iconSpacing) / 2)
+                            + 21
+                        local chooseWidth = 100
+                        choose:SetPoint(
+                            "TOPLEFT",
+                            content,
+                            "TOPLEFT",
+                            chooseCenterX - math.floor(chooseWidth / 2),
+                            lineY - 18
+                        )
+                        choose:SetWidth(chooseWidth)
+                        choose:SetJustifyH("CENTER")
+                        choose:SetText("CHOOSE ONE")
+                        WGRGearFinderTrackChild(content, choose)
+                    end
+                end
+
                 for itemIndex, record
                     in ipairs(group.records)
                 do
+                    local itemX = x + ((itemIndex - 1) * iconSpacing)
+                    local itemY = lineY - (showMagentaActions and 60 or 14)
+
+                    if showMagentaActions and record.magentaActionable then
+                        WGRGearFinderCreateRecommendationActionButton(
+                            content,
+                            itemX + 4,
+                            lineY - 39,
+                            34,
+                            "Equip",
+                            record
+                        )
+                    end
+
                     WGRGearFinderCreateItemButton(
                         content,
                         record,
-                        x + ((itemIndex - 1) * iconSpacing),
-                        lineY - 14,
+                        itemX,
+                        itemY,
                         valueTextFunc
                             and valueTextFunc(record)
                             or ""
@@ -6199,7 +6841,7 @@ local function WGRGearFinderRender(
             end
         end
 
-        return usedLines
+        return usedLines, lineHeight
     end
 
     local function RenderFullWidthSection(
@@ -6647,7 +7289,15 @@ local function WGRGearFinderRender(
                 classified.other
             )
 
-        local otherUsedLines =
+        local hasMagentaActions = false
+        for _, record in ipairs(classified.other) do
+            if record.magentaActionable then
+                hasMagentaActions = true
+                break
+            end
+        end
+
+        local otherUsedLines, otherLineHeight =
             RenderWrappedGroupedItems(
                 otherGroups,
                 y,
@@ -6662,12 +7312,13 @@ local function WGRGearFinderRender(
                             )
                         )
                         or ""
-                end
+                end,
+                hasMagentaActions
             )
 
         y =
             y
-            - (otherUsedLines * 72)
+            - (otherUsedLines * (otherLineHeight or 72))
             - 12
     end
 
@@ -7044,7 +7695,7 @@ function WGRScheduleGearFinderRefresh(
 
     if not frame
         or not frame.gearFinderPage
-        or not frame.gearFinderPage:IsShown()
+        or not frame.gearFinderPage:IsVisible()
     then
         return
     end
@@ -7072,7 +7723,7 @@ function WGRScheduleGearFinderRefresh(
 
             if currentFrame
                 and currentFrame.gearFinderPage
-                and currentFrame.gearFinderPage:IsShown()
+                and currentFrame.gearFinderPage:IsVisible()
             then
                 local perfStart = WGRPerfNow and WGRPerfNow() or 0
                 WGRRefreshGearFinder(
@@ -7148,7 +7799,14 @@ function WGRRefreshGearFinder(
     )
 
     if WGRRefreshIgnoredItemLocations then
+        local phaseStart = WGRPerfNow and WGRPerfNow() or 0
         WGRRefreshIgnoredItemLocations()
+        if phaseStart > 0 and WGRPerfNow and WGRPerfRecord then
+            WGRPerfRecord(
+                "gear_finder_ignored_locations",
+                WGRPerfNow() - phaseStart
+            )
+        end
     end
 
     WGRGearFinderGeneration =
@@ -7181,8 +7839,23 @@ function WGRRefreshGearFinder(
             character
         )
 
-    local bagItems =
+    local bagScanStart = WGRPerfNow and WGRPerfNow() or 0
+    local bagItems,
+          bagBindingCacheHits,
+          bagBindingCacheMisses,
+          bagSignature =
         WGRGearFinderScanBags()
+    if bagScanStart > 0 and WGRPerfNow and WGRPerfRecord then
+        WGRPerfRecord(
+            "gear_finder_bag_scan",
+            WGRPerfNow() - bagScanStart,
+            string.format(
+                "binding_cache=%d hit / %d miss",
+                bagBindingCacheHits or 0,
+                bagBindingCacheMisses or 0
+            )
+        )
+    end
 
     local items = {}
 
@@ -7203,7 +7876,14 @@ function WGRRefreshGearFinder(
         0
 
     WGRGearFinderBagSignature =
-        WGRGearFinderBuildBagSignature()
+        bagSignature
+    if WGRPerfRecord then
+        WGRPerfRecord(
+            "gear_finder_bag_signature",
+            0,
+            "built during scan"
+        )
+    end
 
     WGRGearFinderPersonalBankOpen =
         WGRGearFinderIsPersonalBankAvailable()
@@ -7213,8 +7893,23 @@ function WGRRefreshGearFinder(
     end
 
     if WGRGearFinderPersonalBankOpen then
-        local bankItems =
+        local bankScanStart = WGRPerfNow and WGRPerfNow() or 0
+        local bankItems,
+              personalBindingCacheHits,
+              personalBindingCacheMisses,
+              personalSignature =
             WGRGearFinderScanPersonalBank()
+        if bankScanStart > 0 and WGRPerfNow and WGRPerfRecord then
+            WGRPerfRecord(
+                "gear_finder_personal_scan",
+                WGRPerfNow() - bankScanStart,
+                string.format(
+                    "binding_cache=%d hit / %d miss",
+                    personalBindingCacheHits or 0,
+                    personalBindingCacheMisses or 0
+                )
+            )
+        end
 
         personalBankCount =
             #bankItems
@@ -7227,7 +7922,14 @@ function WGRRefreshGearFinder(
         end
 
         WGRGearFinderPersonalBankSignature =
-            WGRGearFinderBuildPersonalBankSignature()
+            personalSignature
+        if WGRPerfRecord then
+            WGRPerfRecord(
+                "gear_finder_personal_signature",
+                0,
+                "built during scan"
+            )
+        end
     end
 
     WGRGearFinderWarbandBankOpen =
@@ -7238,8 +7940,23 @@ function WGRRefreshGearFinder(
     end
 
     if WGRGearFinderWarbandBankOpen then
-        local warbandItems =
+        local warbandScanStart = WGRPerfNow and WGRPerfNow() or 0
+        local warbandItems,
+              warbandBindingCacheHits,
+              warbandBindingCacheMisses,
+              warbandSignature =
             WGRGearFinderScanWarbandBank()
+        if warbandScanStart > 0 and WGRPerfNow and WGRPerfRecord then
+            WGRPerfRecord(
+                "gear_finder_warband_scan",
+                WGRPerfNow() - warbandScanStart,
+                string.format(
+                    "binding_cache=%d hit / %d miss",
+                    warbandBindingCacheHits or 0,
+                    warbandBindingCacheMisses or 0
+                )
+            )
+        end
 
         warbandBankCount =
             #warbandItems
@@ -7252,7 +7969,14 @@ function WGRRefreshGearFinder(
         end
 
         WGRGearFinderWarbandBankSignature =
-            WGRGearFinderBuildWarbandBankSignature()
+            warbandSignature
+        if WGRPerfRecord then
+            WGRPerfRecord(
+                "gear_finder_warband_signature",
+                0,
+                "built during scan"
+            )
+        end
     end
 
     frame.gearFinderSummary:SetText(
@@ -8266,6 +8990,13 @@ WGRGearFinderEventFrame:SetScript(
             and arg1 ~= "player"
         then
             return
+        end
+
+        -- Equipping can convert Warbound/BoE gear into Soulbound gear without
+        -- changing the item's hyperlink. Drop the physical-slot binding cache
+        -- so the next Gear Finder refresh re-reads authoritative binding data.
+        if event == "PLAYER_EQUIPMENT_CHANGED" then
+            WGRGearFinderClearBindingCache()
         end
 
         if event == "BANKFRAME_OPENED" then
