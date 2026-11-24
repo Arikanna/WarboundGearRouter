@@ -2180,7 +2180,7 @@ local function WGRSavedWeaponBaselineStillOwned(characterName, baseline)
         for _, data in ipairs(list or {}) do
             local link = data and data.link
             if link then
-                local itemID = GetItemInfoInstant and select(1, GetItemInfoInstant(link)) or nil
+                local itemID = C_Item and C_Item.GetItemInfoInstant and select(1, C_Item.GetItemInfoInstant(link)) or nil
                 local key = itemID and ("id:" .. tostring(itemID)) or ("link:" .. tostring(link))
                 counts[key] = (counts[key] or 0) + 1
             end
@@ -2193,7 +2193,7 @@ local function WGRSavedWeaponBaselineStillOwned(characterName, baseline)
 
     local function consume(link)
         if not link then return false end
-        local itemID = GetItemInfoInstant and select(1, GetItemInfoInstant(link)) or nil
+        local itemID = C_Item and C_Item.GetItemInfoInstant and select(1, C_Item.GetItemInfoInstant(link)) or nil
         local key = itemID and ("id:" .. tostring(itemID)) or ("link:" .. tostring(link))
         local count = counts[key] or 0
         if count <= 0 then return false end

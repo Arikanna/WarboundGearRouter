@@ -1,14 +1,16 @@
-## Interface: 120100
+## Interface: 120105
 ## Title: Warbound Gear Router
 ## Notes: Routes Warbound gear through a prioritized alt roster.
 ## Author: Arikanna (Silvermoon)
-## Version: 0.67f
+## Version: 0.72bu
 ## IconTexture: Interface\AddOns\WarboundGearRouter\WBGRIcon
+## AddonCompartmentFunc: WGRAddonCompartment_OnClick
 ## Dependencies: DataStore, DataStore_Characters, DataStore_Inventory
 ## OptionalDeps: DataStore_Containers, DataStore_Talents
 ## SavedVariables: WarboundGearRouterDB
 
 StaticData.lua
+CommandHelp.lua
 Database.lua
 DataStoreHelpers.lua
 SpecRouting.lua
@@ -20,7 +22,10 @@ TrinketRouting.lua
 WeaponRouting.lua
 Tooltip.lua
 GearFinder.lua
+StorageCleanup.lua
+DisposalMail.lua
 GearSearch.lua
+WhatsNew.lua
 MainWindow.lua
 Diagnostics.lua
 MailRuntime.lua

@@ -3547,6 +3547,16 @@ local WGRHeldGearCasterDPSSpecs = {
     [1480] = true,
 }
 
+-- Storage Cleanup shares the normal held-gear specialization role buckets.
+-- This is a demand label only: actual item eligibility stays spec-specific.
+function WGRGetTrinketRetentionRoleForSpec(specID)
+    if WGRHeldGearTankSpecs[specID] then return 'TANK' end
+    if WGRHeldGearHealerSpecs[specID] then return 'HEALER' end
+    if WGRHeldGearCasterDPSSpecs[specID] then return 'CASTER_DPS' end
+    if specID then return 'PHYSICAL_DPS' end
+    return nil
+end
+
 local function WGRHeldGearPrimaryStat(
     itemLink
 )
@@ -5353,7 +5363,20 @@ local function EvaluateWarbankButton(button, generation)
     end
 
     local itemLink = C_Container.GetContainerItemLink(bagID, slotID)
-    if not itemLink or not IsTransferableContainerItem(bagID, slotID, itemLink) then return end
+    if not itemLink then return end
+
+    -- v0.72bh: an explicit physical-copy override has priority over the
+    -- asynchronous recommendation/tooltip load. This also rebinds a saved
+    -- WBK GUID after a character switch without requiring a Cleanup scan.
+    local manualMode = WGRStorageCleanupGetCopyMark and
+        WGRStorageCleanupGetCopyMark(bagID,slotID,itemLink,'WARBAND_BANK')
+    if manualMode == 'DISPOSE' then
+        ShowDisposeOverlay(button)
+        return
+    elseif manualMode == 'KEEP' then
+        HideDisposeOverlay(button)
+    end
+    if not IsTransferableContainerItem(bagID, slotID, itemLink) then return end
 
     button.__WGRWarbankBag = bagID
     button.__WGRWarbankSlot = slotID
@@ -5381,10 +5404,12 @@ local function EvaluateWarbankButton(button, generation)
                 return
             end
 
-            local isDispose = result and (
-                result.kind == "sell"
-                or result.kind == "no_current_upgrade"
-            )
+            local manualMode=WGRStorageCleanupGetCopyMark and
+                WGRStorageCleanupGetCopyMark(button.__WGRWarbankBag,button.__WGRWarbankSlot,currentLink,'WARBAND_BANK')
+            local isDispose = manualMode~='KEEP' and (
+                (WGRStorageCleanupIsDisposeCopy and
+                    WGRStorageCleanupIsDisposeCopy(button.__WGRWarbankBag,button.__WGRWarbankSlot,currentLink,'WARBAND_BANK'))
+                or (result and (result.kind == "sell" or result.kind == "no_current_upgrade")))
 
             if isDispose then
                 HideWarbankTakeOverlay(button)
@@ -5445,7 +5470,19 @@ local function EvaluateBagnonButton(button, generation)
     end
 
     local itemLink = C_Container.GetContainerItemLink(bagID, slotID)
-    if not itemLink or not IsTransferableContainerItem(bagID, slotID, itemLink) then return end
+    if not itemLink then return end
+
+    -- Manual overrides apply before the normal asynchronous route finishes.
+    -- PBK/BAG owner scope is still enforced by the button ownership guard.
+    local manualMode = WGRStorageCleanupGetCopyMark and
+        WGRStorageCleanupGetCopyMark(bagID,slotID,itemLink)
+    if manualMode == 'DISPOSE' then
+        ShowDisposeOverlay(button)
+        return
+    elseif manualMode == 'KEEP' then
+        HideDisposeOverlay(button)
+    end
+    if not IsTransferableContainerItem(bagID, slotID, itemLink) then return end
 
     button.__WGRBag = bagID
     button.__WGRSlot = slotID
@@ -5475,10 +5512,12 @@ local function EvaluateBagnonButton(button, generation)
                 return
             end
 
-            local isDispose = result and (
-                result.kind == "sell"
-                or result.kind == "no_current_upgrade"
-            )
+            local manualMode=WGRStorageCleanupGetCopyMark and
+                WGRStorageCleanupGetCopyMark(button.__WGRBag,button.__WGRSlot,currentLink)
+            local isDispose = manualMode~='KEEP' and (
+                (WGRStorageCleanupIsDisposeCopy and
+                    WGRStorageCleanupIsDisposeCopy(button.__WGRBag,button.__WGRSlot,currentLink))
+                or (result and (result.kind == "sell" or result.kind == "no_current_upgrade")))
 
             if isDispose then
                 HideCleanupOverlay(button)
@@ -5511,6 +5550,22 @@ local function EvaluateBagnonButton(button, generation)
         end,
         true
     )
+end
+
+-- A deliberate manual mark changes status without changing the item link.
+-- The BAG_UPDATE signature fast path would otherwise skip this exact slot.
+function WGRRefreshCopyOverlay(bagID,slotID)
+    local byBag=bagnonButtonsByBagSlot and bagnonButtonsByBagSlot[bagID]
+    local buttons=byBag and byBag[slotID]
+    if type(buttons)=='table' and #buttons>0 then
+        for _,button in ipairs(buttons) do
+            if button and button.IsShown and button:IsShown() then
+                EvaluateBagnonButton(button,cleanupGeneration)
+            end
+        end
+    elseif WGRMarkBagnonOverlayBagDirty then
+        WGRMarkBagnonOverlayBagDirty(bagID)
+    end
 end
 
 function RefreshBagnonCleanupOverlays(dirtyBags)
@@ -5555,7 +5610,13 @@ function RefreshBagnonCleanupOverlays(dirtyBags)
         HideTiedBestOverlay(button)
         HideDisposeOverlay(button)
 
-        if IsCurrentCharacterBagnonButton(button) then
+        -- v0.72bh: shared WBK is not owned by the current character.
+        -- Bagnon's account-bank buttons can report a different/remote owner;
+        -- their *live* slot must be processed independently of BAG/PBK owner.
+        -- Never evaluate a cached/offline WBK view as a live bank container.
+        local liveSharedBank = type(bagID)=='number' and bagID>=12 and bagID<=16
+            and WGRGearFinderIsWarbandBankOpen and WGRGearFinderIsWarbandBankOpen()
+        if liveSharedBank or IsCurrentCharacterBagnonButton(button) then
             local slotID = button.GetID and button:GetID()
 
             if type(bagID) == "number"
@@ -6183,6 +6244,31 @@ function ProcessTooltip(tooltip)
 
     local displayContext = nil
     local owner = tooltip.GetOwner and tooltip:GetOwner()
+    if owner and type(owner.bag)=='number' and WGRStorageCleanupGetCopyMark then
+        local bagID=owner.bag
+        local slotID=owner.slot or (owner.GetID and owner:GetID())
+        if type(slotID)=='number' then
+            local mode,mark,guid=WGRStorageCleanupGetCopyMark(bagID,slotID)
+            local marker=guid and (guid..':'..tostring(mode)) or nil
+            if mode=='DISPOSE' and WGRStorageCleanupIsDisposeCopy
+                and WGRStorageCleanupIsDisposeCopy(bagID,slotID) then
+                if marker~=tooltip.__WGRManualOverrideKey then
+                    tooltip:AddLine('|TInterface\\Buttons\\UI-GroupLoot-Pass-Up:14:14|t WBGR: DISPOSE ('..
+                        (WGRStorageCleanupDisposeReasonLabel and WGRStorageCleanupDisposeReasonLabel(mark) or 'Manual Override')..')',.68,.68,.68)
+                    tooltip:AddLine('Holder routing suspended for this copy',.8,.8,.8)
+                    tooltip.__WGRManualOverrideKey=marker
+                    tooltip:Show()
+                end
+                return
+            elseif mode=='KEEP' and marker~=tooltip.__WGRManualOverrideKey then
+                tooltip:AddLine('|TInterface\\AddOns\\WarboundGearRouter\\WBGRKeepLock:18:18:0:0|t WBGR: KEEP (Manual Override)',.35,1,.45)
+                tooltip:AddLine('Protected from automatic disposal',.8,.8,.8)
+                tooltip.__WGRManualOverrideKey=marker
+                tooltip:Show()
+                -- KEEP still gets the regular routing information below.
+            end
+        end
+    end
     if owner and type(owner.bag) == "number" then
         local bagID = owner.bag
         if bagID >= 12 and bagID <= 16 then
@@ -6197,6 +6283,19 @@ function ProcessTooltip(tooltip)
     BuildTooltipRecommendation(
         itemLink,
         function(result, alternatives)
+            local ownerNow=tooltip.GetOwner and tooltip:GetOwner()
+            if ownerNow and type(ownerNow.bag)=='number' and
+                WGRStorageCleanupGetCopyMark then
+                local slotNow=ownerNow.slot or (ownerNow.GetID and ownerNow:GetID())
+                local mode=type(slotNow)=='number' and
+                    WGRStorageCleanupGetCopyMark(ownerNow.bag,slotNow)
+                -- A manual KEEP protects a copy even when ordinary tooltip
+                -- classification would show SELL / no-current-upgrade.
+                if mode=='KEEP' and result and
+                    (result.kind=='sell' or result.kind=='no_current_upgrade') then
+                    return
+                end
+            end
             AddWGRLineToTooltip(
                 tooltip,
                 itemLink,
@@ -6257,6 +6356,7 @@ function InstallTooltipHook()
 
                 self.__WGRIgnoredItemLink =
                     nil
+                self.__WGRManualOverrideKey = nil
 
                 self.__WGRSoulboundTrinketSpecsItemLink =
                     nil

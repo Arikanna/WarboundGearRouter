@@ -1103,6 +1103,10 @@ local function WGRGearFinderIsPersonalBankAvailable()
         )
 end
 
+function WGRStorageCleanupPersonalBankTabIDs()
+    return WGRGearFinderGetPersonalBankTabIDs()
+end
+
 local function WGRGearFinderScanPersonalBank()
     local items = {}
     local signatureParts = {}
@@ -1947,6 +1951,18 @@ local function WGRGearFinderWeaponPieceFitsConfig(record, config, role)
     if not record or not record.itemLink then return false end
     local weaponKind = GetWeaponKind(record.itemLink)
     local offKind = WGRGetOffhandKind(record.itemLink)
+    local info = GetInstantItemInfo(record.itemLink)
+    local equipLoc = info and info.equipLoc
+
+    -- Respect Blizzard's explicit hand restrictions before considering a
+    -- weapon for a paired setup. Generic INVTYPE_WEAPON items may use either
+    -- hand; MAINHAND/OFFHAND-only items may not be mirrored into the other.
+    if role == "MAIN" and equipLoc == "INVTYPE_WEAPONOFFHAND" then
+        return false
+    end
+    if role == "OFF" and equipLoc == "INVTYPE_WEAPONMAINHAND" then
+        return false
+    end
 
     if config == "RANGED" then
         return role == "MAIN" and weaponKind == "RANGED"
@@ -2043,6 +2059,28 @@ local function WGRGearFinderWeaponRecordKey(record)
     return tostring(record.source) .. ":" .. tostring(record.bagID) .. ":" .. tostring(record.slotID)
 end
 
+local function WGRGearFinderWeaponCandidateIsHandFlexible(record, config)
+    if not record or record.ownedBaseline or not record.itemLink then
+        return false
+    end
+
+    if config == "DUAL_2H" then
+        return GetWeaponKind(record.itemLink) == "TWO_HAND"
+    end
+
+    if config ~= "DUAL_1H" then
+        return false
+    end
+
+    local info = GetInstantItemInfo(record.itemLink)
+    if not info or GetWeaponKind(record.itemLink) ~= "ONE_HAND" then
+        return false
+    end
+
+    return info.equipLoc ~= "INVTYPE_WEAPONMAINHAND"
+        and info.equipLoc ~= "INVTYPE_WEAPONOFFHAND"
+end
+
 local function WGRGearFinderBestWeaponSetupsForConfig(pieces, config, overallBaseline, threshold)
     local main = {}
     local off = {}
@@ -2107,6 +2145,27 @@ local function WGRGearFinderBestWeaponSetupsForConfig(pieces, config, overallBas
     local function addSetup(a, b)
         if not a then return end
         if b and WGRGearFinderWeaponRecordKey(a) == WGRGearFinderWeaponRecordKey(b) then return end
+
+        -- Two fully interchangeable routed weapons produce the same complete
+        -- dual-wield score in either orientation.  Keep one deterministic
+        -- assignment instead of presenting both physical items as choices for
+        -- both hands: higher ilvl goes to Main Hand, lower ilvl to Off Hand.
+        -- Equal-ilvl pairs remain choices because WBGR does not rank weapon
+        -- stats/effects beyond item level.
+        if b
+            and (config == "DUAL_1H" or config == "DUAL_2H")
+            and WGRGearFinderWeaponCandidateIsHandFlexible(a, config)
+            and WGRGearFinderWeaponCandidateIsHandFlexible(b, config)
+        then
+            local aLevel = tonumber(a.itemLevel) or 0
+            local bLevel = tonumber(b.itemLevel) or 0
+
+            if aLevel < bLevel then
+                return
+            end
+
+        end
+
         -- A loose paired-weapon component is only actionable if it improves
         -- the component position it would replace.  The complete setup score
         -- is still used below for the actual +ilvl comparison.
@@ -2482,7 +2541,13 @@ local function WGRGearFinderClassify(
         local recommendation =
             record.recommendation
 
-        if recommendation
+        if record.bagID~=nil and record.slotID~=nil
+            and WGRStorageCleanupIsDisposeCopy and
+                WGRStorageCleanupIsDisposeCopy(record.bagID,record.slotID,record.itemLink,record.source) then
+            record.classification='DISPOSE'
+            record.cleanupDisposition='MANUALLY_OR_VERIFIED_MARKED'
+            dispose[#dispose+1]=record
+        elseif recommendation
             and (
                 recommendation.kind == "sell"
                 or recommendation.kind == "no_current_upgrade"
@@ -3444,6 +3509,7 @@ local function WGRGearFinderCountPersonalBankMovableRecords(records)
 end
 
 local function WGRGearFinderMoveRecordsToPersonalBank(records, description)
+    local moveManifest = {}
     if not WGRGearFinderIsPersonalBankAvailable() then
         print("|cffff5555WBGR:|r Open the Personal Bank before moving items.")
         return
@@ -3452,7 +3518,6 @@ local function WGRGearFinderMoveRecordsToPersonalBank(records, description)
     local totalRequested = WGRGearFinderCountPersonalBankMovableRecords(records)
     local requested = math.min(totalRequested, WGRGearFinderBulkMoveLimit)
     if requested == 0 then
-        print("|cff33ff99WBGR:|r Nothing in " .. tostring(description or "this group") .. " needs to be moved to the Personal Bank.")
         return
     end
 
@@ -3475,8 +3540,17 @@ local function WGRGearFinderMoveRecordsToPersonalBank(records, description)
                 C_Container.PickupContainerItem(record.bagID, record.slotID)
                 if CursorHasItem and CursorHasItem() then
                     C_Container.PickupContainerItem(destination.bagID, destination.slotID)
-                    if not CursorHasItem() then moved = moved + 1
-                    else ClearCursor(); unavailable = unavailable + 1 end
+                    if not CursorHasItem() then
+                        moved = moved + 1
+                        moveManifest[#moveManifest + 1] = {
+                            success = true, itemLink = record.itemLink, source = record.source,
+                            sourceBagID = record.bagID, sourceSlotID = record.slotID,
+                            destination = "PERSONAL_BANK",
+                            targetBagID = destination.bagID, targetSlotID = destination.slotID,
+                        }
+                    else
+                        ClearCursor(); unavailable = unavailable + 1
+                    end
                 else
                     unavailable = unavailable + 1
                 end
@@ -3484,15 +3558,17 @@ local function WGRGearFinderMoveRecordsToPersonalBank(records, description)
         end
     end
 
-    local message = "|cff33ff99WBGR:|r Moved " .. tostring(moved) .. " of " .. tostring(requested) .. " " .. tostring(description or "items") .. " to the Personal Bank."
-    if bankFull then message = message .. " Personal Bank is full."
-    elseif unavailable > 0 then message = message .. " " .. tostring(unavailable) .. " item(s) could not be moved." end
-    print(message)
+    if bankFull then
+        print("|cffffaa00WBGR:|r Moved " .. tostring(moved) .. " of " .. tostring(requested) .. " " .. tostring(description or "items") .. "; Personal Bank is full.")
+    elseif unavailable > 0 then
+        print("|cffffaa00WBGR:|r Moved " .. tostring(moved) .. " of " .. tostring(requested) .. " " .. tostring(description or "items") .. "; " .. tostring(unavailable) .. " item(s) could not be moved.")
+    end
 
     if moved > 0 and WGRAddRecentActivity then
         WGRAddRecentActivity(tostring(UnitName("player") or "Current character") .. " moved " .. tostring(moved) .. " character gear item" .. (moved == 1 and "" or "s") .. " to the Personal Bank.", "MOVE_PERSONAL_BANK")
     end
     WGRScheduleGearFinderRefresh(0.20)
+    return { moved = moved, requested = requested, unavailable = unavailable, manifest = moveManifest }
 end
 
 local function WGRGearFinderCreatePersonalBankButton(parent, records, x, y)
@@ -3598,6 +3674,7 @@ local function WGRGearFinderMoveRecordsToBags(
     records,
     description
 )
+    local moveManifest = {}
     local totalRequested =
         WGRGearFinderCountMovableRecords(
             records
@@ -3610,11 +3687,6 @@ local function WGRGearFinderMoveRecordsToBags(
         )
 
     if requested == 0 then
-        print(
-            "|cff33ff99WBGR:|r Nothing in "
-                .. tostring(description or "this group")
-                .. " needs to be moved to bags."
-        )
         return
     end
 
@@ -3700,6 +3772,11 @@ local function WGRGearFinderMoveRecordsToBags(
                     if not CursorHasItem()
                     then
                         moved = moved + 1
+                        moveManifest[#moveManifest + 1] = {
+                            success = true, itemLink = record.itemLink, source = record.source,
+                            sourceBagID = record.bagID, sourceSlotID = record.slotID,
+                            destination = "BAGS", targetBagID = targetBag, targetSlotID = targetSlot,
+                        }
                     else
                         -- Do not leave an item attached to the cursor.
                         ClearCursor()
@@ -3714,28 +3791,11 @@ local function WGRGearFinderMoveRecordsToBags(
         end
     end
 
-    local message =
-        "|cff33ff99WBGR:|r Moved "
-        .. tostring(moved)
-        .. " of "
-        .. tostring(requested)
-        .. " "
-        .. tostring(description or "items")
-        .. " to bags."
-
     if bagsFull then
-        message =
-            message
-            .. " Bags are full."
+        print("|cffffaa00WBGR:|r Moved " .. tostring(moved) .. " of " .. tostring(requested) .. " " .. tostring(description or "items") .. "; Bags are full.")
     elseif unavailable > 0 then
-        message =
-            message
-            .. " "
-            .. tostring(unavailable)
-            .. " item(s) could not be moved."
+        print("|cffffaa00WBGR:|r Moved " .. tostring(moved) .. " of " .. tostring(requested) .. " " .. tostring(description or "items") .. "; " .. tostring(unavailable) .. " item(s) could not be moved.")
     end
-
-    print(message)
 
     if moved > 0
         and WGRAddRecentActivity
@@ -3761,12 +3821,14 @@ local function WGRGearFinderMoveRecordsToBags(
     WGRScheduleGearFinderRefresh(
         0.20
     )
+    return { moved = moved, requested = requested, unavailable = unavailable, manifest = moveManifest }
 end
 
 local function WGRGearFinderDepositRecordsToWarband(
     records,
     description
 )
+    local moveManifest = {}
     if not WGRGearFinderIsWarbandBankAvailable() then
         print(
             "|cffff5555WBGR:|r Open the Warband Bank before moving items."
@@ -3786,11 +3848,6 @@ local function WGRGearFinderDepositRecordsToWarband(
         )
 
     if requested == 0 then
-        print(
-            "|cff33ff99WBGR:|r Nothing in "
-                .. tostring(description or "this group")
-                .. " needs to be moved."
-        )
         return
     end
 
@@ -3875,41 +3932,56 @@ local function WGRGearFinderDepositRecordsToWarband(
 
                     if not CursorHasItem() then
                         moved = moved + 1
+                        moveManifest[#moveManifest + 1] = {
+                            success = true,
+                            itemLink = record.itemLink,
+                            source = record.source,
+                            sourceBagID = record.bagID,
+                            sourceSlotID = record.slotID,
+                            destination = "WARBAND_BANK",
+                            targetBagID = targetBag,
+                            targetSlotID = targetSlot,
+                        }
                     else
                         ClearCursor()
                         unavailable =
                             unavailable + 1
+                        moveManifest[#moveManifest + 1] = {
+                            success = false,
+                            itemLink = record.itemLink,
+                            source = record.source,
+                            sourceBagID = record.bagID,
+                            sourceSlotID = record.slotID,
+                            destination = "WARBAND_BANK",
+                            targetBagID = targetBag,
+                            targetSlotID = targetSlot,
+                            reason = "cursor remained after destination pickup",
+                        }
                     end
                 else
                     unavailable =
                         unavailable + 1
+                    moveManifest[#moveManifest + 1] = {
+                        success = false,
+                        itemLink = record.itemLink,
+                        source = record.source,
+                        sourceBagID = record.bagID,
+                        sourceSlotID = record.slotID,
+                        destination = "WARBAND_BANK",
+                        targetBagID = targetBag,
+                        targetSlotID = targetSlot,
+                        reason = "source pickup did not place item on cursor",
+                    }
                 end
             end
         end
     end
 
-    local message =
-        "|cff33ff99WBGR:|r Moved "
-        .. tostring(moved)
-        .. " of "
-        .. tostring(requested)
-        .. " "
-        .. tostring(description or "items")
-        .. " to the Warband Bank."
-
     if warbandFull then
-        message =
-            message
-            .. " Warband Bank is full."
+        print("|cffffaa00WBGR:|r Moved " .. tostring(moved) .. " of " .. tostring(requested) .. " " .. tostring(description or "items") .. "; Warband Bank is full.")
     elseif unavailable > 0 then
-        message =
-            message
-            .. " "
-            .. tostring(unavailable)
-            .. " item(s) could not be moved."
+        print("|cffffaa00WBGR:|r Moved " .. tostring(moved) .. " of " .. tostring(requested) .. " " .. tostring(description or "items") .. "; " .. tostring(unavailable) .. " item(s) could not be moved.")
     end
-
-    print(message)
 
     if moved > 0
         and WGRAddRecentActivity
@@ -3948,6 +4020,13 @@ local function WGRGearFinderDepositRecordsToWarband(
             end
         )
     end
+
+    return {
+        moved = moved,
+        requested = requested,
+        unavailable = unavailable,
+        manifest = moveManifest,
+    }
 end
 
 local function WGRGearFinderCreateMoveButton(
@@ -4638,12 +4717,44 @@ local function WGRGearFinderChooseTargetEquipSlot(record)
     end
 
     local equipLoc = record.equipLoc
+    local instantInfo = record.itemLink and GetInstantItemInfo(record.itemLink)
+    equipLoc = equipLoc or (instantInfo and instantInfo.equipLoc)
+
     local armorSlot = equipLoc and WGRArmorEquipSlots[equipLoc]
     if armorSlot then return armorSlot end
 
     if WGROffhandEquipLocs[equipLoc] then return 17 end
 
-    if IsSupportedWeapon(record.itemLink) then return 16 end
+    if IsSupportedWeapon(record.itemLink) then
+        -- Respect weapons that Blizzard restricts to a specific hand.
+        if equipLoc == "INVTYPE_WEAPONMAINHAND" then return 16 end
+        if equipLoc == "INVTYPE_WEAPONOFFHAND" then return 17 end
+
+        -- Generic 1H/2H items are ambiguous to EquipItemByName.  When the
+        -- character is already using the same dual-wield weapon kind in both
+        -- hands, explicitly replace the weaker hand instead of letting WoW
+        -- default to Main Hand and potentially overwrite the better weapon.
+        local incomingKind = GetWeaponKind(record.itemLink)
+        local mainLink = GetInventoryItemLink("player", 16)
+        local offLink = GetInventoryItemLink("player", 17)
+        local mainKind = mainLink and GetWeaponKind(mainLink)
+        local offKind = offLink and GetWeaponKind(offLink)
+
+        if incomingKind
+            and mainKind == incomingKind
+            and offKind == incomingKind
+            and (incomingKind == "ONE_HAND" or incomingKind == "TWO_HAND")
+        then
+            local mainLevel = tonumber(GetItemLevel(mainLink)) or 0
+            local offLevel = tonumber(GetItemLevel(offLink)) or 0
+            if offLevel < mainLevel then
+                return 17
+            end
+            return 16
+        end
+
+        return 16
+    end
 
     local slots = equipLoc and WGRGlobalEquipSlots[equipLoc]
     if type(slots) ~= "table" or #slots == 0 then return nil end
@@ -4730,12 +4841,6 @@ local function WGRGearFinderEquipBagSlot(
             { itemLink = currentLink }
         )
 
-    print(
-        "|cff33ff99WBGR:|r Equip requested for "
-        .. tostring(itemName)
-        .. "."
-    )
-
     C_Item.EquipItemByName(
         currentLink,
         targetSlot
@@ -4745,6 +4850,81 @@ local function WGRGearFinderEquipBagSlot(
     -- until the player confirms, so do not report failure here.
     WGRScheduleGearFinderRefresh(0.50)
 
+    return true
+end
+
+local function WGRGearFinderMoveEquippedWeapon(record, targetSlot)
+    if not record or record.source ~= "EQUIPPED" then
+        return false
+    end
+
+    local sourceSlot = tonumber(record.slotID)
+    targetSlot = tonumber(targetSlot)
+
+    if not ((sourceSlot == 16 or sourceSlot == 17)
+        and (targetSlot == 16 or targetSlot == 17))
+    then
+        print("|cffff5555WBGR:|r Could not move equipped weapon: hand slot is unknown.")
+        return false
+    end
+
+    if sourceSlot == targetSlot then
+        WGRScheduleGearFinderRefresh(0.10)
+        return true
+    end
+
+    local currentLink = GetInventoryItemLink("player", sourceSlot)
+    if not currentLink
+        or not WGRGearFinderKnownItemMatches(currentLink, record.itemLink)
+    then
+        print("|cffff5555WBGR:|r Could not move equipped weapon: its equipped slot changed. Refresh Gear Finder.")
+        return false
+    end
+
+    if not PickupInventoryItem then
+        print("|cffff5555WBGR:|r Could not move equipped weapon: PickupInventoryItem is unavailable.")
+        return false
+    end
+
+    if CursorHasItem and CursorHasItem() then
+        ClearCursor()
+    end
+
+    -- Swap the exact equipped weapon into Gear Finder's intended hand. If the
+    -- destination hand is occupied, place that displaced weapon back into the
+    -- original hand so no item is left on the cursor.
+    PickupInventoryItem(sourceSlot)
+
+    if not (CursorHasItem and CursorHasItem()) then
+        print("|cffff5555WBGR:|r Could not pick up the equipped weapon.")
+        return false
+    end
+
+    PickupInventoryItem(targetSlot)
+
+    if CursorHasItem and CursorHasItem() then
+        PickupInventoryItem(sourceSlot)
+    end
+
+    if CursorHasItem and CursorHasItem() then
+        ClearCursor()
+        print("|cffff5555WBGR:|r Could not complete the equipped-weapon swap. Refresh Gear Finder.")
+        return false
+    end
+
+    local targetLink = GetInventoryItemLink("player", targetSlot)
+    if not targetLink
+        or not WGRGearFinderKnownItemMatches(targetLink, record.itemLink)
+    then
+        print("|cffff5555WBGR:|r Could not complete the equipped-weapon swap. Refresh Gear Finder.")
+        WGRScheduleGearFinderRefresh(0.10)
+        return false
+    end
+
+    local itemName = WGRGearFinderActionItemName(record)
+    local handName = targetSlot == 16 and "Main Hand" or "Off Hand"
+
+    WGRScheduleGearFinderRefresh(0.30)
     return true
 end
 
@@ -4783,15 +4963,20 @@ local function WGRGearFinderHandleRecommendationAction(record)
         return
     end
 
+    -- A paired-weapon recommendation can intentionally reuse an already
+    -- equipped weapon in the opposite hand. Move that exact physical equipped
+    -- item rather than treating EQ as a retrievable storage location.
+    if record.source == "EQUIPPED" then
+        WGRGearFinderMoveEquippedWeapon(
+            record,
+            targetSlot
+        )
+        return
+    end
+
     -- If the item is already in Bags, this is the second click:
     -- attempt to equip it into Gear Finder's intended slot.
     if record.source == "BAGS" then
-        print(
-            "|cff33ff99WBGR:|r Equipping "
-            .. tostring(itemName)
-            .. "..."
-        )
-
         WGRGearFinderEquipBagSlot(
             record.bagID,
             record.slotID,
@@ -4907,12 +5092,6 @@ local function WGRGearFinderHandleRecommendationAction(record)
         return
     end
 
-    print(
-        "|cff33ff99WBGR:|r Moved "
-        .. tostring(itemName)
-        .. " to Bags. Click Equip to equip it."
-    )
-
     WGRScheduleGearFinderRefresh(
         0.20
     )
@@ -4969,8 +5148,33 @@ local function WGRGearFinderCreateRecommendationActionButton(
         text
         or "Equip"
 
+    local moveTooltip = nil
+
     if record then
-        if record.source == "BAGS" then
+        local requestedTargetSlot =
+            tonumber(targetSlot)
+            or tonumber(record.targetEquipSlot)
+
+        if record.source == "EQUIPPED"
+            and (requestedTargetSlot == 16 or requestedTargetSlot == 17)
+        then
+            local currentSlot = tonumber(record.slotID)
+
+            -- Already equipped in the hand this recommendation wants: the EQ
+            -- location label is sufficient and no action button is needed.
+            if currentSlot == requestedTargetSlot then
+                button:Hide()
+                return nil
+            end
+
+            if requestedTargetSlot == 16 then
+                actionText = "> MH"
+                moveTooltip = "Move equipped weapon to Main Hand"
+            else
+                actionText = "> OH"
+                moveTooltip = "Move equipped weapon to Off Hand"
+            end
+        elseif record.source == "BAGS" then
             actionText = "Equip"
         elseif record.source == "PERSONAL_BANK"
             or record.source == "WARBAND_BANK"
@@ -4982,6 +5186,23 @@ local function WGRGearFinderCreateRecommendationActionButton(
     button:SetText(
         actionText
     )
+
+    if moveTooltip then
+        button:SetScript(
+            "OnEnter",
+            function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText(moveTooltip)
+                GameTooltip:Show()
+            end
+        )
+        button:SetScript(
+            "OnLeave",
+            function()
+                GameTooltip:Hide()
+            end
+        )
+    end
 
     local fontString =
         button:GetFontString()
@@ -5199,11 +5420,26 @@ local function WGRGearFinderCreateItemButton(
             )
         end
 
+        local override,overrideRecord
+        if WGRStorageCleanupGetCopyMark and record.bagID~=nil and record.slotID~=nil then
+            override,overrideRecord=WGRStorageCleanupGetCopyMark(record.bagID,record.slotID,record.itemLink,record.source)
+        end
+        if override=='DISPOSE' and WGRStorageCleanupIsDisposeCopy and
+            WGRStorageCleanupIsDisposeCopy(record.bagID,record.slotID,record.itemLink,record.source) then
+            GameTooltip:AddLine('|TInterface\\Buttons\\UI-GroupLoot-Pass-Up:14:14|t WBGR: DISPOSE ('..
+                (WGRStorageCleanupDisposeReasonLabel and WGRStorageCleanupDisposeReasonLabel(overrideRecord) or 'Manual Override')..')',.65,.65,.65)
+            GameTooltip:AddLine('Holder routing suspended for this physical copy',.85,.85,.85)
+        elseif override=='KEEP' then
+            GameTooltip:AddLine('|TInterface\\AddOns\\WarboundGearRouter\\WBGRKeepLock:18:18:0:0|t WBGR: KEEP (Manual Override)',.35,1,.45)
+            GameTooltip:AddLine('Protected from automatic disposal',.85,.85,.85)
+        end
         GameTooltip:Show()
 
         -- Gear Finder should show the same routing information as the physical
         -- item immediately. Shift still expands the normal WGR alternatives.
-        if WGRRenderRecommendationForItemTooltip then
+        if WGRRenderRecommendationForItemTooltip and not
+            (WGRStorageCleanupIsDisposeCopy and record.bagID~=nil and record.slotID~=nil
+                and WGRStorageCleanupIsDisposeCopy(record.bagID,record.slotID,record.itemLink,record.source)) then
             WGRRenderRecommendationForItemTooltip(
                 GameTooltip,
                 record.itemLink,
@@ -5250,6 +5486,45 @@ local function WGRGearFinderCreateItemButton(
                     rootDescription:CreateTitle(
                         itemName
                     )
+
+                    if WGRStorageCleanupGetSettings
+                        and record.bagID~=nil and record.slotID~=nil
+                        and (record.source=='BAGS' or record.source=='PERSONAL_BANK'
+                            or (record.source=='WARBAND_BANK' and WGRGearFinderIsWarbandBankOpen
+                                and WGRGearFinderIsWarbandBankOpen())) then
+                        local status=WGRStorageCleanupGetCopyMark and
+                            WGRStorageCleanupGetCopyMark(record.bagID,record.slotID,record.itemLink,record.source)
+                        local function OverrideAction(label,mode,clearExpected)
+                            rootDescription:CreateButton(label,function()
+                                local ok,reason
+                                if clearExpected then
+                                    ok,reason=WGRStorageCleanupClearCopyOverride(record.bagID,record.slotID,clearExpected,record.source)
+                                else
+                                    ok,reason=WGRStorageCleanupSetCopyMark(record.bagID,record.slotID,mode,'MANUAL',nil,nil,record.source)
+                                end
+                                if not ok then
+                                    print('|cffffaa00WBGR:|r Override unchanged: '..tostring(reason))
+                                end
+                                if ok then
+                                    if WGRStorageCleanupNotifyManualOverrideChanged then
+                                        WGRStorageCleanupNotifyManualOverrideChanged(clearExpected~=nil)
+                                    elseif WGRStorageCleanupRefreshVisibleAudit then
+                                        WGRStorageCleanupRefreshVisibleAudit()
+                                    end
+                                end
+                            end)
+                        end
+                        if status=='KEEP' then
+                            OverrideAction('Unkeep (return to automatic)',nil,'KEEP')
+                        else
+                            OverrideAction('Mark KEEP (protect copy)','KEEP')
+                        end
+                        if status=='DISPOSE' then
+                            OverrideAction('Undispose (restore original route)',nil,'DISPOSE')
+                        else
+                            OverrideAction('Mark DISPOSE (manual)','DISPOSE')
+                        end
+                    end
 
                     rootDescription:CreateButton(
                         "Ignore this item in WBGR",
@@ -6154,10 +6429,20 @@ local function WGRGearFinderRender(
             return code or "?"
         end
 
-        local function WeaponActionForOptions(options)
+        local function WeaponActionForOptions(options, targetSlot)
             local count = #(options or {})
             if count > 1 then return "CHOOSE ONE" end
-            if count == 1 and options[1].ownedBaseline then return "KEEP" end
+            if count == 1 and options[1].ownedBaseline then
+                local record = options[1]
+                if record.source == "EQUIPPED"
+                    and tonumber(record.slotID)
+                    and tonumber(targetSlot)
+                    and tonumber(record.slotID) ~= tonumber(targetSlot)
+                then
+                    return "MOVE"
+                end
+                return "KEEP"
+            end
             if count == 1 then return "EQUIP" end
             return ""
         end
@@ -6180,7 +6465,7 @@ local function WGRGearFinderRender(
         end
 
         local function AddWeaponSingleAction(left, topY, width, options, targetSlot)
-            local text = WeaponActionForOptions(options)
+            local text = WeaponActionForOptions(options, targetSlot)
             if text == "KEEP" then
                 local keepWidth = 32
 
@@ -6194,7 +6479,7 @@ local function WGRGearFinderRender(
                 )
 
                 return 18
-            elseif text == "EQUIP" then
+            elseif text == "EQUIP" or text == "MOVE" then
                 WGRGearFinderCreateRecommendationActionButton(
                     content,
                     left
@@ -6202,7 +6487,7 @@ local function WGRGearFinderRender(
                         + math.floor((42 - 32) / 2),
                     topY,
                     32,
-                    "Equip",
+                    text == "MOVE" and nil or "Equip",
                     options[1],
                     targetSlot
                 )
@@ -7477,6 +7762,56 @@ local function WGRGearFinderRender(
     end
 end
 
+-- v0.68g: Explicit To Do action only. Re-read the CURRENT, accessible
+-- source and the CURRENT normal recommendation; To Do counts are not physical
+-- item identities. Never change the routing or movement lists here.
+function WGRGearFinderGetHolderBoundCleanupCandidates(source,cooperate)
+    if source~='BAGS' and source~='PERSONAL_BANK' then return {},0,'Unsupported source' end
+    if not (WGRStorageCleanupGetSettings and WGRStorageCleanupGetSettings().enabled) then
+        return {},0,'Storage Cleanup is OFF'
+    end
+    if source=='PERSONAL_BANK' and not WGRGearFinderIsPersonalBankAvailable() then
+        return {},0,'Open Personal Bank to scan its outgoing items'
+    end
+    local currentName=WGRGearFinderCurrentName()
+    if not currentName or (WGRIsCharacterRemoved and WGRIsCharacterRemoved(currentName)) then
+        return {},0,'Current character is unavailable or Removed'
+    end
+    local records=source=='BAGS' and WGRGearFinderScanBags() or WGRGearFinderScanPersonalBank()
+    local holderBound={}
+    local outgoing=0
+    if WGRBeginRoutingEvaluationCache then WGRBeginRoutingEvaluationCache() end
+    for index,record in ipairs(records or {}) do
+        if cooperate and index>1 and (index-1)%4==0 then
+            -- End the short-lived routing cache BEFORE yielding to WoW.
+            -- No global evaluation cache remains open across frames.
+            if WGREndRoutingEvaluationCache then WGREndRoutingEvaluationCache() end
+            cooperate()
+            if WGRBeginRoutingEvaluationCache then WGRBeginRoutingEvaluationCache() end
+        end
+        local result,status=WGRBuildLoadedItemRecommendation(record.itemLink)
+        if status=='ready' and result and result.name
+            and not (WGRStorageCleanupIsDisposeCopy and
+                WGRStorageCleanupIsDisposeCopy(record.bagID,record.slotID,record.itemLink,record.source))
+            and not WGRGearFinderSameCharacter(result.name,currentName)
+            and (result.kind=='upgrade' or result.kind=='future_upgrade'
+                or result.kind=='holder' or result.kind=='unknown') then
+            outgoing=outgoing+1
+            -- Only the explicit holder kind qualifies. Even a +1 current
+            -- upgrade, future_upgrade, or uncertain route must remain intact.
+            if result.kind=='holder' then
+                holderBound[#holderBound+1]={itemLink=record.itemLink,
+                    bagID=record.bagID,slotID=record.slotID,source=source,
+                    guid=WGRStorageCleanupGetPhysicalCopyGUID and
+                        WGRStorageCleanupGetPhysicalCopyGUID(record.bagID,record.slotID,record.itemLink),
+                    cleanupOwner=currentName,normalRecipient=result.name}
+            end
+        end
+    end
+    if WGREndRoutingEvaluationCache then WGREndRoutingEvaluationCache() end
+    return holderBound,outgoing,nil
+end
+
 local function WGRGearFinderCollectCurrentPersonalBankOutgoing()
     if not WGRGearFinderIsPersonalBankAvailable() then
         return {}
@@ -7505,6 +7840,8 @@ local function WGRGearFinderCollectCurrentPersonalBankOutgoing()
 
         if recommendation
             and recommendation.name
+            and not (WGRStorageCleanupIsDisposeCopy and
+                WGRStorageCleanupIsDisposeCopy(record.bagID,record.slotID,record.itemLink,record.source))
             and not WGRGearFinderSameCharacter(
                 recommendation.name,
                 currentName
@@ -7560,9 +7897,6 @@ function WGRGearFinderMoveCurrentPersonalBankOutgoingToBags()
         WGRGearFinderCollectCurrentPersonalBankOutgoing()
 
     if #records == 0 then
-        print(
-            "|cff33ff99WBGR:|r No routed Personal Bank items currently need to move."
-        )
         WGRGearFinderRefreshOutgoingTodoAfterMove()
         return
     end
@@ -7594,9 +7928,6 @@ function WGRGearFinderDepositCurrentPersonalBankOutgoingToWarband()
         WGRGearFinderCollectCurrentPersonalBankOutgoing()
 
     if #records == 0 then
-        print(
-            "|cff33ff99WBGR:|r No routed Personal Bank items currently need to be deposited."
-        )
         WGRGearFinderRefreshOutgoingTodoAfterMove()
         return
     end
@@ -7641,6 +7972,8 @@ function WGRGearFinderDepositCurrentOutgoingToWarband()
 
                 if recommendation
                     and recommendation.name
+                    and not (WGRStorageCleanupIsDisposeCopy and
+                        WGRStorageCleanupIsDisposeCopy(bagID,slotID,itemLink))
                     and not WGRGearFinderSameCharacter(
                         recommendation.name,
                         currentName
@@ -7666,9 +7999,6 @@ function WGRGearFinderDepositCurrentOutgoingToWarband()
     if WGREndRoutingEvaluationCache then WGREndRoutingEvaluationCache() end
 
     if #carried == 0 then
-        print(
-            "|cff33ff99WBGR:|r No routed bag items currently need to be deposited."
-        )
         if WGRRefreshTodoPage then
             WGRRefreshTodoPage()
         end
@@ -9066,3 +9396,17 @@ WGRGearFinderEventFrame:SetScript(
         )
     end
 )
+
+-- Storage Cleanup reuses the ordinary Gear Finder movement routines. Movement
+-- is a user convenience only: it does not authorize disposal, freeze a batch,
+-- or replace the explicit Storage Cleanup scan / manual KEEP-DISPOSE overrides.
+function WGRStorageCleanupMoveRecords(records, destination)
+    if type(records) ~= "table" or #records == 0 then return end
+    if destination == "BAGS" then
+        return WGRGearFinderMoveRecordsToBags(records,"Storage Cleanup surplus")
+    elseif destination == "PERSONAL_BANK" then
+        return WGRGearFinderMoveRecordsToPersonalBank(records,"Storage Cleanup surplus")
+    elseif destination == "WARBAND_BANK" then
+        return WGRGearFinderDepositRecordsToWarband(records,"Storage Cleanup surplus")
+    end
+end

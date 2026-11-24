@@ -281,9 +281,11 @@ function WGRRequestInventoryRefresh(delay, forceAll, allowWhenPaused)
     WGRScheduleInventoryRefresh(delay, forceAll, allowWhenPaused)
 end
 
--- Forward declaration: PLAYER_ENTERING_WORLD can call this before the
--- implementation appears later in the file.
+-- Forward declarations: startup can call these before the implementations
+-- appear later in the file.
 WGRCreateMinimapButton = nil
+WGRRegisterDataBrokerLauncher = nil
+WGRRegisterBlizzardSettingsPage = nil
 
 eventFrame:SetScript(
     "OnEvent",
@@ -302,6 +304,8 @@ eventFrame:SetScript(
             QueueCleanupRefresh()
             QueueStartupOverlayRefreshes()
             WGRCreateMinimapButton()
+            WGRRegisterDataBrokerLauncher()
+            WGRRegisterBlizzardSettingsPage()
 
             C_Timer.After(
                 3.25,
@@ -439,6 +443,8 @@ eventFrame:SetScript(
         elseif event == "ADDON_LOADED" then
             InstallBagVisibilityHooks()
             QueueCleanupRefresh()
+            WGRRegisterDataBrokerLauncher()
+            WGRRegisterBlizzardSettingsPage()
 
             C_Timer.After(
                 0.50,
@@ -696,55 +702,8 @@ WGRCreateMinimapButton = function()
                 "ANCHOR_LEFT"
             )
 
-            GameTooltip:AddLine(
-                "Warbound Gear Router",
-                1.00,
-                0.82,
-                0.00
-            )
-
-            local tracked =
-                WGRMailGetTrackedList()
-
-            GameTooltip:AddLine(
-                string.format(
-                    "%d character%s with mail waiting",
-                    #tracked,
-                    #tracked == 1
-                        and ""
-                        or "s"
-                ),
-                1.00,
-                1.00,
-                1.00
-            )
-
-            if #tracked > 0 then
-                GameTooltip:AddLine(
-                    "Soonest: "
-                        .. tracked[1].name
-                        .. " - "
-                        .. WGRMailFormatRemaining(
-                            tracked[1].remaining
-                        ),
-                    1.00,
-                    0.82,
-                    0.20
-                )
-            end
-
-            GameTooltip:AddLine(
-                "Left-click: Open WBGR",
-                0.75,
-                0.75,
-                0.75
-            )
-
-            GameTooltip:AddLine(
-                "Drag: Move button",
-                0.75,
-                0.75,
-                0.75
+            WGRPopulateLauncherTooltip(
+                GameTooltip
             )
 
             GameTooltip:Show()
@@ -821,4 +780,326 @@ WGRCreateMinimapButton = function()
         WarboundGearRouterDB.minimap.shown
             ~= false
     )
+end
+
+-- ============================================================
+-- BLIZZARD ADDON COMPARTMENT
+-- ============================================================
+
+function WGRAddonCompartment_OnClick(_, buttonName)
+    if buttonName == nil
+        or buttonName == "LeftButton"
+    then
+        WGRToggleMainWindow()
+    end
+end
+
+-- ============================================================
+-- BLIZZARD OPTIONS > ADDONS PAGE
+-- ============================================================
+
+local WGRBlizzardSettingsCategory =
+    nil
+
+WGRRegisterBlizzardSettingsPage = function()
+    if WGRBlizzardSettingsCategory
+        or not Settings
+        or type(Settings.RegisterCanvasLayoutCategory) ~= "function"
+        or type(Settings.RegisterAddOnCategory) ~= "function"
+    then
+        return
+    end
+
+    local panel =
+        CreateFrame("Frame")
+
+    local icon =
+        panel:CreateTexture(
+            nil,
+            "ARTWORK"
+        )
+
+    icon:SetSize(
+        64,
+        64
+    )
+
+    icon:SetPoint(
+        "TOPLEFT",
+        panel,
+        "TOPLEFT",
+        28,
+        -28
+    )
+
+    icon:SetTexture(
+        "Interface\\AddOns\\WarboundGearRouter\\WBGRIcon"
+    )
+
+    local title =
+        panel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontNormalLarge"
+        )
+
+    title:SetPoint(
+        "TOPLEFT",
+        icon,
+        "TOPRIGHT",
+        16,
+        -4
+    )
+
+    title:SetText(
+        "Warbound Gear Router"
+    )
+
+    local description =
+        panel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontHighlight"
+        )
+
+    description:SetPoint(
+        "TOPLEFT",
+        title,
+        "BOTTOMLEFT",
+        0,
+        -10
+    )
+
+    description:SetText(
+        "WBGR settings are managed in the main addon window."
+    )
+
+    local openButton =
+        CreateFrame(
+            "Button",
+            nil,
+            panel,
+            "UIPanelButtonTemplate"
+        )
+
+    openButton:SetSize(
+        190,
+        28
+    )
+
+    openButton:SetPoint(
+        "TOPLEFT",
+        panel,
+        "TOPLEFT",
+        28,
+        -118
+    )
+
+    openButton:SetText(
+        "Open WBGR Settings"
+    )
+
+    openButton:SetScript(
+        "OnClick",
+        function()
+            if SettingsPanel
+                and SettingsPanel.IsShown
+                and SettingsPanel:IsShown()
+            then
+                if HideUIPanel then
+                    HideUIPanel(
+                        SettingsPanel
+                    )
+                else
+                    SettingsPanel:Hide()
+                end
+            end
+
+            if WGROpenSettingsWindow then
+                WGROpenSettingsWindow()
+            elseif WGRToggleMainWindow then
+                WGRToggleMainWindow()
+            end
+        end
+    )
+
+    local slashHint =
+        panel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontHighlightSmall"
+        )
+
+    slashHint:SetPoint(
+        "TOPLEFT",
+        openButton,
+        "BOTTOMLEFT",
+        0,
+        -14
+    )
+
+    slashHint:SetText(
+        "/wbgr - Open Warbound Gear Router"
+    )
+
+    local version =
+        C_AddOns
+        and C_AddOns.GetAddOnMetadata
+        and C_AddOns.GetAddOnMetadata(
+            "WarboundGearRouter",
+            "Version"
+        )
+        or "Unknown"
+
+    local versionText =
+        panel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontDisableSmall"
+        )
+
+    versionText:SetPoint(
+        "TOPLEFT",
+        slashHint,
+        "BOTTOMLEFT",
+        0,
+        -10
+    )
+
+    versionText:SetText(
+        "Version: "
+            .. tostring(version)
+    )
+
+    local category =
+        Settings.RegisterCanvasLayoutCategory(
+            panel,
+            "Warbound Gear Router"
+        )
+
+    Settings.RegisterAddOnCategory(
+        category
+    )
+
+    WGRBlizzardSettingsCategory =
+        category
+end
+
+-- ============================================================
+-- LIBDATABROKER LAUNCHER
+-- ============================================================
+
+local WGRDataBrokerLauncher =
+    nil
+
+WGRPopulateLauncherTooltip = function(tooltip)
+    if not tooltip then
+        return
+    end
+
+    tooltip:AddLine(
+        "Warbound Gear Router",
+        1.00,
+        0.82,
+        0.00
+    )
+
+    local tracked =
+        WGRMailGetTrackedList()
+
+    tooltip:AddLine(
+        string.format(
+            "%d character%s with mail waiting",
+            #tracked,
+            #tracked == 1
+                and ""
+                or "s"
+        ),
+        1.00,
+        1.00,
+        1.00
+    )
+
+    if #tracked > 0 then
+        tooltip:AddLine(
+            "Soonest: "
+                .. tracked[1].name
+                .. " - "
+                .. WGRMailFormatRemaining(
+                    tracked[1].remaining
+                ),
+            1.00,
+            0.82,
+            0.20
+        )
+    end
+
+    tooltip:AddLine(
+        "Left-click: Open WBGR",
+        0.75,
+        0.75,
+        0.75
+    )
+
+    tooltip:AddLine(
+        "Drag: Move button",
+        0.75,
+        0.75,
+        0.75
+    )
+end
+
+WGRRegisterDataBrokerLauncher = function()
+    if WGRDataBrokerLauncher
+        or not LibStub
+    then
+        return
+    end
+
+    local ldb =
+        LibStub(
+            "LibDataBroker-1.1",
+            true
+        )
+
+    if not ldb
+        or type(ldb.NewDataObject) ~= "function"
+    then
+        return
+    end
+
+    if type(ldb.GetDataObjectByName) == "function" then
+        local existing =
+            ldb:GetDataObjectByName(
+                "Warbound Gear Router"
+            )
+
+        if existing then
+            WGRDataBrokerLauncher =
+                existing
+            return
+        end
+    end
+
+    WGRDataBrokerLauncher =
+        ldb:NewDataObject(
+            "Warbound Gear Router",
+            {
+                type = "launcher",
+                label = "WBGR",
+                icon = "Interface\\AddOns\\WarboundGearRouter\\WBGRIcon",
+                OnClick = function(_, button)
+                    if button == nil
+                        or button == "LeftButton"
+                    then
+                        WGRToggleMainWindow()
+                    end
+                end,
+                OnTooltipShow = function(tooltip)
+                    WGRPopulateLauncherTooltip(
+                        tooltip
+                    )
+                end,
+            }
+        )
 end

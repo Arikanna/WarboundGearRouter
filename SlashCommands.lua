@@ -27,57 +27,10 @@ SlashCmdList[
     end
 
     if command == "help" then
-        print(
-            "|cff00ff00Warbound Gear Router|r"
-        )
-
-        print(
-            "Version "
-            .. WGRGetAddonMetadata(
-                "Version",
-                "Unknown"
-            )
-        )
-
-        print(
-            "|cffffff00/wbgr|r - open Warbound Gear Router"
-        )
-
-        print(
-            "|cffffff00/wbgr mailrouter|r - open the Mail Router while at a mailbox"
-        )
-
-        print(
-            "|cffffff00/wbgr mailcheck|r - open the WBGR Mail page"
-        )
-
-        print(
-            "|cffffff00/wbgr cleanup|r - rescan and refresh gear overlays"
-        )
-
-        print(
-            "|cffffff00/wbgr ignore|r - ignore the item currently under your mouse"
-        )
-
-        print(
-            "|cffffff00/wbgr unignore|r - stop ignoring the item currently under your mouse"
-        )
-
-        print(
-            "|cffffff00/wbgr pause|r - pause live routing tooltips and overlay scans"
-        )
-
-        print(
-            "|cffffff00/wbgr resume|r - resume live routing and rebuild overlays"
-        )
-
-        print(
-        )
-
-        print(
-            "Additional diagnostic commands are available when troubleshooting."
-        )
-
+        print("|cff00ff00Warbound Gear Router|r - Version " .. WGRGetAddonMetadata("Version", "Unknown"))
+        for _, entry in ipairs(WGRPublicCommandHelp or {}) do
+            print("|cffffff00" .. entry[1] .. "|r - " .. entry[2])
+        end
         return
     end
 
@@ -148,6 +101,81 @@ SlashCmdList[
         end
 
         print("Use |cffffff00/wbgr perf reset|r before a clean test if needed.")
+        return
+    end
+
+    if command=='markdiag' then
+        if WGRStorageCleanupDiagnoseManualWBK then WGRStorageCleanupDiagnoseManualWBK() end
+        return
+    end
+
+    if command=='disposemaildebug' then
+        if WGRDisposalMailDiagnoseCurrent then WGRDisposalMailDiagnoseCurrent() end
+        return
+    end
+    if command=='recoverdispose' then
+        local b,s,id=tostring(rest or ''):match('^(%-?%d+)%s+(%d+)%s*(%d*)$')
+        local bag,slot=tonumber(b),tonumber(s)
+        if not bag or not slot then
+            if tostring(rest or ''):match('%S') then
+                print('|cffffaa00WBGR:|r Usage: /wbgr recoverdispose while hovering (or <bag> <slot> [batchID]).')
+                return
+            end
+            local errorText
+            if WGRStorageCleanupHoveredPhysicalCopy then
+                bag,slot,errorText=WGRStorageCleanupHoveredPhysicalCopy()
+            end
+            if not bag or not slot then
+                print('|cffffaa00WBGR:|r '..tostring(errorText or 'Hover over an accessible item first.'))
+                return
+            end
+        end
+        local ok,message=WGRDisposalMailRequestManualRecovery and
+            WGRDisposalMailRequestManualRecovery(bag,slot,id and id~='' and tonumber(id) or nil)
+        print((ok and '|cff33ff99WBGR:|r ' or '|cffffaa00WBGR:|r ')..tostring(message))
+        return
+    end
+
+    if command=='dispose' or command=='undispose'
+        or command=='keep' or command=='unkeep' then
+        local bag,slot=tostring(rest or ''):match('^(%-?%d+)%s+(%d+)$')
+        bag,slot=tonumber(bag),tonumber(slot)
+        if not bag or not slot then
+            if tostring(rest or ''):match('%S') then
+                print('|cffffaa00WBGR:|r Usage: /wbgr '..command..' while hovering over a physical item (or specify <bag> <slot>).')
+                return
+            end
+            local errorText
+            if WGRStorageCleanupHoveredPhysicalCopy then
+                bag,slot,errorText=WGRStorageCleanupHoveredPhysicalCopy()
+            end
+            if not bag or not slot then
+                print('|cffffaa00WBGR:|r '..tostring(errorText or 'Hover over an accessible item first.'))
+                return
+            end
+        end
+        local ok,message
+        if command=='unkeep' or command=='undispose' then
+            if WGRStorageCleanupClearCopyOverride then
+                ok,message=WGRStorageCleanupClearCopyOverride(bag,slot,
+                    command=='unkeep' and 'KEEP' or 'DISPOSE')
+            end
+        else
+            if WGRStorageCleanupSetCopyMark then
+                ok,message=WGRStorageCleanupSetCopyMark(bag,slot,
+                    command=='keep' and 'KEEP' or 'DISPOSE','MANUAL')
+            end
+        end
+        if ok then
+            print('|cff33ff99WBGR:|r '..command:upper()..': '..tostring(message))
+            if WGRStorageCleanupNotifyManualOverrideChanged then
+                WGRStorageCleanupNotifyManualOverrideChanged(command=='unkeep' or command=='undispose')
+            elseif WGRStorageCleanupRefreshVisibleAudit then
+                WGRStorageCleanupRefreshVisibleAudit()
+            end
+        else
+            print('|cffffaa00WBGR:|r Override unchanged: '..tostring(message))
+        end
         return
     end
 
@@ -468,7 +496,7 @@ SlashCmdList[
     end
 
     if command == "mailcheck" then
-        WGRMailShowTracker()
+        WGRMailShowTracker(true)
         return
     end
 
@@ -977,7 +1005,7 @@ SlashCmdList[
     end
 
 
-    if command == "cleanup" then
+    if command == "overlay" or command == "cleanup" then
         if WGRRoutingIsPaused() then
             print(
                 "|cffffff00WBGR routing is paused.|r Use |cffffff00/wbgr resume|r before refreshing overlays."
@@ -985,14 +1013,7 @@ SlashCmdList[
             return
         end
 
-        local visible, evaluated =
-            RefreshBagnonCleanupOverlays()
-
-        print(string.format(
-            "|cff00ff00WBGR cleanup refreshed.|r Visible Bagnon buttons: %d; evaluated personal-storage buttons: %d",
-            visible or 0,
-            evaluated or 0
-        ))
+        RefreshBagnonCleanupOverlays()
 
         return
     end

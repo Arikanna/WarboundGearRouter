@@ -6,10 +6,53 @@
 -- ============================================================
 WGRMail = {
     frame=nil, rows={}, destinations={}, prepareAll=false,
-    waitingForSend=false, preparedRecipient=nil, preparedCount=0, mailboxOpen=false,
+    waitingForSend=false, preparedRecipient=nil, preparedSubject=nil, preparedCount=0, mailboxOpen=false,
+    preparedAttachmentLinks=nil, preparedAttachmentCounts=nil,
+    preparedReady=false, preparedStableSince=nil, preparedStableChecks=0,
+    removingPreparedAttachment=false,
     ownsDraft=false, replacingDraft=false,
+    preparedDisposalDraft=nil,pendingDisposalSendValid=false,
 }
 local WGR_MAIL_MAX = ATTACHMENTS_MAX_SEND or 12
+local WGR_MAIL_PREPARED_STABLE_SECONDS = 0.30
+
+local function WGRMailResetPreparedReadiness()
+    WGRMail.preparedReady = false
+    WGRMail.preparedStableSince = nil
+    WGRMail.preparedStableChecks = 0
+end
+
+local function WGRMailUpdatePreparedReadiness(matches)
+    if not matches then
+        WGRMailResetPreparedReadiness()
+        return false
+    end
+
+    if WGRMail.preparedReady then
+        return true
+    end
+
+    local now = GetTime and GetTime() or 0
+
+    if not WGRMail.preparedStableSince then
+        WGRMail.preparedStableSince = now
+        WGRMail.preparedStableChecks = 1
+        return false
+    end
+
+    WGRMail.preparedStableChecks =
+        (WGRMail.preparedStableChecks or 0) + 1
+
+    local elapsed = now - WGRMail.preparedStableSince
+    if WGRMail.preparedStableChecks >= 2
+        and elapsed >= WGR_MAIL_PREPARED_STABLE_SECONDS
+    then
+        WGRMail.preparedReady = true
+        return true
+    end
+
+    return false
+end
 
 -- Gear Search MAIL tracking is intentionally separate from the existing
 -- recipient mail-reminder state. It records physical item location only.
@@ -787,11 +830,18 @@ function WGRMailReconcileTrackedGearInbox()
                     )
                     promotedFromMailToBag = true
                     changed = true
+                elseif inboxCount == 0
+                    and type(item.sentAt) == 'number'
+                    and (time() - item.sentAt) > (48 * 60 * 60) then
+                    -- Only the actual recipient's opened, empty inbox can
+                    -- retire an unobserved delivery, and only once the send
+                    -- is well past normal delivery latency. Preserve legacy
+                    -- records with no trustworthy sentAt rather than invent
+                    -- a timestamp. Recent/in-transit mail remains tracked.
+                    changed = true
                 else
-                    -- Until at least one expected attachment has been
-                    -- positively observed, do not erase a freshly-sent
-                    -- record merely because inbox population can lag behind
-                    -- MAIL_SHOW/MAIL_INBOX_UPDATE.
+                    -- A recently sent or undated record cannot be dismissed
+                    -- solely because the inbox is currently empty.
                     retained[#retained + 1] = item
                 end
             else
@@ -851,6 +901,99 @@ end
 -- Forward declaration: early draft-clear callbacks rescan before the
 -- implementation appears later in this module.
 local WGRMailScan
+local WGRMailRefreshPreparedSendButton
+local WGRMailRefreshPreparedDraftPanel
+
+-- The normal Blizzard Send Mail UI is available only when its frame and
+-- Send Mail tab are effectively visible. IsShown() alone is insufficient:
+-- replacement mailbox UIs can leave Blizzard child frames in their shown
+-- state while hiding a parent, which makes the tab unusable on screen.
+local function WGRMailFrameIsEffectivelyVisible(frame)
+    if not frame then
+        return false
+    end
+
+    local visible = nil
+
+    if frame.IsVisible then
+        visible = frame:IsVisible() == true
+    else
+        -- Defensive fallback for stripped test/mocked frames. Retail Frames
+        -- have IsVisible(), but IsShown() is still better than assuming a
+        -- missing visibility method means the frame is usable.
+        visible = frame.IsShown
+            and frame:IsShown() == true
+    end
+
+    if not visible then
+        return false
+    end
+
+    -- Replacement mailbox UIs can leave Blizzard's MailFrame hierarchy
+    -- technically visible while suppressing it with alpha. IsVisible() does
+    -- not account for alpha, so require a genuinely rendered frame too.
+    local alpha = nil
+    if frame.GetEffectiveAlpha then
+        alpha = frame:GetEffectiveAlpha()
+    elseif frame.GetAlpha then
+        alpha = frame:GetAlpha()
+    end
+
+    if type(alpha) == "number" and alpha <= 0.01 then
+        return false
+    end
+
+    -- Treat a collapsed or effectively zero-scale Blizzard control as
+    -- unavailable even if it remains shown in the frame hierarchy.
+    if frame.GetEffectiveScale then
+        local scale = frame:GetEffectiveScale()
+        if type(scale) == "number" and scale <= 0.01 then
+            return false
+        end
+    end
+
+    -- Finally require the frame to intersect the visible UIParent rectangle
+    -- when both rectangles are available. This covers replacement UIs that
+    -- park Blizzard's mailbox off-screen rather than hiding it.
+    if UIParent
+        and frame.GetLeft
+        and frame.GetRight
+        and frame.GetTop
+        and frame.GetBottom
+        and UIParent.GetLeft
+        and UIParent.GetRight
+        and UIParent.GetTop
+        and UIParent.GetBottom
+    then
+        local left = frame:GetLeft()
+        local right = frame:GetRight()
+        local top = frame:GetTop()
+        local bottom = frame:GetBottom()
+        local parentLeft = UIParent:GetLeft()
+        local parentRight = UIParent:GetRight()
+        local parentTop = UIParent:GetTop()
+        local parentBottom = UIParent:GetBottom()
+
+        if left and right and top and bottom
+            and parentLeft and parentRight and parentTop and parentBottom
+            and (
+                right <= parentLeft
+                or left >= parentRight
+                or top <= parentBottom
+                or bottom >= parentTop
+            )
+        then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function WGRMailUsingBlizzardSendUI()
+    return WGRMailFrameIsEffectivelyVisible(MailFrame)
+        and WGRMailFrameIsEffectivelyVisible(MailFrameTab2)
+end
 
 local function WGRMailStatus(text,r,g,b)
     if WGRMail.frame and WGRMail.frame.status then
@@ -860,12 +1003,47 @@ local function WGRMailStatus(text,r,g,b)
 end
 
 local function WGRMailStop(text)
+    -- If WBGR owns an outgoing draft that is hidden behind a replacement
+    -- mailbox UI, abandoning Mail Router must return those attachments to
+    -- Bags. Never leave an invisible draft armed after Stop/close/error.
+    if WGRMail.mailboxOpen
+        and WGRMail.ownsDraft
+        and not WGRMailUsingBlizzardSendUI()
+    then
+        for attachmentIndex = WGR_MAIL_MAX, 1, -1 do
+            if GetSendMailItem(attachmentIndex) then
+                if RemoveSendMailItem then
+                    RemoveSendMailItem(attachmentIndex)
+                else
+                    ClickSendMailItemButton(attachmentIndex)
+                end
+
+                if CursorHasItem and CursorHasItem() and ClearCursor then
+                    ClearCursor()
+                end
+            end
+        end
+    end
+
     WGRMail.prepareAll=false
     WGRMail.waitingForSend=false
     WGRMail.preparedRecipient=nil
+    WGRMail.preparedSubject=nil
     WGRMail.preparedCount=0
+    WGRMail.preparedAttachmentLinks=nil
+    WGRMail.preparedAttachmentCounts=nil
+    WGRMailResetPreparedReadiness()
+    WGRMail.preparedDisposalDraft=nil
+    WGRMail.pendingDisposalSendValid=false
+    WGRMail.pendingSendRecipient=nil
+    WGRMail.pendingGearDraft=nil
+    WGRMail.ownsDraft=false
+    WGRMail.removingPreparedAttachment=false
     if WGRMail.frame and WGRMail.frame.prepareAllButton then
         WGRMail.frame.prepareAllButton:SetText("Prepare All")
+    end
+    if WGRMailRefreshPreparedSendButton then
+        WGRMailRefreshPreparedSendButton()
     end
     if text then WGRMailStatus(text) end
 end
@@ -927,17 +1105,150 @@ local function WGRMailCountCurrentDraftItems()
     return count
 end
 
+local function WGRMailCurrentAttachmentSnapshot()
+    local links = {}
+    local counts = {}
+
+    for index = 1, WGR_MAIL_MAX do
+        local link =
+            GetSendMailItemLink
+            and GetSendMailItemLink(index)
+            or nil
+
+        if link then
+            links[#links + 1] = link
+            counts[link] = (counts[link] or 0) + 1
+        end
+    end
+
+    return links, counts
+end
+
+local function WGRMailStorePreparedAttachmentSnapshot()
+    local links, counts =
+        WGRMailCurrentAttachmentSnapshot()
+
+    WGRMail.preparedAttachmentLinks = links
+    WGRMail.preparedAttachmentCounts = counts
+    WGRMail.preparedCount = #links
+    WGRMailResetPreparedReadiness()
+
+    return #links
+end
+
+local function WGRMailPreparedAttachmentsMatch()
+    local expectedLinks =
+        WGRMail.preparedAttachmentLinks
+    local expectedCounts =
+        WGRMail.preparedAttachmentCounts
+
+    if type(expectedLinks) ~= "table"
+        or type(expectedCounts) ~= "table"
+        or #expectedLinks <= 0
+    then
+        return false, 0
+    end
+
+    local currentLinks, currentCounts =
+        WGRMailCurrentAttachmentSnapshot()
+
+    if #currentLinks ~= #expectedLinks then
+        return false, #currentLinks
+    end
+
+    for link, count in pairs(expectedCounts) do
+        if currentCounts[link] ~= count then
+            return false, #currentLinks
+        end
+    end
+
+    for link, count in pairs(currentCounts) do
+        if expectedCounts[link] ~= count then
+            return false, #currentLinks
+        end
+    end
+
+    return true, #currentLinks
+end
+
+local function WGRMailAttachmentCountsForLinks(links)
+    local counts = {}
+
+    for _, link in ipairs(links or {}) do
+        counts[link] = (counts[link] or 0) + 1
+    end
+
+    return counts
+end
+
+local function WGRMailAttachmentSnapshotMatchesLinks(expectedLinks)
+    local currentLinks, currentCounts = WGRMailCurrentAttachmentSnapshot()
+    local expectedCounts = WGRMailAttachmentCountsForLinks(expectedLinks)
+
+    if #currentLinks ~= #(expectedLinks or {}) then
+        return false, currentLinks, currentCounts
+    end
+
+    for link, count in pairs(expectedCounts) do
+        if currentCounts[link] ~= count then
+            return false, currentLinks, currentCounts
+        end
+    end
+
+    for link, count in pairs(currentCounts) do
+        if expectedCounts[link] ~= count then
+            return false, currentLinks, currentCounts
+        end
+    end
+
+    return true, currentLinks, currentCounts
+end
+
+local function WGRMailCurrentAttachmentEntries()
+    local entries = {}
+
+    for slot = 1, WGR_MAIL_MAX do
+        local link = GetSendMailItemLink and GetSendMailItemLink(slot) or nil
+        if link then
+            entries[#entries + 1] = { slot = slot, link = link }
+        end
+    end
+
+    return entries
+end
+
 local function WGRMailDraftClear()
-    if WGRMailText(SendMailNameEditBox) ~= "" then return false end
-    if WGRMailText(SendMailSubjectEditBox) ~= "" then return false end
-    if WGRMailText(SendMailBodyEditBox) ~= "" then return false end
+    -- Blizzard's recipient/subject/body fields are UI-owned state. Only treat
+    -- them as part of the draft when the normal Blizzard Send Mail UI is
+    -- actually available. Replacement mailbox UIs may never expose these
+    -- controls, and WBGR's custom fallback supplies its own recipient/subject
+    -- directly to SendMail(). Shared attachments/money/COD are still checked
+    -- below for every mailbox UI.
+    if WGRMailUsingBlizzardSendUI() then
+        if WGRMailText(SendMailNameEditBox) ~= "" then return false end
+        if WGRMailText(SendMailSubjectEditBox) ~= "" then return false end
+        if WGRMailText(SendMailBodyEditBox) ~= "" then return false end
+    end
     if WGRMailHasAttachments() then return false end
 
-    if WGRMailMoneyAmount(SendMailMoney) > 0 then
+    -- Prefer the underlying outgoing-mail state so replacement mailbox UIs
+    -- cannot hide money/COD from WBGR's safety check. Fall back to Blizzard's
+    -- money widgets for older clients / harnesses.
+    if GetSendMailMoney then
+        local ok, amount = pcall(GetSendMailMoney)
+        if ok and type(amount) == "number" and amount > 0 then
+            return false
+        end
+    elseif WGRMailMoneyAmount(SendMailMoney) > 0 then
         return false
     end
 
-    if WGRMailMoneyAmount(SendMailCOD) > 0 then
+    if GetSendMailCOD then
+        local ok, amount = pcall(GetSendMailCOD)
+        if ok and type(amount) == "number" and amount > 0 then
+            return false
+        end
+    elseif WGRMailMoneyAmount(SendMailCOD) > 0 then
         return false
     end
 
@@ -1075,16 +1386,18 @@ end
 
 
 local function WGRMailOwnedDraftIsCleared()
-    if WGRMailText(
-        SendMailNameEditBox
-    ) ~= "" then
-        return false
-    end
+    if WGRMailUsingBlizzardSendUI() then
+        if WGRMailText(
+            SendMailNameEditBox
+        ) ~= "" then
+            return false
+        end
 
-    if WGRMailText(
-        SendMailSubjectEditBox
-    ) ~= "" then
-        return false
+        if WGRMailText(
+            SendMailSubjectEditBox
+        ) ~= "" then
+            return false
+        end
     end
 
     if WGRMailHasAttachments() then
@@ -1095,16 +1408,18 @@ local function WGRMailOwnedDraftIsCleared()
 end
 
 local function WGRMailClearFields()
-    if SendMailNameEditBox then
-        SendMailNameEditBox:SetText("")
-    end
+    if WGRMailUsingBlizzardSendUI() then
+        if SendMailNameEditBox then
+            SendMailNameEditBox:SetText("")
+        end
 
-    if SendMailSubjectEditBox then
-        SendMailSubjectEditBox:SetText("")
-    end
+        if SendMailSubjectEditBox then
+            SendMailSubjectEditBox:SetText("")
+        end
 
-    if SendMailBodyEditBox then
-        SendMailBodyEditBox:SetText("")
+        if SendMailBodyEditBox then
+            SendMailBodyEditBox:SetText("")
+        end
     end
 
     -- Return all attachments to carried bags.
@@ -1157,7 +1472,20 @@ local function WGRMailClearFields()
 
     WGRMail.waitingForSend = false
     WGRMail.preparedRecipient = nil
+    WGRMail.preparedSubject = nil
+    WGRMail.preparedCount = 0
+    WGRMail.preparedAttachmentLinks = nil
+    WGRMail.preparedAttachmentCounts = nil
+    WGRMailResetPreparedReadiness()
+    WGRMail.preparedDisposalDraft = nil
+    WGRMail.pendingDisposalSendValid = false
+    WGRMail.pendingSendRecipient = nil
+    WGRMail.pendingGearDraft = nil
     WGRMail.ownsDraft = false
+    WGRMail.removingPreparedAttachment = false
+    if WGRMailRefreshPreparedSendButton then
+        WGRMailRefreshPreparedSendButton()
+    end
 end
 
 local function WGRMailRefreshOverlays()
@@ -1283,7 +1611,9 @@ local function WGRMailBagItems()
         local slots=C_Container.GetContainerNumSlots(bag)
         for slot=1,slots do
             local link=C_Container.GetContainerItemLink(bag,slot)
-            if link and IsTransferableContainerItem(bag,slot,link) then
+            if link and IsTransferableContainerItem(bag,slot,link)
+                and not (WGRStorageCleanupIsDisposeCopy and
+                    WGRStorageCleanupIsDisposeCopy(bag,slot,link)) then
                 items[#items+1]={bagID=bag,slotID=slot,itemLink=link}
             end
         end
@@ -1374,6 +1704,8 @@ local function WGRMailCountPersonalBankOutgoing()
                     slotID,
                     itemLink
                 )
+                and not (WGRStorageCleanupIsDisposeCopy and
+                    WGRStorageCleanupIsDisposeCopy(bagID,slotID,itemLink))
             then
                 local result =
                     WGRMailEvaluateItem(
@@ -1397,6 +1729,29 @@ end
 
 local WGRMailPrepareDestination
 local WGRMailPrepareNext
+
+function WGRMailUpdateDisposeButtons()
+    local frame=WGRMail and WGRMail.frame
+    if not frame or not frame.disposeButtons then return false end
+    local settings=WGRStorageCleanupGetSettings and WGRStorageCleanupGetSettings()
+    local has=false
+    for binding,button in pairs(frame.disposeButtons) do
+        local candidates=settings and settings.enabled and
+            WGRStorageCleanupDisposalMailCandidates and
+            WGRStorageCleanupDisposalMailCandidates(binding) or {}
+        local count=#candidates
+        local recipient=settings and (binding=='WARBAND' and
+            settings.warboundRecipient or settings.boeRecipient) or nil
+        local valid=recipient and recipient~='CURRENT' and recipient~=''
+        -- Recipient validation is repeated by the authoritative preparation
+        -- function. This UI is only an affordance, not a safety boundary.
+        button:SetText(string.format('%s DISPOSE (%d)',
+            binding=='WARBAND' and 'Warbound' or 'BoE',count))
+        button:SetEnabled(count>0 and valid and WGRMail.mailboxOpen)
+        if count>0 then has=true end
+    end
+    return has
+end
 
 local function WGRMailUpdateRows()
     if not WGRMail.frame then return end
@@ -1448,9 +1803,11 @@ local function WGRMailUpdateRows()
         end
     end
 
+    local hasDisposal=WGRMailUpdateDisposeButtons and WGRMailUpdateDisposeButtons()
     if #WGRMail.destinations==0 then
         WGRMailStatus(
-            "No SEND TO / HOLD ON gear in carried bags.",
+            hasDisposal and 'DISPOSE Mail available; review the destination before sending.'
+                or 'No SEND TO / HOLD ON gear in carried bags.',
             .65,.65,.65
         )
     elseif not WGRMail.waitingForSend then
@@ -1718,6 +2075,8 @@ local function WGRMailFindFor(
                 item.slotID,
                 currentLink
             )
+            and not (WGRStorageCleanupIsDisposeCopy and
+                WGRStorageCleanupIsDisposeCopy(item.bagID,item.slotID,currentLink))
         then
             -- Fresh routing evaluation immediately before attachment.
             local result =
@@ -1779,47 +2138,63 @@ local function WGROpenSendMailTab(
         return
     end
 
-    -- If the Send Mail pane is already the selected mail tab,
-    -- continue immediately.
-    if PanelTemplates_GetSelectedTab
-        and MailFrame
-        and PanelTemplates_GetSelectedTab(
-            MailFrame
-        ) == 2
-    then
-        if callback then
-            callback()
+    local usingBlizzardSendUI =
+        WGRMailUsingBlizzardSendUI()
+
+    if usingBlizzardSendUI then
+        -- If the Send Mail pane is already the selected Blizzard tab,
+        -- continue immediately.
+        if PanelTemplates_GetSelectedTab
+            and PanelTemplates_GetSelectedTab(
+                MailFrame
+            ) == 2
+        then
+            if callback then
+                callback()
+            end
+            return
         end
-        return
+
+        -- Preserve normal Blizzard-mailbox behavior: switch the visible
+        -- Blizzard UI to its Send Mail pane.
+        if MailFrameTab_OnClick
+            and MailFrameTab2
+        then
+            MailFrameTab_OnClick(
+                MailFrameTab2,
+                2
+            )
+        elseif PanelTemplates_SetTab
+            and MailFrame
+        then
+            PanelTemplates_SetTab(
+                MailFrame,
+                2
+            )
+
+            if InboxFrame then
+                InboxFrame:Hide()
+            end
+
+            if SendMailFrame then
+                SendMailFrame:Show()
+            end
+
+            if SetSendMailShowing then
+                pcall(SetSendMailShowing, true)
+            end
+        end
+    else
+        -- Replacement mailbox UIs do not expose a generic tab-switch API.
+        -- Activate Retail's shared outgoing-mail state directly so WBGR can
+        -- prepare attachments without knowing the replacement addon's frames.
+        if SetSendMailShowing then
+            pcall(SetSendMailShowing, true)
+        end
     end
 
-    -- Use Blizzard's actual mail-tab selection function rather
-    -- than relying on Button:Click().
-    if MailFrameTab_OnClick
-        and MailFrameTab2
-    then
-        MailFrameTab_OnClick(
-            MailFrameTab2,
-            2
-        )
-    elseif PanelTemplates_SetTab
-        and MailFrame
-    then
-        PanelTemplates_SetTab(
-            MailFrame,
-            2
-        )
-
-        if InboxFrame then
-            InboxFrame:Hide()
-        end
-
-        if SendMailFrame then
-            SendMailFrame:Show()
-        end
-    end
-
-    -- Give Blizzard one frame to finish changing panes.
+    -- Give the client/replacement UI one frame to settle the outgoing-mail
+    -- state before scanning/attaching.
     C_Timer.After(
         0.05,
         function()
@@ -1934,8 +2309,11 @@ local function WGRMailPrepareDestinationInternal(destName,fromAll)
             return
         end
 
-        SendMailNameEditBox:SetText(destName)
-        SendMailSubjectEditBox:SetText("Alt Gear")
+        local usingBlizzardSendUI = WGRMailUsingBlizzardSendUI()
+        if usingBlizzardSendUI then
+            SendMailNameEditBox:SetText(destName)
+            SendMailSubjectEditBox:SetText("Alt Gear")
+        end
         local attached=0
         for i=1,math.min(#items,WGR_MAIL_MAX) do
             local item=items[i]
@@ -1950,8 +2328,10 @@ local function WGRMailPrepareDestinationInternal(destName,fromAll)
         end
 
         if attached==0 then
-            SendMailNameEditBox:SetText("")
-            SendMailSubjectEditBox:SetText("")
+            if usingBlizzardSendUI then
+                SendMailNameEditBox:SetText("")
+                SendMailSubjectEditBox:SetText("")
+            end
             WGRMailStatus("No items could be attached for "..destName..".",1,.45,.25)
             if fromAll then WGRMailStop("Prepare All stopped: attachment failed.") end
             return
@@ -1959,13 +2339,26 @@ local function WGRMailPrepareDestinationInternal(destName,fromAll)
 
         WGRMail.waitingForSend=true
         WGRMail.preparedRecipient=destName
+        WGRMail.preparedSubject="Alt Gear"
         WGRMail.preparedCount=attached
         WGRMail.ownsDraft=true
-        WGRMailStatus(
-            string.format("Prepared %d item%s for %s. Review, then press Send.",
-                attached,attached==1 and "" or "s",destName),
-            1,.35,.82
-        )
+        WGRMailStorePreparedAttachmentSnapshot()
+        if usingBlizzardSendUI then
+            WGRMailStatus(
+                string.format("Prepared %d item%s for %s. Review, then press Send.",
+                    attached,attached==1 and "" or "s",destName),
+                1,.35,.82
+            )
+        else
+            WGRMailStatus(
+                string.format("Prepared %d item%s for %s. Review if desired, then use Send Prepared.",
+                    attached,attached==1 and "" or "s",destName),
+                1,.35,.82
+            )
+        end
+        if WGRMailRefreshPreparedSendButton then
+            WGRMailRefreshPreparedSendButton()
+        end
         WGRMailScan(
             function()
                 WGRMailRefreshOverlays()
@@ -1974,6 +2367,123 @@ local function WGRMailPrepareDestinationInternal(destName,fromAll)
     end)
 end
 
+
+-- v0.68o: explicit, user-reviewed DISPOSE mail preparation. Never call the
+-- normal holder routing preparer: it intentionally excludes DISPOSE copies.
+-- The user must pick a recipient in Storage Cleanup and must press Send.
+function WGRMailPrepareDisposalDraft(recipient,binding)
+    if not (WGRStorageCleanupGetSettings and WGRStorageCleanupGetSettings().enabled) then
+        return false,'Storage Cleanup is OFF' end
+    if not WGRMail.mailboxOpen then return false,'Open a mailbox first' end
+    if binding~='WARBAND' and binding~='BOE' then
+        return false,'Choose a Warbound or BoE disposal group' end
+    recipient=recipient and strtrim(tostring(recipient)) or ''
+    local target=WGRMailNormalizeCharacterName(recipient)
+    local myself=WGRMailNormalizeCharacterName(UnitName and UnitName('player'))
+    if not target or target=='CURRENT' or
+        (myself and string.lower(target)==string.lower(myself)) then
+        return false,'Select a different disposal recipient in Storage Cleanup' end
+    if WGRMail.waitingForSend or WGRMail.prepareAll or not WGRMailDraftClear() then
+        return false,'Finish or clear the current outgoing mail draft first' end
+    if not (WGROpenSendMailTab and WGRStorageCleanupDisposalMailCandidates) then
+        return false,'Disposal mail preparation unavailable' end
+    -- The list is acquired after Blizzard switches to the Send tab; checking
+    -- it earlier could race an inventory movement or a draft change.
+    WGROpenSendMailTab(function()
+        if not WGRMail.mailboxOpen or not WGRMailDraftClear() or WGRMail.waitingForSend then
+            WGRMailStatus('Clear the outgoing mail draft before preparing disposal.',1,.5,.2)
+            return
+        end
+        local usingBlizzardSendUI = WGRMailUsingBlizzardSendUI()
+        local candidates=WGRStorageCleanupDisposalMailCandidates(binding)
+        if #candidates==0 then
+            WGRMailStatus('No verified DISPOSE copies of this binding in Bags.',1,.7,.3)
+            print('|cffffaa00WBGR:|r No currently marked/mailable DISPOSE items of this type in Bags.')
+            return
+        end
+        local attached,entries=0,{}
+        if usingBlizzardSendUI then
+            SendMailNameEditBox:SetText(recipient)
+            SendMailSubjectEditBox:SetText('WBGR Disposal')
+        end
+        for _,item in ipairs(candidates) do
+            if attached>=WGR_MAIL_MAX then break end
+            local link=C_Container.GetContainerItemLink(item.bagID,item.slotID)
+            if link==item.itemLink and
+                WGRStorageCleanupGetPhysicalCopyGUID(item.bagID,item.slotID,link)==item.guid and
+                WGRStorageCleanupIsDisposeCopy(item.bagID,item.slotID,link) and
+                IsTransferableContainerItem(item.bagID,item.slotID,link) then
+                C_Container.PickupContainerItem(item.bagID,item.slotID)
+                ClickSendMailItemButton(attached+1)
+                local attachedLink=GetSendMailItemLink and GetSendMailItemLink(attached+1)
+                if attachedLink==link then
+                    attached=attached+1
+                    entries[#entries+1]={guid=item.guid,itemLink=link}
+                else
+                    -- Do not prepare a partial ambiguous send. Player must
+                    -- clear the draft manually; we never send or delete gear.
+                    WGRMailStatus('Attachment could not be verified; clear the draft.',1,.3,.3)
+                    print('|cffff5555WBGR:|r Could not verify disposal attachment; clear the mail draft manually.')
+                    return
+                end
+            end
+        end
+        if attached==0 then
+            if usingBlizzardSendUI then
+                SendMailNameEditBox:SetText('')
+                SendMailSubjectEditBox:SetText('')
+            end
+            WGRMailStatus('No disposal copies could be attached.',1,.7,.2)
+            return
+        end
+        WGRMail.preparedDisposalDraft={recipient=recipient,entries=entries}
+        WGRMail.pendingDisposalSendValid=false
+        WGRMail.waitingForSend=true
+        WGRMail.preparedRecipient=recipient
+        WGRMail.preparedSubject='WBGR Disposal'
+        WGRMail.preparedCount=attached
+        WGRMail.ownsDraft=true
+        WGRMailStorePreparedAttachmentSnapshot()
+        local message
+        if usingBlizzardSendUI then
+            message=string.format('Prepared %d DISPOSE item(s) for %s. Review and press Send; nothing sent automatically.',attached,recipient)
+        else
+            message=string.format('Prepared %d DISPOSE item(s) for %s. Review if desired, then use Send Prepared; nothing sent automatically.',attached,recipient)
+        end
+        WGRMailStatus(message,1,.55,.8)
+        if WGRMailRefreshPreparedSendButton then
+            WGRMailRefreshPreparedSendButton()
+        end
+    end)
+    return true
+end
+
+-- Validate the actual send recipient and entire attachment multiset. No
+-- attempt is made to recover a physical GUID from Blizzard's mail slots.
+local function WGRMailPreparedDisposalMatchesActual(recipient)
+    local prepared=WGRMail.preparedDisposalDraft
+    if not prepared or not recipient then return false end
+    local actual=WGRMailNormalizeCharacterName(recipient)
+    local expected=WGRMailNormalizeCharacterName(prepared.recipient)
+    if not actual or not expected or string.lower(actual)~=string.lower(expected) then
+        return false end
+    local counts={}
+    for _,entry in ipairs(prepared.entries or {}) do
+        counts[entry.itemLink]=(counts[entry.itemLink] or 0)+1
+    end
+    local n=0
+    for slot=1,WGR_MAIL_MAX do
+        local link=GetSendMailItemLink and GetSendMailItemLink(slot)
+        if link then
+            n=n+1
+            counts[link]=(counts[link] or 0)-1
+            if counts[link]<0 then return false end
+        end
+    end
+    if n~=#(prepared.entries or {}) then return false end
+    for _,left in pairs(counts) do if left~=0 then return false end end
+    return true
+end
 
 WGRMailPrepareDestination=function(
     destName,
@@ -2023,6 +2533,267 @@ WGRMailPrepareDestination=function(
     )
 end
 
+local function WGRMailRemovePreparedAttachment(preparedIndex)
+    if not WGRMail.mailboxOpen
+        or WGRMailUsingBlizzardSendUI()
+        or not WGRMail.waitingForSend
+        or not WGRMail.ownsDraft
+    then
+        return
+    end
+
+    if WGRMail.removingPreparedAttachment then
+        WGRMailStatus("Please wait for the previous attachment change to finish.",1,.65,.2)
+        return
+    end
+
+    -- DISPOSE drafts retain exact physical-copy authorization. Keep those
+    -- all-or-nothing in replacement-mailbox mode rather than silently
+    -- changing the authorized GUID set from a UI-only attachment removal.
+    if WGRMail.preparedDisposalDraft then
+        WGRMailStatus("DISPOSE drafts cannot be trimmed here. Clear Draft and prepare a new disposal batch instead.",1,.65,.2)
+        return
+    end
+
+    local matches = WGRMailPreparedAttachmentsMatch()
+    if not matches then
+        WGRMailStatus("Prepared attachments changed. Clear Draft and prepare the mail again before editing the batch.",1,.3,.3)
+        if WGRMailRefreshPreparedSendButton then
+            WGRMailRefreshPreparedSendButton()
+        end
+        return
+    end
+
+    local expectedLinks = WGRMail.preparedAttachmentLinks or {}
+    local selectedLink = expectedLinks[preparedIndex]
+    if not selectedLink then
+        return
+    end
+
+    -- Rows are a compact prepared list, while Blizzard attachment slots may
+    -- contain gaps. Find the matching occurrence of this exact item link in
+    -- the live outgoing slots so duplicate identical links remain safe.
+    local occurrence = 0
+    for index = 1, preparedIndex do
+        if expectedLinks[index] == selectedLink then
+            occurrence = occurrence + 1
+        end
+    end
+
+    local targetSlot = nil
+    local seen = 0
+    for _, entry in ipairs(WGRMailCurrentAttachmentEntries()) do
+        if entry.link == selectedLink then
+            seen = seen + 1
+            if seen == occurrence then
+                targetSlot = entry.slot
+                break
+            end
+        end
+    end
+
+    if not targetSlot then
+        WGRMailStatus("Could not identify that prepared attachment. Clear Draft and prepare again.",1,.3,.3)
+        return
+    end
+
+    local expectedAfter = {}
+    for index, link in ipairs(expectedLinks) do
+        if index ~= preparedIndex then
+            expectedAfter[#expectedAfter + 1] = link
+        end
+    end
+
+    WGRMail.removingPreparedAttachment = true
+    if WGRMailRefreshPreparedSendButton then
+        WGRMailRefreshPreparedSendButton()
+    end
+
+    if RemoveSendMailItem then
+        RemoveSendMailItem(targetSlot)
+    else
+        ClickSendMailItemButton(targetSlot)
+        if CursorHasItem and CursorHasItem() and ClearCursor then
+            ClearCursor()
+        end
+    end
+
+    C_Timer.After(
+        0.20,
+        function()
+            WGRMail.removingPreparedAttachment = false
+
+            if not WGRMail.mailboxOpen
+                or not WGRMail.waitingForSend
+                or not WGRMail.ownsDraft
+            then
+                return
+            end
+
+            local settled, currentLinks, currentCounts =
+                WGRMailAttachmentSnapshotMatchesLinks(expectedAfter)
+
+            if not settled then
+                WGRMailStatus("Attachment removal did not settle as expected. Clear Draft and prepare again before sending.",1,.3,.3)
+                if WGRMailRefreshPreparedSendButton then
+                    WGRMailRefreshPreparedSendButton()
+                end
+                return
+            end
+
+            if #currentLinks == 0 then
+                WGRMailClearFields()
+                WGRMailStatus("Removed the last prepared item. Draft cleared.",.75,.75,.75)
+                if WGRMailScan then
+                    WGRMailScan(function() WGRMailRefreshOverlays() end)
+                end
+                return
+            end
+
+            WGRMail.preparedAttachmentLinks = currentLinks
+            WGRMail.preparedAttachmentCounts = currentCounts
+            WGRMail.preparedCount = #currentLinks
+            WGRMailResetPreparedReadiness()
+
+            local itemName = nil
+            if C_Item and C_Item.GetItemInfo then
+                itemName = C_Item.GetItemInfo(selectedLink)
+            elseif GetItemInfo then
+                itemName = GetItemInfo(selectedLink)
+            end
+
+            WGRMailStatus(
+                string.format(
+                    "Removed %s from this batch. %d item%s remain prepared.",
+                    tostring(itemName or "item"),
+                    #currentLinks,
+                    #currentLinks == 1 and "" or "s"
+                ),
+                .45,.85,1
+            )
+
+            if WGRMailRefreshPreparedSendButton then
+                WGRMailRefreshPreparedSendButton()
+            end
+            if WGRMailScan then
+                WGRMailScan(function() WGRMailRefreshOverlays() end)
+            end
+        end
+    )
+end
+
+local function WGRMailGetUnderlyingSendAmount(getter)
+    if not getter then
+        return 0
+    end
+
+    local ok, amount = pcall(getter)
+    if ok and type(amount) == "number" then
+        return amount
+    end
+
+    return 0
+end
+
+local function WGRMailSendPreparedCustomDraft()
+    if not WGRMail.mailboxOpen then
+        WGRMailStatus("Open a mailbox first.",1,.3,.3)
+        return
+    end
+
+    if WGRMailUsingBlizzardSendUI() then
+        WGRMailStatus("Use Blizzard's Send button for the normal mailbox.",1,.65,.2)
+        return
+    end
+
+    if not WGRMail.waitingForSend
+        or not WGRMail.ownsDraft
+        or not WGRMail.preparedRecipient
+        or WGRMail.preparedRecipient == ""
+    then
+        WGRMailStatus("No WBGR mail draft is prepared.",1,.65,.2)
+        return
+    end
+
+    local attachmentsMatch, attached =
+        WGRMailPreparedAttachmentsMatch()
+
+    if attached <= 0 then
+        WGRMailStatus("No attachments remain in the prepared draft.",1,.45,.25)
+        if WGRMailRefreshPreparedSendButton then
+            WGRMailRefreshPreparedSendButton()
+        end
+        return
+    end
+
+    if not attachmentsMatch then
+        WGRMailResetPreparedReadiness()
+        WGRMailStatus(
+            "Prepared attachments changed. Clear Draft and prepare the mail again before sending.",
+            1,.3,.3
+        )
+        if WGRMailRefreshPreparedSendButton then
+            WGRMailRefreshPreparedSendButton()
+        end
+        return
+    end
+
+    -- Replacement mailbox attachment APIs can settle over several UI/event
+    -- ticks. Never send merely because one instantaneous snapshot matched;
+    -- the exact reviewed set must remain stable first.
+    if not WGRMail.preparedReady then
+        WGRMailStatus("Prepared attachments are still settling. Try Send Prepared again once it becomes ready.",1,.65,.2)
+        if WGRMailRefreshPreparedSendButton then
+            WGRMailRefreshPreparedSendButton()
+        end
+        return
+    end
+
+    -- Never let the generic WBGR send button accidentally send money or COD
+    -- that a replacement mailbox UI may have configured outside Blizzard's
+    -- hidden money widgets.
+    if WGRMailGetUnderlyingSendAmount(GetSendMailMoney) > 0
+        or WGRMailGetUnderlyingSendAmount(GetSendMailCOD) > 0
+    then
+        WGRMailStatus("WBGR will not send while money or COD is set in the outgoing draft.",1,.3,.3)
+        return
+    end
+
+    if not SendMail then
+        WGRMailStatus("The game's SendMail function is unavailable.",1,.3,.3)
+        return
+    end
+
+    local recipient = WGRMail.preparedRecipient
+    local subject = WGRMail.preparedSubject or "Alt Gear"
+
+    -- Refresh the exact shared attachment snapshot immediately before the
+    -- user-authorized send. The existing secure SendMail post-hook remains
+    -- authoritative for the actual recipient supplied to the game.
+    WGRMailCaptureDraftItems(recipient)
+
+    if WGRMail.frame and WGRMail.frame.sendPreparedButton then
+        WGRMail.frame.sendPreparedButton:Disable()
+        WGRMail.frame.sendPreparedButton:SetText("Sending...")
+    end
+
+    WGRMailStatus("Sending prepared mail to "..tostring(recipient).."...")
+
+    local ok, err = pcall(
+        SendMail,
+        recipient,
+        subject,
+        ""
+    )
+
+    if not ok then
+        WGRMailStatus("Could not send prepared mail: "..tostring(err),1,.3,.3)
+        if WGRMailRefreshPreparedSendButton then
+            WGRMailRefreshPreparedSendButton()
+        end
+    end
+end
+
 WGRMailPrepareNext=function()
     if not WGRMail.prepareAll or not WGRMail.mailboxOpen or WGRMail.waitingForSend then return end
     WGRMailScan(function()
@@ -2050,18 +2821,145 @@ local function WGRMailToggleAll()
     WGRMailPrepareNext()
 end
 
+local WGRMailUpdateMailboxRouterButton
+
+local function WGRMailGetSavedRouterPosition()
+    local interface =
+        WarboundGearRouterDB
+        and WarboundGearRouterDB.interface
+
+    local position =
+        interface
+        and interface.mailRouterPosition
+
+    if type(position) ~= "table"
+        or type(position.x) ~= "number"
+        or type(position.y) ~= "number"
+    then
+        return nil
+    end
+
+    return position
+end
+
+local function WGRMailPositionRouterFrame(frame)
+    if not frame then return end
+
+    frame:ClearAllPoints()
+
+    local position =
+        WGRMailGetSavedRouterPosition()
+
+    if position then
+        frame:SetPoint(
+            "CENTER",
+            UIParent,
+            "CENTER",
+            position.x,
+            position.y
+        )
+        return
+    end
+
+    if MailFrame then
+        frame:SetPoint(
+            "TOPLEFT",
+            MailFrame,
+            "TOPRIGHT",
+            8,
+            -18
+        )
+    else
+        frame:SetPoint(
+            "CENTER",
+            UIParent,
+            "CENTER",
+            0,
+            0
+        )
+    end
+end
+
+local function WGRMailSaveRouterPosition(frame)
+    local interface =
+        WarboundGearRouterDB
+        and WarboundGearRouterDB.interface
+
+    if not interface
+        or not frame
+        or not UIParent
+        or not frame.GetCenter
+        or not UIParent.GetCenter
+    then
+        return
+    end
+
+    local frameX, frameY =
+        frame:GetCenter()
+    local parentX, parentY =
+        UIParent:GetCenter()
+
+    if not frameX
+        or not frameY
+        or not parentX
+        or not parentY
+    then
+        return
+    end
+
+    interface.mailRouterPosition = {
+        x = frameX - parentX,
+        y = frameY - parentY,
+    }
+end
+
 local function WGRMailCreateFrame()
     if WGRMail.frame then return WGRMail.frame end
     local f=CreateFrame("Frame","WGRMailRouterFrame",UIParent,"BackdropTemplate")
-    f:SetSize(220,430)
+    f:SetSize(240,540)
     f:SetFrameStrata("DIALOG")
+    -- Match the main WBGR window's normal DIALOG priority while allowing
+    -- whichever WBGR window the user interacts with to come to the front.
+    -- This is intentionally limited to the two WBGR root windows.
+    f:SetToplevel(true)
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:SetClampedToScreen(true)
     f:SetBackdrop({
         bgFile="Interface\\DialogFrame\\UI-DialogBox-Background",
         edgeFile="Interface\\Tooltips\\UI-Tooltip-Border",
         tile=true,tileSize=16,edgeSize=16,
         insets={left=4,right=4,top=4,bottom=4},
     })
-    f:SetBackdropColor(.05,.05,.05,.95)
+    local solidBackground =
+        f:CreateTexture(nil,"BACKGROUND",nil,-8)
+    solidBackground:SetPoint("TOPLEFT",f,"TOPLEFT",4,-4)
+    solidBackground:SetPoint("BOTTOMRIGHT",f,"BOTTOMRIGHT",-4,4)
+    solidBackground:SetColorTexture(.02,.02,.02,1)
+    f.WGRSolidBackground = solidBackground
+
+    function f:WGRApplyBackgroundOpacity()
+        local interface = WarboundGearRouterDB and WarboundGearRouterDB.interface
+        local percent = interface and interface.backgroundOpacity or 50
+        percent = math.max(0,math.min(100,tonumber(percent) or 50))
+
+        -- Match the main WBGR window's existing opacity curve exactly.
+        if percent <= 50 then
+            local legacyScale = percent / 50
+            self:SetBackdropColor(.05,.05,.05,.96 * legacyScale)
+            if self.WGRSolidBackground then
+                self.WGRSolidBackground:SetAlpha(0)
+            end
+        else
+            self:SetBackdropColor(.05,.05,.05,.96)
+            local solidAlpha = (percent - 50) / 50
+            if self.WGRSolidBackground then
+                self.WGRSolidBackground:SetAlpha(solidAlpha)
+            end
+        end
+    end
+
+    f:WGRApplyBackgroundOpacity()
 
     local close =
         CreateFrame(
@@ -2094,6 +2992,63 @@ local function WGRMailCreateFrame()
                     "Mail Router closed."
                 )
             end
+            if WGRMailUpdateMailboxRouterButton and C_Timer then
+                C_Timer.After(0, function()
+                    if WGRMailUpdateMailboxRouterButton then
+                        WGRMailUpdateMailboxRouterButton()
+                    end
+                end)
+            end
+        end
+    )
+
+    f:SetScript(
+        "OnShow",
+        function()
+            if f.WGRApplyBackgroundOpacity then
+                f:WGRApplyBackgroundOpacity()
+            end
+            if WGRMail.mailboxRouterButton then
+                WGRMail.mailboxRouterButton:Hide()
+            end
+        end
+    )
+
+    local dragHandle =
+        CreateFrame(
+            "Frame",
+            nil,
+            f
+        )
+
+    dragHandle:SetPoint(
+        "TOPLEFT",
+        f,
+        "TOPLEFT",
+        8,
+        -6
+    )
+    dragHandle:SetPoint(
+        "TOPRIGHT",
+        f,
+        "TOPRIGHT",
+        -34,
+        -6
+    )
+    dragHandle:SetHeight(42)
+    dragHandle:EnableMouse(true)
+    dragHandle:RegisterForDrag("LeftButton")
+    dragHandle:SetScript(
+        "OnDragStart",
+        function()
+            f:StartMoving()
+        end
+    )
+    dragHandle:SetScript(
+        "OnDragStop",
+        function()
+            f:StopMovingOrSizing()
+            WGRMailSaveRouterPosition(f)
         end
     )
 
@@ -2102,7 +3057,7 @@ local function WGRMailCreateFrame()
     title:SetText("WBGR Mail Router")
     local sub=f:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
     sub:SetPoint("TOP",title,"BOTTOM",0,-4)
-    sub:SetText("Destination  -  Items")
+    sub:SetText("Routing Mail")
 
     local checkMail=
         CreateFrame(
@@ -2131,7 +3086,9 @@ local function WGRMailCreateFrame()
 
     checkMail:SetScript(
         "OnClick",
-        WGRMailShowTracker
+        function()
+            WGRMailShowTracker(true)
+        end
     )
 
     local destinationScroll =
@@ -2155,7 +3112,7 @@ local function WGRMailCreateFrame()
         f,
         "BOTTOMRIGHT",
         -30,
-        104
+        214
     )
 
     local destinationContent =
@@ -2180,12 +3137,89 @@ local function WGRMailCreateFrame()
     f.destinationContent =
         destinationContent
 
+    -- Replacement-mailbox mode cannot rely on a third-party Send page to
+    -- show WBGR's recipient, subject, or attachments. Reuse the destination
+    -- area as a WBGR-owned review panel while a custom draft is prepared.
+    local preparedPanel = CreateFrame("Frame",nil,f)
+    preparedPanel:SetPoint("TOPLEFT",destinationScroll,"TOPLEFT",0,0)
+    preparedPanel:SetPoint("BOTTOMRIGHT",destinationScroll,"BOTTOMRIGHT",0,0)
+    preparedPanel:Hide()
+    f.preparedPanel = preparedPanel
+
+    local preparedTitle=preparedPanel:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    preparedTitle:SetPoint("TOPLEFT",preparedPanel,"TOPLEFT",0,0)
+    preparedTitle:SetText("Prepared Mail")
+    f.preparedTitle=preparedTitle
+
+    local preparedRecipient=preparedPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+    preparedRecipient:SetPoint("TOPLEFT",preparedTitle,"BOTTOMLEFT",0,-6)
+    preparedRecipient:SetPoint("RIGHT",preparedPanel,"RIGHT",0,0)
+    preparedRecipient:SetJustifyH("LEFT")
+    f.preparedRecipientText=preparedRecipient
+
+    local preparedSubject=preparedPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+    preparedSubject:SetPoint("TOPLEFT",preparedRecipient,"BOTTOMLEFT",0,-3)
+    preparedSubject:SetPoint("RIGHT",preparedPanel,"RIGHT",0,0)
+    preparedSubject:SetJustifyH("LEFT")
+    f.preparedSubjectText=preparedSubject
+
+    local preparedCount=preparedPanel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+    preparedCount:SetPoint("TOPLEFT",preparedSubject,"BOTTOMLEFT",0,-3)
+    preparedCount:SetPoint("RIGHT",preparedPanel,"RIGHT",0,0)
+    preparedCount:SetJustifyH("LEFT")
+    f.preparedCountText=preparedCount
+
+    local preparedHint=preparedPanel:CreateFontString(nil,"OVERLAY","GameFontDisableSmall")
+    preparedHint:SetPoint("TOPLEFT",preparedCount,"BOTTOMLEFT",0,-3)
+    preparedHint:SetPoint("RIGHT",preparedPanel,"RIGHT",0,0)
+    preparedHint:SetJustifyH("LEFT")
+    preparedHint:SetText("X removes an item from this batch.")
+    f.preparedHintText=preparedHint
+
+    local preparedScroll=CreateFrame("ScrollFrame",nil,preparedPanel,"UIPanelScrollFrameTemplate")
+    preparedScroll:SetPoint("TOPLEFT",preparedHint,"BOTTOMLEFT",0,-6)
+    preparedScroll:SetPoint("BOTTOMRIGHT",preparedPanel,"BOTTOMRIGHT",-20,0)
+    local preparedContent=CreateFrame("Frame",nil,preparedScroll)
+    preparedContent:SetSize(170,1)
+    preparedScroll:SetScrollChild(preparedContent)
+    f.preparedScroll=preparedScroll
+    f.preparedContent=preparedContent
+    f.preparedRows={}
+
+    local disposeTitle=f:CreateFontString(nil,'OVERLAY','GameFontHighlightSmall')
+    disposeTitle:SetPoint('BOTTOM',f,'BOTTOM',0,193)
+    disposeTitle:SetText('DISPOSE Mail')
+    f.disposeButtons={}
+    for _,binding in ipairs({'WARBAND','BOE'}) do
+        local button=CreateFrame('Button',nil,f,'UIPanelButtonTemplate')
+        button:SetSize(210,24)
+        button:SetPoint('BOTTOM',f,'BOTTOM',0,binding=='WARBAND' and 163 or 135)
+        button:SetText(binding=='WARBAND' and 'Warbound DISPOSE (0)' or 'BoE DISPOSE (0)')
+        button:SetScript('OnClick',function()
+            local settings=WGRStorageCleanupGetSettings and WGRStorageCleanupGetSettings()
+            local recipient=settings and (binding=='WARBAND' and
+                settings.warboundRecipient or settings.boeRecipient)
+            if WGRMailPrepareDisposalDraft then
+                local ok,why=WGRMailPrepareDisposalDraft(recipient,binding)
+                if not ok then WGRMailStatus(why or 'Cannot prepare disposal mail',1,.6,.2) end
+            end
+        end)
+        f.disposeButtons[binding]=button
+    end
     local all=CreateFrame("Button",nil,f,"UIPanelButtonTemplate")
     all:SetSize(112,24)
     all:SetPoint("BOTTOM",f,"BOTTOM",0,72)
     all:SetText("Prepare All")
     all:SetScript("OnClick",WGRMailToggleAll)
     f.prepareAllButton=all
+
+    local sendPrepared=CreateFrame("Button",nil,f,"UIPanelButtonTemplate")
+    sendPrepared:SetSize(132,24)
+    sendPrepared:SetPoint("BOTTOM",f,"BOTTOM",0,103)
+    sendPrepared:SetText("Send Prepared")
+    sendPrepared:SetScript("OnClick",WGRMailSendPreparedCustomDraft)
+    sendPrepared:Hide()
+    f.sendPreparedButton=sendPrepared
 
     local rescan=CreateFrame("Button",nil,f,"UIPanelButtonTemplate")
     rescan:SetSize(94,24)
@@ -2257,6 +3291,200 @@ local function WGRMailCreateFrame()
     f:Hide()
     WGRMail.frame=f
     return f
+end
+
+WGRMailRefreshPreparedDraftPanel = function()
+    local frame = WGRMail and WGRMail.frame
+    if not frame
+        or not frame.preparedPanel
+        or not frame.destinationScroll
+    then
+        return
+    end
+
+    local show =
+        WGRMail.mailboxOpen
+        and WGRMail.waitingForSend
+        and WGRMail.ownsDraft
+        and not WGRMailUsingBlizzardSendUI()
+
+    if not show then
+        frame.preparedPanel:Hide()
+        frame.destinationScroll:Show()
+        return
+    end
+
+    frame.destinationScroll:Hide()
+    frame.preparedPanel:Show()
+
+    frame.preparedRecipientText:SetText(
+        "To: " .. tostring(WGRMail.preparedRecipient or "")
+    )
+    frame.preparedSubjectText:SetText(
+        "Subject: " .. tostring(WGRMail.preparedSubject or "")
+    )
+
+    local matches, currentCount =
+        WGRMailPreparedAttachmentsMatch()
+    local expectedCount =
+        type(WGRMail.preparedAttachmentLinks) == "table"
+        and #WGRMail.preparedAttachmentLinks
+        or 0
+
+    if matches then
+        frame.preparedCountText:SetText(
+            "Attachments: " .. tostring(expectedCount) .. " (verified)"
+        )
+        frame.preparedCountText:SetTextColor(.35,1,.35)
+    else
+        frame.preparedCountText:SetText(
+            "Attachments: "
+                .. tostring(currentCount)
+                .. "/"
+                .. tostring(expectedCount)
+                .. " - draft changed"
+        )
+        frame.preparedCountText:SetTextColor(1,.35,.35)
+    end
+
+    local links =
+        type(WGRMail.preparedAttachmentLinks) == "table"
+        and WGRMail.preparedAttachmentLinks
+        or {}
+
+    for index, row in ipairs(frame.preparedRows or {}) do
+        if index > #links then
+            row:Hide()
+        end
+    end
+
+    local allowTrim = not WGRMail.preparedDisposalDraft
+    if frame.preparedHintText then
+        frame.preparedHintText:SetText(
+            allowTrim
+            and "X removes an item from this batch."
+            or "DISPOSE batches stay exact; Clear Draft to restage."
+        )
+    end
+
+    for index, link in ipairs(links) do
+        local row = frame.preparedRows[index]
+        if not row then
+            row = CreateFrame("Frame",nil,frame.preparedContent)
+            row:SetSize(165,18)
+
+            row.label = row:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall")
+            row.label:SetPoint("LEFT",row,"LEFT",0,0)
+            row.label:SetPoint("RIGHT",row,"RIGHT",-22,0)
+            row.label:SetJustifyH("LEFT")
+            row.label:SetWordWrap(false)
+
+            row.remove = CreateFrame("Button",nil,row,"UIPanelButtonTemplate")
+            row.remove:SetSize(20,18)
+            row.remove:SetPoint("RIGHT",row,"RIGHT",0,0)
+            row.remove:SetText("X")
+            row.remove:SetScript(
+                "OnClick",
+                function(button)
+                    local parent = button:GetParent()
+                    if parent and parent.preparedIndex then
+                        WGRMailRemovePreparedAttachment(parent.preparedIndex)
+                    end
+                end
+            )
+            row.remove:SetScript(
+                "OnEnter",
+                function(button)
+                    GameTooltip:SetOwner(button,"ANCHOR_RIGHT")
+                    GameTooltip:SetText("Remove from this prepared batch",1,1,1)
+                    GameTooltip:AddLine("Returns this item to Bags. It can be routed again later.",.8,.8,.8,true)
+                    GameTooltip:Show()
+                end
+            )
+            row.remove:SetScript("OnLeave",function() GameTooltip:Hide() end)
+
+            frame.preparedRows[index] = row
+        end
+
+        row.preparedIndex = index
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT",frame.preparedContent,"TOPLEFT",0,-((index-1)*20))
+
+        local itemName = nil
+        if C_Item and C_Item.GetItemInfo then
+            itemName = C_Item.GetItemInfo(link)
+        elseif GetItemInfo then
+            itemName = GetItemInfo(link)
+        end
+
+        row.label:SetText(tostring(index) .. ". " .. tostring(itemName or link or "Unknown item"))
+        if allowTrim then
+            row.remove:Show()
+            row.remove:SetEnabled(not WGRMail.removingPreparedAttachment)
+        else
+            row.remove:Hide()
+        end
+        row:Show()
+    end
+
+    frame.preparedContent:SetHeight(math.max(1,#links*20))
+end
+
+WGRMailRefreshPreparedSendButton = function()
+    local button =
+        WGRMail
+        and WGRMail.frame
+        and WGRMail.frame.sendPreparedButton
+
+    if not button then
+        return
+    end
+
+    local show =
+        WGRMail.mailboxOpen
+        and WGRMail.waitingForSend
+        and WGRMail.ownsDraft
+        and not WGRMailUsingBlizzardSendUI()
+
+    if not show then
+        button:Hide()
+        button:Enable()
+        button:SetText("Send Prepared")
+        if WGRMailRefreshPreparedDraftPanel then
+            WGRMailRefreshPreparedDraftPanel()
+        end
+        return
+    end
+
+    local matches, count =
+        WGRMailPreparedAttachmentsMatch()
+
+    WGRMail.preparedCount = count
+
+    local ready = WGRMailUpdatePreparedReadiness(matches)
+
+    button:Show()
+
+    if WGRMail.removingPreparedAttachment then
+        button:SetText("Updating...")
+        button:Disable()
+    elseif count <= 0 then
+        button:SetText("No Attachments")
+        button:Disable()
+    elseif not matches then
+        button:SetText("Draft Changed")
+        button:Disable()
+    elseif not ready then
+        button:SetText("Preparing...")
+        button:Disable()
+    else
+        button:SetText("Send Prepared")
+        button:Enable()
+    end
+
+    if WGRMailRefreshPreparedDraftPanel then
+        WGRMailRefreshPreparedDraftPanel()
+    end
 end
 
 WGRMailSetMasterPaused =
@@ -2339,7 +3567,90 @@ WGRMailRetrieveTrackedForCurrent =
             end
         end
 
-        if not hasTracked then
+        local currentTracked =
+            WGRMailResolveTrackedRecipient(
+                currentName
+            )
+
+        local gearTracking =
+            WGRMailGearTrackingTable()
+
+        local currentGearEntry =
+            currentTracked
+            and gearTracking[
+                string.lower(
+                    currentTracked
+                )
+            ]
+            or nil
+
+        -- Prefer the item-aware MAIL ledger whenever it is available. Manual
+        -- sends through Blizzard or replacement mailbox UIs do not necessarily
+        -- use WBGR's legacy "Alt Gear" subject, but WBGR already records the
+        -- expected sender + physical gear identity for each routed item.
+        local expectedByKey = {}
+
+        if currentGearEntry
+            and type(
+                currentGearEntry.items
+            ) == "table"
+        then
+            for _, item
+                in ipairs(
+                    currentGearEntry.items
+                )
+            do
+                local senderKey =
+                    string.lower(
+                        WGRMailNormalizeCharacterName(
+                            item.sender
+                        )
+                        or ""
+                    )
+
+                local itemID =
+                    tonumber(
+                        item.itemID
+                    )
+                    or WGRMailItemID(
+                        item.itemLink
+                    )
+
+                local gearKey =
+                    item.gearKey
+
+                if senderKey ~= ""
+                    and itemID
+                    and gearKey
+                then
+                    local matchKey =
+                        senderKey
+                        .. "\031"
+                        .. tostring(
+                            itemID
+                        )
+                        .. "\031"
+                        .. tostring(
+                            gearKey
+                        )
+
+                    expectedByKey[matchKey] =
+                        (
+                            expectedByKey[matchKey]
+                            or 0
+                        ) + 1
+                end
+            end
+        end
+
+        local useItemAwareTracking =
+            next(
+                expectedByKey
+            ) ~= nil
+
+        if not hasTracked
+            and not useItemAwareTracking
+        then
             print(
                 "|cffffcc00WBGR:|r No WBGR-routed mail is currently tracked for "
                 .. tostring(currentName)
@@ -2348,10 +3659,104 @@ WGRMailRetrieveTrackedForCurrent =
             return
         end
 
-        local initialMailCount = 0
-        local initialAttachmentCount = 0
+        local function InboxAttachmentMatchKey(
+            mailIndex,
+            attachmentIndex
+        )
+            local _, _, sender =
+                GetInboxHeaderInfo(
+                    mailIndex
+                )
 
-        local function IsTrackedWGRMail(
+            local itemLink =
+                GetInboxItemLink
+                and GetInboxItemLink(
+                    mailIndex,
+                    attachmentIndex
+                )
+                or nil
+
+            if not itemLink then
+                return nil
+            end
+
+            local senderKey =
+                string.lower(
+                    WGRMailNormalizeCharacterName(
+                        sender
+                    )
+                    or ""
+                )
+
+            local itemID =
+                WGRMailItemID(
+                    itemLink
+                )
+
+            local gearKey =
+                WGRMailRawGearKeyForItem(
+                    itemLink
+                )
+
+            if senderKey == ""
+                or not itemID
+                or not gearKey
+            then
+                return nil
+            end
+
+            return
+                senderKey
+                .. "\031"
+                .. tostring(
+                    itemID
+                )
+                .. "\031"
+                .. tostring(
+                    gearKey
+                )
+        end
+
+        local function CountInboxMatchKey(
+            targetKey
+        )
+            if not targetKey then
+                return 0
+            end
+
+            local count = 0
+            local countInbox =
+                select(
+                    1,
+                    GetInboxNumItems()
+                )
+                or 0
+
+            for mailIndex = 1, countInbox do
+                for attachmentIndex = 1,
+                    (
+                        ATTACHMENTS_MAX_RECEIVE
+                        or 16
+                    )
+                do
+                    if InboxAttachmentMatchKey(
+                        mailIndex,
+                        attachmentIndex
+                    ) == targetKey
+                    then
+                        count =
+                            count + 1
+                    end
+                end
+            end
+
+            return count
+        end
+
+        -- Legacy fallback for older tracking records that predate the physical
+        -- item-aware MAIL ledger. Keep the old subject/sender rule only when no
+        -- item-aware expectation is available for this character.
+        local function IsLegacyTrackedWGRMail(
             mailIndex
         )
             local _, _, sender, subject =
@@ -2367,6 +3772,10 @@ WGRMailRetrieveTrackedForCurrent =
                 )
         end
 
+        local initialMailCount = 0
+        local initialAttachmentCount = 0
+        local remainingToRetrieve = {}
+
         local inboxCount =
             select(
                 1,
@@ -2374,13 +3783,20 @@ WGRMailRetrieveTrackedForCurrent =
             )
             or 0
 
-        for mailIndex = 1, inboxCount do
-            if IsTrackedWGRMail(
-                mailIndex
-            )
-            then
-                local attachmentCount =
-                    0
+        if useItemAwareTracking then
+            local availableByKey = {}
+            for key, count
+                in pairs(
+                    expectedByKey
+                )
+            do
+                availableByKey[key] = count
+            end
+
+            for mailIndex = 1,
+                inboxCount
+            do
+                local matchedInMail = 0
 
                 for attachmentIndex = 1,
                     (
@@ -2388,22 +3804,73 @@ WGRMailRetrieveTrackedForCurrent =
                         or 16
                     )
                 do
-                    if GetInboxItem(
-                        mailIndex,
-                        attachmentIndex
-                    )
-                    then
-                        attachmentCount =
-                            attachmentCount + 1
+                    local matchKey =
+                        InboxAttachmentMatchKey(
+                            mailIndex,
+                            attachmentIndex
+                        )
+
+                    local available =
+                        matchKey
+                        and availableByKey[matchKey]
+                        or 0
+
+                    if available > 0 then
+                        availableByKey[matchKey] =
+                            available - 1
+
+                        remainingToRetrieve[matchKey] =
+                            (
+                                remainingToRetrieve[matchKey]
+                                or 0
+                            ) + 1
+
+                        matchedInMail =
+                            matchedInMail + 1
+                        initialAttachmentCount =
+                            initialAttachmentCount + 1
                     end
                 end
 
-                if attachmentCount > 0 then
+                if matchedInMail > 0 then
                     initialMailCount =
                         initialMailCount + 1
-                    initialAttachmentCount =
-                        initialAttachmentCount
-                        + attachmentCount
+                end
+            end
+        else
+            for mailIndex = 1,
+                inboxCount
+            do
+                if IsLegacyTrackedWGRMail(
+                    mailIndex
+                )
+                then
+                    local attachmentCount =
+                        0
+
+                    for attachmentIndex = 1,
+                        (
+                            ATTACHMENTS_MAX_RECEIVE
+                            or 16
+                        )
+                    do
+                        if GetInboxItem(
+                            mailIndex,
+                            attachmentIndex
+                        )
+                        then
+                            attachmentCount =
+                                attachmentCount + 1
+                        end
+                    end
+
+                    if attachmentCount > 0 then
+                        initialMailCount =
+                            initialMailCount + 1
+                        initialAttachmentCount =
+                            initialAttachmentCount
+                            + attachmentCount
+                    end
                 end
             end
         end
@@ -2417,6 +3884,7 @@ WGRMailRetrieveTrackedForCurrent =
 
         local attempts = 0
         local maxAttempts = 200
+        local confirmedTaken = 0
 
         local function TakeNextTrackedAttachment()
             if not WGRMail
@@ -2445,105 +3913,170 @@ WGRMailRetrieveTrackedForCurrent =
             for mailIndex = 1,
                 currentInboxCount
             do
-                if IsTrackedWGRMail(
-                    mailIndex
-                )
-                then
-                    for attachmentIndex = 1,
-                        (
-                            ATTACHMENTS_MAX_RECEIVE
-                            or 16
+                local legacyMail =
+                    not useItemAwareTracking
+                    and IsLegacyTrackedWGRMail(
+                        mailIndex
+                    )
+
+                for attachmentIndex = 1,
+                    (
+                        ATTACHMENTS_MAX_RECEIVE
+                        or 16
+                    )
+                do
+                    local itemName =
+                        GetInboxItem(
+                            mailIndex,
+                            attachmentIndex
                         )
-                    do
-                        local itemName =
-                            GetInboxItem(
+
+                    local matchKey =
+                        useItemAwareTracking
+                        and InboxAttachmentMatchKey(
+                            mailIndex,
+                            attachmentIndex
+                        )
+                        or nil
+
+                    local itemAwareMatch =
+                        useItemAwareTracking
+                        and matchKey
+                        and (
+                            remainingToRetrieve[matchKey]
+                            or 0
+                        ) > 0
+
+                    if itemName
+                        and (
+                            legacyMail
+                            or itemAwareMatch
+                        )
+                    then
+                        local originalLink =
+                            GetInboxItemLink
+                            and GetInboxItemLink(
                                 mailIndex,
                                 attachmentIndex
                             )
+                            or nil
 
-                        if itemName then
-                            local originalLink =
-                                GetInboxItemLink
+                        local originalMatchCount =
+                            itemAwareMatch
+                            and CountInboxMatchKey(
+                                matchKey
+                            )
+                            or nil
+
+                        TakeInboxItem(
+                            mailIndex,
+                            attachmentIndex
+                        )
+
+                        -- The mailbox UI can briefly continue reporting the
+                        -- attachment after TakeInboxItem() succeeds. Wait until
+                        -- the attachment actually disappears or changes before
+                        -- moving on, so reindexing cannot cause a double-take.
+                        local verifyAttempts = 0
+
+                        local function VerifyTaken()
+                            if not WGRMail
+                                or not WGRMail.mailboxOpen
+                            then
+                                return
+                            end
+
+                            verifyAttempts =
+                                verifyAttempts + 1
+
+                            local currentItemName =
+                                GetInboxItem(
+                                    mailIndex,
+                                    attachmentIndex
+                                )
+
+                            local currentLink =
+                                currentItemName
+                                and GetInboxItemLink
                                 and GetInboxItemLink(
                                     mailIndex,
                                     attachmentIndex
                                 )
                                 or nil
 
-                            TakeInboxItem(
-                                mailIndex,
-                                attachmentIndex
-                            )
+                            local verifiedTaken = false
 
-                            -- The mailbox UI can briefly continue reporting the
-                            -- attachment after TakeInboxItem() succeeds. The old
-                            -- code immediately rescanned and could click/count
-                            -- that same attachment more than once. Wait until
-                            -- the attachment actually disappears or changes
-                            -- before incrementing the retrieved total.
-                            local verifyAttempts = 0
-
-                            local function VerifyTaken()
-                                if not WGRMail
-                                    or not WGRMail.mailboxOpen
-                                then
-                                    return
-                                end
-
-                                verifyAttempts =
-                                    verifyAttempts + 1
-
-                                local currentName =
-                                    GetInboxItem(
-                                        mailIndex,
-                                        attachmentIndex
+                            if itemAwareMatch
+                                and matchKey
+                            then
+                                local currentMatchCount =
+                                    CountInboxMatchKey(
+                                        matchKey
                                     )
 
-                                local currentLink =
-                                    currentName
-                                    and GetInboxItemLink
-                                    and GetInboxItemLink(
-                                        mailIndex,
-                                        attachmentIndex
+                                verifiedTaken =
+                                    currentMatchCount
+                                    < (
+                                        originalMatchCount
+                                        or 0
                                     )
-                                    or nil
-
+                            else
                                 local stillSame =
-                                    currentName ~= nil
+                                    currentItemName ~= nil
                                     and (
                                         originalLink == nil
                                         or currentLink
                                             == originalLink
                                     )
 
-                                if stillSame
-                                    and verifyAttempts < 20
-                                then
-                                    C_Timer.After(
-                                        0.10,
-                                        VerifyTaken
-                                    )
-                                    return
-                                end
-
-                                -- Do not increment a per-item counter here.
-                                -- Blizzard can reindex mail/attachments while
-                                -- retrieval is active. The final reported total
-                                -- is calculated from tracked attachments before
-                                -- retrieval minus tracked attachments remaining
-                                -- after the final mailbox rescan.
-                                C_Timer.After(
-                                    0.05,
-                                    TakeNextTrackedAttachment
-                                )
+                                verifiedTaken =
+                                    not stillSame
                             end
 
+                            if not verifiedTaken
+                                and verifyAttempts < 20
+                            then
+                                C_Timer.After(
+                                    0.10,
+                                    VerifyTaken
+                                )
+                                return
+                            end
+
+                            if not verifiedTaken then
+                                print(
+                                    "|cffffcc00WBGR:|r Mail retrieval paused because an attachment did not leave the inbox. Try again after the mailbox updates."
+                                )
+                                return
+                            end
+
+                            if itemAwareMatch
+                                and matchKey
+                            then
+                                remainingToRetrieve[matchKey] =
+                                    math.max(
+                                        0,
+                                        (
+                                            remainingToRetrieve[matchKey]
+                                            or 0
+                                        ) - 1
+                                    )
+                            end
+
+                            confirmedTaken =
+                                confirmedTaken + 1
+
                             C_Timer.After(
-                                0.10,
-                                VerifyTaken
+                                0.05,
+                                TakeNextTrackedAttachment
                             )
-                            return
                         end
+
+                        C_Timer.After(
+                            0.10,
+                            VerifyTaken
+                        )
+                        return
                     end
                 end
             end
@@ -2566,63 +4099,66 @@ WGRMailRetrieveTrackedForCurrent =
                 local finalAttachmentCount =
                     0
 
-                local finalInboxCount =
-                    select(
-                        1,
-                        GetInboxNumItems()
-                    )
-                    or 0
+                if not useItemAwareTracking then
+                    local finalInboxCount =
+                        select(
+                            1,
+                            GetInboxNumItems()
+                        )
+                        or 0
 
-                for mailIndex = 1,
-                    finalInboxCount
-                do
-                    if IsTrackedWGRMail(
-                        mailIndex
-                    )
-                    then
-                        for attachmentIndex = 1,
-                            (
-                                ATTACHMENTS_MAX_RECEIVE
-                                or 16
-                            )
-                        do
-                            if GetInboxItem(
-                                mailIndex,
-                                attachmentIndex
-                            )
-                            then
-                                finalAttachmentCount =
-                                    finalAttachmentCount
-                                    + 1
+                    for mailIndex = 1,
+                        finalInboxCount
+                    do
+                        if IsLegacyTrackedWGRMail(
+                            mailIndex
+                        )
+                        then
+                            for attachmentIndex = 1,
+                                (
+                                    ATTACHMENTS_MAX_RECEIVE
+                                    or 16
+                                )
+                            do
+                                if GetInboxItem(
+                                    mailIndex,
+                                    attachmentIndex
+                                )
+                                then
+                                    finalAttachmentCount =
+                                        finalAttachmentCount
+                                        + 1
+                                end
                             end
                         end
                     end
-                end
 
-                -- Mailbox state can lag behind the actual item transfer.
-                -- Wait until the final tracked-attachment count has dropped
-                -- and then remained stable for a pass before logging/removing
-                -- the To Do entry.
-                if completionAttempt < 20
-                    and (
-                        finalAttachmentCount
-                            >= initialAttachmentCount
-                        or previousFinalCount
-                            ~= finalAttachmentCount
-                    )
-                then
-                    previousFinalCount =
-                        finalAttachmentCount
+                    -- Legacy subject-based mail can lag behind the actual item
+                    -- transfer. Preserve the old stabilization wait for those
+                    -- historical records.
+                    if completionAttempt < 20
+                        and (
+                            finalAttachmentCount
+                                >= initialAttachmentCount
+                            or previousFinalCount
+                                ~= finalAttachmentCount
+                        )
+                    then
+                        previousFinalCount =
+                            finalAttachmentCount
 
-                    C_Timer.After(
-                        0.15,
-                        FinishRetrieval
-                    )
-                    return
+                        C_Timer.After(
+                            0.15,
+                            FinishRetrieval
+                        )
+                        return
+                    end
                 end
 
                 local totalTaken =
-                    math.max(
+                    useItemAwareTracking
+                    and confirmedTaken
+                    or math.max(
                         0,
                         initialAttachmentCount
                         - finalAttachmentCount
@@ -2660,10 +4196,6 @@ WGRMailRetrieveTrackedForCurrent =
                         )
                         .. "."
 
-                    print(
-                        "|cff33ff99WBGR:|r "
-                        .. retrievalText
-                    )
 
                     if WGRAddRecentActivity then
                         WGRAddRecentActivity(
@@ -2679,6 +4211,10 @@ WGRMailRetrieveTrackedForCurrent =
                             }
                         )
                     end
+                end
+
+                if WGRMailReconcileTrackedGearInbox then
+                    WGRMailReconcileTrackedGearInbox()
                 end
 
                 WGRMailBeginInboxSession()
@@ -2711,14 +4247,8 @@ WGRMailOpenRouterManual =
         local frame =
             WGRMailCreateFrame()
 
-        frame:ClearAllPoints()
-
-        frame:SetPoint(
-            "TOPLEFT",
-            MailFrame,
-            "TOPRIGHT",
-            8,
-            -18
+        WGRMailPositionRouterFrame(
+            frame
         )
 
         frame:Show()
@@ -2757,14 +4287,307 @@ WGRMailOpenRouterManual =
         )
     end
 
-local function WGRMailHandleMailboxHidden()
+local function WGRMailGetMailboxMode()
+    local interface =
+        WarboundGearRouterDB
+        and WarboundGearRouterDB.interface
+
+    if interface then
+        if interface.mailRouterMailboxMode == "AUTO"
+            or interface.mailRouterMailboxMode == "BUTTON"
+            or interface.mailRouterMailboxMode == "NONE"
+        then
+            return interface.mailRouterMailboxMode
+        end
+
+        -- Compatibility with v0.71m/n SavedVariables before the three-state
+        -- mailbox preference existed.
+        if interface.openMailRouterAutomatically == false then
+            return "BUTTON"
+        end
+    end
+
+    return "AUTO"
+end
+
+local function WGRMailShouldOpenAutomatically()
+    return WGRMailGetMailboxMode() == "AUTO"
+end
+
+local function WGRMailShouldShowMailboxButton()
+    return WGRMailGetMailboxMode() == "BUTTON"
+end
+
+local function WGRMailGetSavedMailboxButtonPosition()
+    local interface =
+        WarboundGearRouterDB
+        and WarboundGearRouterDB.interface
+
+    local position =
+        interface
+        and interface.mailRouterButtonPosition
+
+    if type(position) ~= "table"
+        or type(position.x) ~= "number"
+        or type(position.y) ~= "number"
+    then
+        return nil
+    end
+
+    return position
+end
+
+local function WGRMailSaveMailboxButtonPosition(button)
+    local interface =
+        WarboundGearRouterDB
+        and WarboundGearRouterDB.interface
+
+    if not interface
+        or not button
+        or not UIParent
+        or not button.GetCenter
+        or not UIParent.GetCenter
+    then
+        return
+    end
+
+    local buttonX, buttonY =
+        button:GetCenter()
+    local parentX, parentY =
+        UIParent:GetCenter()
+
+    if not buttonX
+        or not buttonY
+        or not parentX
+        or not parentY
+    then
+        return
+    end
+
+    interface.mailRouterButtonPosition = {
+        x = buttonX - parentX,
+        y = buttonY - parentY,
+    }
+end
+
+local function WGRMailUsingBlizzardMailboxButtonAnchor()
+    return WGRMailUsingBlizzardSendUI()
+end
+
+local function WGRMailPositionMailboxRouterButton(button)
+    if not button or button.__WGRDragging then return end
+
+    button:ClearAllPoints()
+
+    if WGRMailUsingBlizzardMailboxButtonAnchor() then
+        button:SetPoint(
+            "LEFT",
+            MailFrameTab2,
+            "RIGHT",
+            8,
+            0
+        )
+    else
+        -- Replacement mailbox UIs (for example TSM) may hide Blizzard's
+        -- MailFrame while the real MailInfo interaction is still active. In
+        -- that case use an independent, user-movable launcher position.
+        local position =
+            WGRMailGetSavedMailboxButtonPosition()
+
+        if position then
+            button:SetPoint(
+                "CENTER",
+                UIParent,
+                "CENTER",
+                position.x,
+                position.y
+            )
+        else
+            button:SetPoint(
+                "TOP",
+                UIParent,
+                "TOP",
+                0,
+                -120
+            )
+        end
+    end
+end
+
+local function WGRMailCreateMailboxRouterButton()
+    if WGRMail.mailboxRouterButton then
+        return WGRMail.mailboxRouterButton
+    end
+
+    local button =
+        CreateFrame(
+            "Button",
+            "WGRMailboxRouterButton",
+            UIParent,
+            "UIPanelButtonTemplate"
+        )
+
+    button:SetSize(150, 24)
+    button:SetText("WBGR Mail Router")
+    button:SetFrameStrata("DIALOG")
+    button:SetMovable(true)
+    button:SetClampedToScreen(true)
+    button:RegisterForDrag("LeftButton")
+    button:Hide()
+
+    button:SetScript(
+        "OnDragStart",
+        function(self)
+            if WGRMailUsingBlizzardMailboxButtonAnchor() then
+                return
+            end
+
+            self.__WGRDragging = true
+            self:StartMoving()
+        end
+    )
+
+    button:SetScript(
+        "OnDragStop",
+        function(self)
+            self:StopMovingOrSizing()
+
+            if not WGRMailUsingBlizzardMailboxButtonAnchor() then
+                WGRMailSaveMailboxButtonPosition(self)
+            end
+
+            local function finishDrag()
+                self.__WGRDragging = false
+                if WGRMailUpdateMailboxRouterButton then
+                    WGRMailUpdateMailboxRouterButton()
+                end
+            end
+
+            if C_Timer then
+                C_Timer.After(0, finishDrag)
+            else
+                finishDrag()
+            end
+        end
+    )
+
+    button:SetScript(
+        "OnClick",
+        function(self)
+            if self.__WGRDragging then
+                return
+            end
+
+            if WGRMailOpenRouterManual then
+                WGRMailOpenRouterManual()
+            end
+        end
+    )
+
+    button:SetScript(
+        "OnEnter",
+        function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:AddLine("WBGR Mail Router", 1.00, 0.82, 0.00)
+            GameTooltip:AddLine(
+                "Open the WBGR Mail Router for this mailbox.",
+                1.00,
+                1.00,
+                1.00
+            )
+            if not WGRMailUsingBlizzardMailboxButtonAnchor() then
+                GameTooltip:AddLine(
+                    "Drag: Move button",
+                    0.75,
+                    0.75,
+                    0.75
+                )
+            end
+            GameTooltip:Show()
+        end
+    )
+
+    button:SetScript(
+        "OnLeave",
+        function()
+            GameTooltip:Hide()
+        end
+    )
+
+    WGRMail.mailboxRouterButton = button
+    WGRMailPositionMailboxRouterButton(button)
+    return button
+end
+
+WGRMailUpdateMailboxRouterButton = function()
+    local button = WGRMailCreateMailboxRouterButton()
+    local routerOpen = WGRMail and WGRMail.frame and WGRMail.frame:IsShown()
+
+    if WGRMail and WGRMail.mailboxOpen and not routerOpen
+        and WGRMailShouldShowMailboxButton() then
+        WGRMailPositionMailboxRouterButton(button)
+        button:Show()
+    else
+        button:Hide()
+    end
+end
+
+local function WGRMailGetMailInteractionType()
+    return Enum
+        and Enum.PlayerInteractionType
+        and Enum.PlayerInteractionType.MailInfo
+end
+
+local function WGRMailIsMailInteractionType(interactionType)
+    local mailType = WGRMailGetMailInteractionType()
+    return mailType ~= nil and interactionType == mailType
+end
+
+local function WGRMailIsMailboxInteractionActive()
+    local mailType = WGRMailGetMailInteractionType()
+    if not mailType
+        or not C_PlayerInteractionManager
+        or not C_PlayerInteractionManager.IsInteractingWithNpcOfType
+    then
+        return nil
+    end
+
+    local ok, active = pcall(
+        C_PlayerInteractionManager.IsInteractingWithNpcOfType,
+        mailType
+    )
+    if not ok then
+        return nil
+    end
+
+    return active == true
+end
+
+local function WGRMailHandleMailboxHidden(forceClose, source)
+    if not forceClose and WGRMailIsMailboxInteractionActive() == true then
+        WGRMailDebug(
+            tostring(source or "Mailbox frame")
+                .. " hidden while MailInfo interaction remains active; keeping mailboxOpen=true."
+        )
+        WGRMail.mailboxOpen = true
+        WGRUpdateOpenRouterButton()
+        WGRMailUpdateMailboxRouterButton()
+        if WGRMailRefreshPreparedSendButton then
+            WGRMailRefreshPreparedSendButton()
+        end
+        return false
+    end
+
     WGRMailDebug(
-        "Mailbox hidden; setting mailboxOpen=false."
+        tostring(source or "Mailbox")
+            .. " closed; setting mailboxOpen=false."
     )
 
     WGRMail.mailboxOpen = false
+    if WGRDisposalMailEndInboxSession then WGRDisposalMailEndInboxSession() end
 
     WGRUpdateOpenRouterButton()
+    WGRMailUpdateMailboxRouterButton()
 
     WGRMailStop()
     WGRMail.ownsDraft = false
@@ -2779,6 +4602,8 @@ local function WGRMailHandleMailboxHidden()
     if WGRRefreshTodoPage then
         WGRRefreshTodoPage()
     end
+
+    return true
 end
 
 if MailFrame
@@ -2786,10 +4611,73 @@ if MailFrame
 then
     MailFrame:HookScript(
         "OnHide",
-        WGRMailHandleMailboxHidden
+        function()
+            -- Replacement mailbox addons such as TSM may hide Blizzard's
+            -- MailFrame while the actual Retail MailInfo interaction remains
+            -- open. Frame visibility is therefore only a fallback signal.
+            WGRMailHandleMailboxHidden(false, "Blizzard MailFrame")
+        end
     )
 
     MailFrame.__WGRHideHooked =
+        true
+end
+
+if MailFrame
+    and not MailFrame.__WGRShowHooked
+then
+    MailFrame:HookScript(
+        "OnShow",
+        function()
+            -- A replacement mailbox can switch back to Blizzard's MailFrame
+            -- without ending the underlying MailInfo interaction. Re-anchor
+            -- the manual launcher immediately to the normal Send Mail tab.
+            if WGRMail and WGRMail.mailboxOpen then
+                WGRMailUpdateMailboxRouterButton()
+                if WGRMailRefreshPreparedSendButton then
+                    WGRMailRefreshPreparedSendButton()
+                end
+            end
+        end
+    )
+
+    MailFrame.__WGRShowHooked =
+        true
+end
+
+if MailFrameTab2
+    and MailFrameTab2.HookScript
+    and not MailFrameTab2.__WGRVisibilityHooked
+then
+    local function WGRMailRefreshMailboxButtonForTabVisibility()
+        local function refresh()
+            if WGRMail and WGRMail.mailboxOpen then
+                WGRMailUpdateMailboxRouterButton()
+                if WGRMailRefreshPreparedSendButton then
+                    WGRMailRefreshPreparedSendButton()
+                end
+            end
+        end
+
+        -- Defer one frame so parent/interaction visibility changes settle
+        -- before deciding between the Blizzard anchor and custom fallback.
+        if C_Timer then
+            C_Timer.After(0, refresh)
+        else
+            refresh()
+        end
+    end
+
+    MailFrameTab2:HookScript(
+        "OnShow",
+        WGRMailRefreshMailboxButtonForTabVisibility
+    )
+    MailFrameTab2:HookScript(
+        "OnHide",
+        WGRMailRefreshMailboxButtonForTabVisibility
+    )
+
+    MailFrameTab2.__WGRVisibilityHooked =
         true
 end
 
@@ -2830,8 +4718,24 @@ WGRMailDraftWatch:SetScript(
         self.elapsed =
             0
 
+        local previousCount =
+            tonumber(WGRMail.preparedCount)
+            or 0
+
         WGRMail.preparedCount =
             WGRMailCountCurrentDraftItems()
+
+        if WGRMailRefreshPreparedSendButton
+            and (
+                previousCount ~= WGRMail.preparedCount
+                or not WGRMailUsingBlizzardSendUI()
+            )
+        then
+            -- Replacement-mailbox drafts need repeated exact-set checks so
+            -- Send Prepared only arms after the shared attachment state has
+            -- remained stable for the settling window.
+            WGRMailRefreshPreparedSendButton()
+        end
     end
 )
 
@@ -2850,6 +4754,11 @@ local WGRMailBagTodoRefreshToken =
 WGRMailBagTodoRefresh:SetScript(
     "OnEvent",
     function()
+        if WGRMail and WGRMail.mailboxOpen and WGRDisposalMailOnInboxChanged then
+            C_Timer.After(.18,function()
+                if WGRMail.mailboxOpen then WGRDisposalMailOnInboxChanged() end
+            end)
+        end
         WGRMailTodoSnapshotDirty =
             true
 
@@ -2917,6 +4826,50 @@ WGRMailBagTodoRefresh:SetScript(
     end
 )
 
+local WGRMailReturnApiHooked = false
+
+-- Replacement mailbox UIs commonly bypass Blizzard's OpenMailDeleteButton and
+-- call the underlying ReturnInboxItem(mailIndex) API directly.  Observe that
+-- game-level return action generically so the existing item-aware return
+-- lifecycle can distinguish Return-to-Sender from ordinary retrieval.
+local function WGRMailInstallReturnApiHook()
+    if WGRMailReturnApiHooked then
+        return
+    end
+
+    if not hooksecurefunc or not ReturnInboxItem then
+        return
+    end
+
+    hooksecurefunc(
+        "ReturnInboxItem",
+        function(mailIndex)
+            -- Disposal mail has its own exact-batch return lifecycle. Preserve
+            -- that path first; ordinary routed mail uses the cached item-aware
+            -- return snapshot. The cache is deliberately consulted before any
+            -- refresh because secure hooks run after ReturnInboxItem itself.
+            local disposalReturn =
+                WGRDisposalMailPrimeReturn
+                and WGRDisposalMailPrimeReturn(mailIndex)
+
+            if not disposalReturn then
+                local staged = WGRMailPrimeReturn(mailIndex)
+
+                -- Normally MAIL_SHOW / MAIL_INBOX_UPDATE keeps this cache
+                -- current. If the user returns a newly-arrived message before
+                -- the delayed cache refresh settles, make one best-effort live
+                -- refresh while Blizzard may still expose the just-returned row.
+                if not staged then
+                    WGRMailRefreshReturnCache()
+                    WGRMailPrimeReturn(mailIndex)
+                end
+            end
+        end
+    )
+
+    WGRMailReturnApiHooked = true
+end
+
 local WGRMailReturnPreClickHooked = false
 
 local function WGRMailInstallReturnPreClickHook()
@@ -2947,7 +4900,11 @@ local function WGRMailInstallReturnPreClickHook()
                 return
             end
 
-            WGRMailPrimeReturn(mailIndex)
+            -- Disposal mail has its own return lifecycle. Never also stage
+            -- it as ordinary holder mail, especially on a Removed alt.
+            local disposalReturn=WGRDisposalMailPrimeReturn and
+                WGRDisposalMailPrimeReturn(mailIndex)
+            if not disposalReturn then WGRMailPrimeReturn(mailIndex) end
         end
     )
 
@@ -2956,22 +4913,63 @@ end
 
 local WGRMailEvents=CreateFrame("Frame")
 
+WGRMailInstallReturnApiHook()
 WGRMailInstallReturnPreClickHook()
 
 WGRMailEvents:RegisterEvent("MAIL_SHOW")
 WGRMailEvents:RegisterEvent("MAIL_CLOSED")
+WGRMailEvents:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
+WGRMailEvents:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
 WGRMailEvents:RegisterEvent("MAIL_SEND_SUCCESS")
+WGRMailEvents:RegisterEvent("MAIL_FAILED")
+WGRMailEvents:RegisterEvent("BAG_UPDATE_DELAYED")
 WGRMailEvents:RegisterEvent("MAIL_INBOX_UPDATE")
 WGRMailEvents:RegisterEvent("MAIL_SEND_INFO_UPDATE")
 WGRMailEvents:RegisterEvent("PLAYER_LOGOUT")
 WGRMailEvents:RegisterEvent("PLAYER_LOGIN")
-WGRMailEvents:SetScript("OnEvent",function(_,event)
+WGRMailEvents:SetScript("OnEvent",function(_,event,...)
+    local eventArg1 = ...
+
     WGRMailDebug(
         "Mail event received: "
             .. tostring(event)
     )
 
-    if event=="MAIL_SHOW" then
+    if event=="PLAYER_INTERACTION_MANAGER_FRAME_SHOW" then
+        if not WGRMailIsMailInteractionType(eventArg1) then
+            return
+        end
+
+        -- Retail's player-interaction lifecycle is authoritative for whether
+        -- a mailbox is actually open. Custom mailbox addons may replace or
+        -- hide Blizzard's MailFrame without ending this MailInfo interaction.
+        WGRMail.mailboxOpen = true
+        WGRUpdateOpenRouterButton()
+        WGRMailDebug(
+            "MailInfo interaction opened; mailboxOpen=true."
+        )
+
+        if WGRRefreshTodoPage then
+            WGRRefreshTodoPage()
+        end
+
+    elseif event=="PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
+        if not WGRMailIsMailInteractionType(eventArg1) then
+            return
+        end
+
+        if WGRMail then
+            WGRMail.returnInboxCache = nil
+            WGRMail.pendingReturn = nil
+        end
+
+        WGRMailHandleMailboxHidden(
+            true,
+            "MailInfo interaction"
+        )
+
+    elseif event=="MAIL_SHOW" then
+        WGRMailInstallReturnApiHook()
         WGRMailInstallReturnPreClickHook()
         WGRMailRefreshReturnCache()
         C_Timer.After(0.35, function()
@@ -2981,7 +4979,14 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         end)
 
         WGRMail.mailboxOpen=true
-
+        -- Keep the manual launcher hidden while Blizzard/custom mailbox UI
+        -- finishes positioning and while WBGR decides whether the router will
+        -- auto-open. This avoids the fallback button flashing mid-screen and
+        -- then jumping to its mailbox anchor.
+        WGRMailCreateMailboxRouterButton():Hide()
+        if WGRDisposalMailStartInboxSession then
+            WGRDisposalMailStartInboxSession()
+        end
         WGRUpdateOpenRouterButton()
 
         if WGRRefreshTodoPage then
@@ -3005,6 +5010,14 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         end
 
         WGRMailQueueInboxScan()
+        if WGRDisposalMailOnInboxChanged then
+            WGRDisposalMailOnInboxChanged()
+        end
+        if C_Timer and WGRDisposalMailOnInboxChanged then
+            C_Timer.After(.60,function()
+                if WGRMail.mailboxOpen then WGRDisposalMailOnInboxChanged() end
+            end)
+        end
 
         C_Timer.After(
             0.60,
@@ -3019,8 +5032,7 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         )
 
         local f=WGRMailCreateFrame()
-        f:ClearAllPoints()
-        f:SetPoint("TOPLEFT",MailFrame,"TOPRIGHT",8,-18)
+        WGRMailPositionRouterFrame(f)
 
         -- Do not expose destinations from an earlier scan/character while
         -- the mailbox and carried-bag item data are still settling.
@@ -3065,18 +5077,23 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
                 return
             end
 
-            if #WGRMail.destinations > 0 then
-                f:Show()
+            if #WGRMail.destinations > 0 or
+                (WGRMailUpdateDisposeButtons and WGRMailUpdateDisposeButtons()) then
+                if WGRMailShouldOpenAutomatically() then
+                    f:Show()
+                else
+                    f:Hide()
+                end
+                WGRMailUpdateMailboxRouterButton()
 
-                WGRMailStatus(
-                    string.format(
-                        "Ready. %d destination%s.",
+                WGRMailStatus(#WGRMail.destinations>0 and
+                    string.format('Ready. %d holder destination%s.',
                         #WGRMail.destinations,
-                        #WGRMail.destinations==1 and "" or "s"
-                    )
-                )
+                        #WGRMail.destinations==1 and '' or 's')
+                    or 'Ready. DISPOSE Mail actions available.')
             else
                 f:Hide()
+                WGRMailUpdateMailboxRouterButton()
             end
         end
 
@@ -3126,9 +5143,23 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         )
     elseif event=="MAIL_SEND_INFO_UPDATE" then
         WGRMailCaptureDraftItems()
+        if WGRMail and WGRMail.ownsDraft then
+            -- Any attachment-state event restarts the readiness window. A
+            -- replacement mailbox may emit several while one batch settles.
+            WGRMailResetPreparedReadiness()
+            WGRMail.preparedCount = WGRMailCountCurrentDraftItems()
+            if WGRMailRefreshPreparedSendButton then
+                WGRMailRefreshPreparedSendButton()
+            end
+        end
 
     elseif event=="MAIL_INBOX_UPDATE" then
         WGRMailQueueInboxScan()
+        if C_Timer and WGRDisposalMailOnInboxChanged then
+            C_Timer.After(.25,function()
+                if WGRMail.mailboxOpen then WGRDisposalMailOnInboxChanged() end
+            end)
+        end
 
         -- A Return is staged before Blizzard processes it.  Finalize that
         -- physical MAIL -> MAIL transfer only after the inbox update settles
@@ -3143,6 +5174,9 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
                 end
 
                 WGRMailFinalizePendingReturn()
+                if WGRDisposalMailFinalizeReturn then
+                    WGRDisposalMailFinalizeReturn()
+                end
                 WGRMailRefreshReturnCache()
             end
         )
@@ -3164,11 +5198,25 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         )
 
     elseif event=="MAIL_CLOSED" then
+        -- MAIL_CLOSED / MailFrame visibility are legacy/fallback signals.
+        -- Do not tear down WBGR while Retail still reports an active MailInfo
+        -- interaction (for example when TSM replaces Blizzard's MailFrame).
+        if WGRMailIsMailboxInteractionActive() == true then
+            WGRMailDebug(
+                "MAIL_CLOSED received while MailInfo interaction remains active; ignoring legacy close signal."
+            )
+            WGRMail.mailboxOpen = true
+            WGRUpdateOpenRouterButton()
+            WGRMailUpdateMailboxRouterButton()
+            return
+        end
+
+        if WGRDisposalMailEndInboxSession then WGRDisposalMailEndInboxSession() end
         if WGRMail then
             WGRMail.returnInboxCache = nil
             WGRMail.pendingReturn = nil
         end
-        WGRMailHandleMailboxHidden()
+        WGRMailHandleMailboxHidden(true, "MAIL_CLOSED")
 
         if WGRRefreshTodoPage then
             WGRRefreshTodoPage()
@@ -3179,10 +5227,12 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         local pendingGearDraft =
             WGRMail.pendingGearDraft
 
-        local sentRecipient =
-            WGRMail.preparedRecipient
-            or WGRMail.pendingSendRecipient
-            or (pendingGearDraft and pendingGearDraft.recipient)
+        -- Only the argument supplied to WoW's actual SendMail call is
+        -- authoritative. The Mail Router's preparedRecipient and an earlier
+        -- draft snapshot may be stale after the player edits the recipient.
+        -- If the secure SendMail post-hook did not capture a recipient, fail
+        -- closed rather than inventing a delivery / Retrieve Mail To Do.
+        local sentRecipient = WGRMail.pendingSendRecipient
 
         local sentCount =
             tonumber(
@@ -3194,7 +5244,25 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         -- outgoing draft while WGR owns it, so manual attachment removals
         -- are reflected in the activity log.
 
-        if sentRecipient then
+        local isDisposalSend=sentRecipient and WGRMail.pendingDisposalSendValid and
+            WGRMail.preparedDisposalDraft and
+            WGRMailNormalizeCharacterName(sentRecipient) and
+            string.lower(WGRMailNormalizeCharacterName(sentRecipient))==
+            string.lower(WGRMailNormalizeCharacterName(WGRMail.preparedDisposalDraft.recipient) or '')
+        if isDisposalSend and WGRDisposalMailQueueConfirmedSend then
+            local verified,pending,queued=WGRDisposalMailQueueConfirmedSend(
+                WGRMail.preparedDisposalDraft.entries,sentRecipient,UnitName('player'))
+            if not queued then
+                print('|cffffaa00WBGR:|r Disposal mail sent, but physical mark authorization changed. No unverified retrieval task created.')
+            elseif pending>0 then
+                print('|cffffaa00WBGR:|r DISPOSE mail successfully sent; '..
+                    tostring(pending)..' copy/copies awaiting Bag GUID departure verification. WBGR will retry; do not collect the mail yet.')
+            end
+        end
+        -- A deliberate disposal send to its configured recipient is NOT a
+        -- normal holder delivery. An edited recipient or attachments are
+        -- handled by the existing ordinary-mail tracking instead.
+        if sentRecipient and not isDisposalSend then
             local trackedGearCommitted, trackedRecipient =
                 WGRMailCommitGearSend(
                     sentRecipient,
@@ -3265,12 +5333,39 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
             end
         end
 
+        -- A manually overridden destination should not automatically
+        -- continue Mail Router's Prepare All sequence.
+        if continue
+            and WGRMail.preparedRecipient
+            and (
+                not sentRecipient
+                or string.lower(WGRMailNormalizeCharacterName(sentRecipient) or "")
+                    ~= string.lower(WGRMailNormalizeCharacterName(WGRMail.preparedRecipient) or "")
+            )
+        then
+            continue = false
+            WGRMail.prepareAll = false
+            if WGRMail.frame and WGRMail.frame.prepareAllButton then
+                WGRMail.frame.prepareAllButton:SetText("Prepare All")
+            end
+        end
+
         WGRMail.waitingForSend=false
         WGRMail.preparedRecipient=nil
+        WGRMail.preparedSubject=nil
         WGRMail.preparedCount=0
+        WGRMail.preparedAttachmentLinks=nil
+        WGRMail.preparedAttachmentCounts=nil
+        WGRMailResetPreparedReadiness()
         WGRMail.pendingSendRecipient=nil
         WGRMail.pendingGearDraft=nil
+        WGRMail.preparedDisposalDraft=nil
+        WGRMail.pendingDisposalSendValid=false
         WGRMail.ownsDraft=false
+        WGRMail.removingPreparedAttachment=false
+        if WGRMailRefreshPreparedSendButton then
+            WGRMailRefreshPreparedSendButton()
+        end
         C_Timer.After(.35,function()
             if not WGRMail.mailboxOpen then return end
             WGRMailScan(function()
@@ -3287,8 +5382,25 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
                 end
             end)
         end)
+    elseif event=="BAG_UPDATE_DELAYED" then
+        if WGRDisposalMailTryConfirmPendingSends then
+            -- Empty pending queues return immediately; no surplus scan.
+            local confirmed=WGRDisposalMailTryConfirmPendingSends()
+            -- Successful background verification is reflected in To Do/Recent Activity; keep chat quiet.
+        end
+    elseif event=="MAIL_FAILED" then
+        -- A later successful attempt must capture its own SendMail argument.
+        -- Keep the unsent draft itself available for retry.
+        WGRMail.pendingSendRecipient = nil
+        WGRMail.pendingDisposalSendValid=false
+        if WGRMailRefreshPreparedSendButton then
+            WGRMailRefreshPreparedSendButton()
+        end
     elseif event=="PLAYER_LOGIN" then
         WGRCreateMinimapButton()
+        if WGRDisposalMailResumeSenderPending then
+            C_Timer.After(2.0,WGRDisposalMailResumeSenderPending)
+        end
 
         C_Timer.After(
             2.0,
@@ -3296,6 +5408,7 @@ WGRMailEvents:SetScript("OnEvent",function(_,event)
         )
 
     elseif event=="PLAYER_LOGOUT" then
+        if WGRDisposalMailEndInboxSession then WGRDisposalMailEndInboxSession() end
         if WGRMailTodoSnapshotDirty
             and not (
                 WGRRoutingIsPaused
@@ -3316,13 +5429,17 @@ end)
 
 -- Capture ordinary/manual sends without replacing or wrapping Blizzard's
 -- SendMail function. MAIL_SEND_INFO_UPDATE normally keeps the attachment
--- snapshot current; this secure post-hook supplies the final recipient name
--- and performs a last best-effort capture while the draft is still readable.
+-- snapshot current. This secure post-hook records the recipient argument of
+-- the actual outgoing API call; neither the suggested routing destination
+-- nor the earlier draft's recipient is proof of where the player sent mail.
 if hooksecurefunc and SendMail then
     hooksecurefunc(
         "SendMail",
         function(recipient)
-            WGRMail.pendingSendRecipient = recipient
+            WGRMail.pendingSendRecipient =
+                recipient and strtrim(tostring(recipient)) ~= "" and recipient or nil
+            WGRMail.pendingDisposalSendValid=
+                WGRMailPreparedDisposalMatchesActual(WGRMail.pendingSendRecipient)
 
             local current = WGRMail.pendingGearDraft
             if not current or #(current.items or {}) == 0 then

@@ -315,6 +315,12 @@ function WGRRemoveCharacter(characterName)
         removedAt = time(),
     }
 
+    -- Storage Cleanup must also forget this character's historical Bags/PBK.
+    -- Keep the account's shared Warbank snapshot untouched.
+    if WGRStorageCleanupForgetRemovedCharacter then
+        WGRStorageCleanupForgetRemovedCharacter(characterName)
+    end
+
     -- Removed characters and their personal Bags/Bank are outside WBGR.
     -- Purge any cached held-gear snapshot immediately.
     if WarboundGearRouterDB.heldGearSnapshots then

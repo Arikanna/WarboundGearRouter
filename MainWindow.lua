@@ -1041,12 +1041,6 @@ local function WGRMailScanTrackedInbox()
             currentName
         )
 
-        print(
-            "|cff00ff00WBGR MAIL:|r "
-            .. currentName
-            .. "'s tracked Alt Gear mail has been collected. Mail reminder cleared automatically."
-        )
-
         -- Keep an already-open Check Mail window in sync immediately.
         -- Do not require the user to rerun /wgr mailcheck.
         if WGRMailTracker.frame
@@ -1514,6 +1508,42 @@ local function WGRTodoIsDismissed(
             dismissKey
         ]
         ~= nil
+end
+
+-- A DISPOSE reminder is a snoozable To Do, NOT a disposal operation.
+-- Deliberate inventory checks restore only the reminder for currently visible,
+-- GUID-verified DISPOSE copies. The verified Storage Cleanup staging path may
+-- also invoke this after an explicit SURPLUS -> Bags action so restaging the
+-- same GUID can revive a reminder the user dismissed during an earlier batch.
+-- Passive scans, To Do redraws and /reload never invoke this function and
+-- cannot clear a manual dismissal.
+function WGRRestoreDisposeTodoAfterManualScan(source)
+    if source~='BAGS' and source~='PERSONAL_BANK' and source~='ALL' then
+        return 0
+    end
+    if not (WGRStorageCleanupGetSettings and WGRStorageCleanupGetSettings().enabled
+        and WGRStorageCleanupCountCurrentMarked) then return 0 end
+    local character=UnitName and UnitName('player')
+    if not character or character=='' then return 0 end
+    InitializeDatabase()
+    local dismissed=WarboundGearRouterDB.todoDismissals
+    if type(dismissed)~='table' then return 0 end
+    local restored=0
+    for _,where in ipairs({{'BAGS','BAG'},{'PERSONAL_BANK','PBK'}}) do
+        if source=='ALL' or source==where[1] then
+            local count,signature=WGRStorageCleanupCountCurrentMarked(where[1])
+            if count and count>0 then
+                local key='DISPOSE:'..character..':'..where[2]..':'..
+                    tostring(signature or count)
+                if dismissed[key] then
+                    dismissed[key]=nil
+                    restored=restored+1
+                end
+            end
+        end
+    end
+    if restored>0 and WGRRefreshTodoPage then WGRRefreshTodoPage() end
+    return restored
 end
 
 local function WGRTodoSelectedSpecs(
@@ -2066,6 +2096,74 @@ local function WGRTodoBuildList()
         end
     end
 
+    -- v0.68p: disposal mail has its own in-transit ledger, independent of
+    -- ordinary gear mail and of Removed/Ignored roster membership.
+    if WGRDisposalMailPendingList then
+        for _,pending in ipairs(WGRDisposalMailPendingList()) do
+            local key='DISPOSE_MAIL:'..string.lower(pending.name)..':'..
+                tostring(pending.token or pending.oldest)
+            if not WGRTodoIsDismissed(key) then
+            todo[#todo+1]={kind='DISPOSAL_MAIL_RETRIEVE',priority=1,
+                sortValue=pending.oldest,character=pending.name,count=pending.count,
+                title=pending.name..' — Retrieve '..pending.count..' DISPOSE Mail Item'..
+                    (pending.count==1 and '' or 's'),
+                detail='DISPOSE gear is still tracked in the mail. Collect it into Bags so WBGR can verify the new physical copies; it is not yet sold or disenchanted.'..
+                    (pending.returned and '\nReturned disposal mail may be waiting on the original sender.' or ''),
+                dismissKey=key}
+            end
+        end
+    end
+
+    -- A pending DISPOSE mail ledger is not proof that any particular live Bag
+    -- copy is its missing attachment. Do NOT silently subtract link-only
+    -- guesses from normal routing counts. Warn alongside those tasks until a
+    -- positively GUID-verified adoption or explicitly confirmed recovery.
+    if WGRDisposalMailPendingList then
+        local pendingOwners={}
+        for _,group in ipairs(WGRDisposalMailPendingList()) do
+            pendingOwners[string.lower(group.name)]=group.count
+        end
+        for _,task in ipairs(todo) do
+            if task.kind=='SEND_BAGS' and task.character and
+                pendingOwners[string.lower(task.character)] then
+                task.detail=task.detail..'\nCAUTION: This character has unresolved DISPOSE mail ('..
+                    pendingOwners[string.lower(task.character)]..
+                    ' copies). Verify which physical items are involved before routing; the Send count may include them.'
+            end
+        end
+    end
+
+    -- v0.68j: DISPOSE is an action/task, never a fictitious destination alt.
+    -- List only LIVE physically verified marks belonging to the logged-in
+    -- character. A closed PBK or offline alt is not assumed empty or fresh.
+    if WGRStorageCleanupGetSettings and WGRStorageCleanupGetSettings().enabled
+        and WGRStorageCleanupCountCurrentMarked then
+        local playerName=UnitName and UnitName('player')
+        -- DISPOSE tasks are not routing tasks: an intentionally Removed
+        -- disposal alt still needs to complete its manually chosen disposal.
+        if playerName then
+            for _,where in ipairs({{'BAGS','BAG'},{'PERSONAL_BANK','PBK'}}) do
+                local count,signature=WGRStorageCleanupCountCurrentMarked(where[1])
+                if count>0 then
+                    -- A dismissal is for this exact group of GUID-marked
+                    -- physical copies. New copies restore a new reminder;
+                    -- neither dismissal nor display changes their marks.
+                    local dismissKey='DISPOSE:'..playerName..':'..where[2]..':'..
+                        tostring(signature or count)
+                    if not WGRTodoIsDismissed(dismissKey) then
+                        todo[#todo+1]={kind='DISPOSE_GEAR',action='DISPOSE_GEAR',
+                            priority=3,sortValue=0,character=playerName,count=count,
+                            disposeSource=where[2],
+                            title=playerName..' — Dispose '..count..' Item'..(count==1 and '' or 's')..' ('..where[2]..')',
+                            detail='DISPOSE-marked gear physically present in '..where[2]..'. Selling and disenchanting are always manual. Right-click the copy in Gear Finder or use /wbgr undispose to restore its holder route.',
+                            dismissKey=dismissKey,
+                        }
+                    end
+                end
+            end
+        end
+    end
+
     -- Lowest-priority current Warband Bank routing snapshot.
     local warbank =
         WarboundGearRouterDB.todoWarbankSnapshot
@@ -2432,24 +2530,46 @@ function WGRMailShowLoginReminder()
     for _, entry
         in ipairs(list)
     do
-        if currentName
-            and string.lower(
+        local dismissKey =
+            "MAIL:"
+            .. string.lower(
+                tostring(entry.name)
+            )
+            .. ":"
+            .. WGRTodoLatestMailSendToken(
                 entry.name
-            ) == string.lower(
-                currentName
             )
-        then
-            currentEntry =
-                entry
-        end
 
-        if entry.remaining
-            <= WGR_MAIL_YELLOW
-        then
-            table.insert(
-                urgent,
-                entry
+        local dismissed =
+            WGRTodoIsDismissed(
+                dismissKey
             )
+
+        -- Login chat/popup reminders must honor the same per-send dismissal
+        -- token as the To Do page.  Otherwise a snoozed/handled mail task can
+        -- disappear from To Do while still announcing "alt gear waiting"
+        -- on every login. A later WBGR send changes the token and therefore
+        -- becomes eligible for reminders again.
+        if not dismissed then
+            if currentName
+                and string.lower(
+                    entry.name
+                ) == string.lower(
+                    currentName
+                )
+            then
+                currentEntry =
+                    entry
+            end
+
+            if entry.remaining
+                <= WGR_MAIL_YELLOW
+            then
+                table.insert(
+                    urgent,
+                    entry
+                )
+            end
         end
     end
 
@@ -2459,36 +2579,8 @@ function WGRMailShowLoginReminder()
                 currentEntry.remaining
             )
 
-        local r, g, b =
-            WGRMailUrgencyColor(
-                currentEntry.remaining
-            )
-
-        local countdownColor =
-            string.format(
-                "%02x%02x%02x",
-                math.floor(r * 255),
-                math.floor(g * 255),
-                math.floor(b * 255)
-            )
-
-        print(
-            "|cffffd100========== WBGR MAIL ==========|r"
-        )
-
-        print(
-            "|cffffffff"
-            .. currentEntry.name
-            .. " has alt gear waiting! |r"
-            .. "|cff"
-            .. countdownColor
-            .. remainingText
-            .. ".|r"
-        )
-
-        print(
-            "|cffffd100==============================|r"
-        )
+        -- Login reminders are represented by To Do and the optional WBGR popup.
+        -- Do not also duplicate them into chat.
     end
 
     if not currentEntry
@@ -2542,7 +2634,8 @@ function WGRMailShowLoginReminder()
 end
 
 local function WGRShowMainTab(
-    tabKey
+    tabKey,
+    skipRemember
 )
     local frame =
         WGRMailTracker.frame
@@ -2557,6 +2650,14 @@ local function WGRShowMainTab(
 
     WGRMainActiveTab =
         tabKey
+
+    if not skipRemember
+        and WarboundGearRouterDB
+        and WarboundGearRouterDB.interface
+    then
+        WarboundGearRouterDB.interface.lastMainTab =
+            tabKey
+    end
 
     frame.mailPage:SetShown(
         tabKey == "MAIL"
@@ -3478,6 +3579,14 @@ local function WGRShowHeldGearTooltip(
         )
     end
 
+    GameTooltip:AddLine(" ")
+    GameTooltip:AddLine(
+        tostring(characterName) == "Warband Bank"
+            and "Click to view the Warband Bank in Gear Search."
+            or "Click to view this character in Gear Search.",
+        0.45, 0.85, 1.00
+    )
+
     GameTooltip:Show()
 end
 
@@ -3625,6 +3734,22 @@ local function WGRBuildAboutSubtabs(
             680
         )
 
+    -- Release highlights are available only when explicitly opened from About.
+    -- Keep existing five About subtabs and their documentation untouched.
+    local whatsNewPanel = WGRCreateWhatsNewPanel(
+        aboutPage, aboutDescription,
+        function(view)
+            local frame = WGRMailTracker.frame
+            WGRShowMainTab("GEAR_FINDER")
+            if frame and frame.ShowGearFinderView then frame.ShowGearFinderView(view) end
+        end,
+        function()
+            local frame = WGRMailTracker.frame
+            WGRShowMainTab("SETTINGS")
+            if frame and frame.ShowSettingsTab then frame.ShowSettingsTab("INTERFACE") end
+        end
+    )
+
     local commandsPanel =
         CreateFrame(
             "Frame",
@@ -3662,20 +3787,47 @@ local function WGRBuildAboutSubtabs(
         "Useful Commands"
     )
 
-    local commands = {
-        {"/wbgr", "Open Warbound Gear Router."},
-        {"/wbgr mailrouter", "Open the Mail Router while at a mailbox."},
-        {"/wbgr cleanup", "Rescan and refresh WBGR gear overlays."},
-        {"/wbgr ignore", "Ignore the item currently under your mouse."},
-        {"/wbgr unignore", "Stop ignoring the item currently under your mouse."},
-        {"/wbgr pause", "Pause live tooltips, overlays, Gear Finder, and BAG-only routing while keeping tracking active."},
-        {"/wbgr resume", "Resume live routing and rebuild overlays."},
-        {"/wbgr help", "Show normal WBGR command help."},
-    }
+    local commandsScroll =
+        CreateFrame(
+            "ScrollFrame",
+            nil,
+            commandsPanel,
+            "UIPanelScrollFrameTemplate"
+        )
+    commandsScroll:SetPoint(
+        "TOPLEFT",
+        commandsTitle,
+        "BOTTOMLEFT",
+        0,
+        -10
+    )
+    commandsScroll:SetPoint(
+        "BOTTOMRIGHT",
+        commandsPanel,
+        "BOTTOMRIGHT",
+        -28,
+        0
+    )
+
+    local commandsContent =
+        CreateFrame(
+            "Frame",
+            nil,
+            commandsScroll
+        )
+    commandsContent:SetWidth(
+        1260
+    )
+    commandsScroll:SetScrollChild(
+        commandsContent
+    )
+
+    -- The same entries are used by /wbgr help and this panel.
+    local commands = WGRPublicCommandHelp or {}
 
     for i, command in ipairs(commands) do
         local commandText =
-            commandsPanel:CreateFontString(
+            commandsContent:CreateFontString(
                 nil,
                 "OVERLAY",
                 "GameFontNormal"
@@ -3683,7 +3835,7 @@ local function WGRBuildAboutSubtabs(
         commandText:SetPoint(
             "TOPLEFT",
             0,
-            -32 - ((i - 1) * 24)
+            -((i - 1) * 24)
         )
         commandText:SetWidth(
             210
@@ -3696,7 +3848,7 @@ local function WGRBuildAboutSubtabs(
         )
 
         local description =
-            commandsPanel:CreateFontString(
+            commandsContent:CreateFontString(
                 nil,
                 "OVERLAY",
                 "GameFontHighlight"
@@ -3704,7 +3856,7 @@ local function WGRBuildAboutSubtabs(
         description:SetPoint(
             "TOPLEFT",
             225,
-            -32 - ((i - 1) * 24)
+            -((i - 1) * 24)
         )
         description:SetWidth(
             900
@@ -3716,6 +3868,13 @@ local function WGRBuildAboutSubtabs(
             command[2]
         )
     end
+
+    commandsContent:SetHeight(
+        math.max(
+            1,
+            (#commands * 24)
+        )
+    )
 
     local gearPanel =
         CreateFrame(
@@ -5617,8 +5776,18 @@ local function WGRBuildAboutSubtabs(
     )
 
     local function ShowAboutSubtab(
-        key
+        key,
+        skipRemember
     )
+        if not skipRemember
+            and key ~= "WHATS_NEW"
+            and WarboundGearRouterDB
+            and WarboundGearRouterDB.interface
+        then
+            WarboundGearRouterDB.interface.lastAboutTab =
+                key
+        end
+
         commandsPanel:SetShown(
             key == "COMMANDS"
         )
@@ -5633,6 +5802,9 @@ local function WGRBuildAboutSubtabs(
         )
         faqPanel:SetShown(
             key == "FAQ"
+        )
+        whatsNewPanel:SetShown(
+            key == "WHATS_NEW"
         )
 
         for tabKey, button
@@ -5719,8 +5891,12 @@ local function WGRBuildAboutSubtabs(
         end
     )
 
+    aboutPage.ShowSubtab =
+        ShowAboutSubtab
+
     ShowAboutSubtab(
-        "GETTING_STARTED"
+        "GETTING_STARTED",
+        true
     )
 end
 
@@ -5792,6 +5968,14 @@ local function WGRMailCreateTrackerFrame()
 
     frame:SetFrameStrata(
         "DIALOG"
+    )
+
+    -- Keep WBGR on its existing high DIALOG strata, but let the main
+    -- window and Mail Router naturally trade front-most order when the
+    -- user interacts with either one. SetToplevel is applied only to
+    -- these two WBGR root windows; no addon-wide/global focus manager.
+    frame:SetToplevel(
+        true
     )
 
     frame:SetMovable(
@@ -7046,6 +7230,191 @@ local function WGRMailCreateTrackerFrame()
         }
     end
 
+    -- This is an explicit user request, never a passive To Do refresh.
+    -- Read-only until physical-copy and disposal reconciliation are complete.
+    -- v0.68i: Explicit, frame-sliced To Do surplus check. The underlying
+    -- classifier and routing safeguards are unchanged; no DISPOSE decisions.
+    local function RunTodoSurplusPreview(entry,button)
+        if WGRStorageCleanupTodoCheckJob and WGRStorageCleanupTodoCheckJob.running then
+            print('|cffffaa00WBGR:|r Check Surplus is already running.');return
+        end
+        if not (WGRStorageCleanupGetSettings and WGRStorageCleanupGetSettings().enabled) then
+            print('|cffffaa00WBGR:|r Enable Storage Cleanup to check for surplus.');return
+        end
+        local name=UnitName('player')
+        if not name or tostring(name):lower()~=tostring(entry.character or ''):lower() then
+            print('|cffffaa00WBGR:|r Log onto the To Do character first.');return
+        end
+        local source=entry.action=='SEND_PBK' and 'PERSONAL_BANK' or 'BAGS'
+        if source=='PERSONAL_BANK' and not (WGRGearFinderIsPersonalBankOpen
+            and WGRGearFinderIsPersonalBankOpen()) then
+            print('|cffffaa00WBGR:|r Open Personal Bank to check its items.');return
+        end
+        if not WGRStorageCleanupStartHolderBoundCheckAsync then
+            print('|cffff5555WBGR:|r Frame-sliced surplus preview is not available.');return
+        end
+        local function restore()
+            if button then button:SetText('Check Surplus');button:SetEnabled(true) end
+        end
+        local function failed(message)
+            restore()
+            print('|cffffaa00WBGR:|r '..tostring(message))
+        end
+        local inventoryRevision=WGRStorageCleanupGetInventoryRevision and
+            WGRStorageCleanupGetInventoryRevision() or nil
+        if button then button:SetText('Checking...');button:SetEnabled(false) end
+        local job,err=WGRStorageCleanupStartHolderBoundCheckAsync(source,
+            function(report,outgoing,candidates,stats)
+                restore()
+                -- Yielding allows gameplay/inventory changes between slices.
+                -- Never show previously observed candidate copies as POSSIBLE
+                -- after they leave their original slots or monitoring is OFF.
+                if not (WGRStorageCleanupGetSettings and WGRStorageCleanupGetSettings().enabled)
+                    or tostring(UnitName('player') or '')~=tostring(name) then
+                    print('|cffffaa00WBGR:|r Inventory context changed during surplus check; rerun if needed.')
+                    return
+                end
+                if source=='PERSONAL_BANK' and not (WGRGearFinderIsPersonalBankOpen
+                    and WGRGearFinderIsPersonalBankOpen()) then
+                    print('|cffffaa00WBGR:|r Personal Bank closed during check. Please rerun.')
+                    return
+                end
+                if inventoryRevision and WGRStorageCleanupGetInventoryRevision and
+                    WGRStorageCleanupGetInventoryRevision()~=inventoryRevision then
+                    print('|cffffaa00WBGR:|r Inventory changed during surplus evaluation; no disposal marks applied. Please rerun.')
+                    return
+                end
+                for _,candidate in ipairs(candidates or {}) do
+                    if not (C_Container and C_Container.GetContainerItemLink
+                        and C_Container.GetContainerItemLink(candidate.bagID,candidate.slotID)==candidate.itemLink) then
+                        print('|cffffaa00WBGR:|r Items moved during surplus check; rerun for current results.')
+                        return
+                    end
+                    local guid=WGRStorageCleanupGetPhysicalCopyGUID and
+                        WGRStorageCleanupGetPhysicalCopyGUID(
+                            candidate.bagID,candidate.slotID,candidate.itemLink)
+                    if not candidate.guid or guid~=candidate.guid then
+                        print('|cffffaa00WBGR:|r Physical item identity changed or was unavailable during check; rerun.')
+                        return
+                    end
+                    local currentRoute,currentStatus=WGRBuildLoadedItemRecommendation(candidate.itemLink)
+                    if not (currentStatus=='ready' and currentRoute and
+                        currentRoute.kind=='holder' and currentRoute.name==candidate.normalRecipient) then
+                        print('|cffffaa00WBGR:|r Holder recommendation changed during check; rerun.')
+                        return
+                    end
+                end
+                local marked=WGRStorageCleanupApplyVerifiedAutoMarks and
+                    WGRStorageCleanupApplyVerifiedAutoMarks(report) or {applied=0,withheld=0}
+                -- This completed, deliberate Check Surplus is also a request
+                -- to see unfinished DISPOSE work again. Only restore a live
+                -- matching reminder; never clear marks or other To Dos.
+                if WGRRestoreDisposeTodoAfterManualScan then
+                    WGRRestoreDisposeTodoAfterManualScan(source)
+                end
+                if marked.applied>0 then
+                    print('|cff33ff99WBGR:|r '..marked.applied..' category-verified physical copies marked DISPOSE; holder routing suspended.')
+                elseif marked.withheld>0 then
+                    print('|cffffaa00WBGR:|r '..marked.withheld..' POSSIBLE copies remain routed: their specific stock/demand was not sufficiently verified.')
+                end
+                print(string.format('|cff33ff99WBGR:|r To Do surplus preview (%s, %s): %d outgoing, %d holder-bound checked; %d POSSIBLE excess, %d retained, %d unresolved.',
+                    tostring(name),source,outgoing or 0,report.checked or 0,
+                    #(report.possible or {}),#(report.retained or {}),#(report.uncertain or {})))
+                for i,item in ipairs(report.possible or {}) do
+                    if i<=12 then
+                        local disposed=WGRStorageCleanupIsDisposeCopy and
+                            WGRStorageCleanupIsDisposeCopy(item.bagID,item.slotID,item.itemLink)
+                        if disposed then
+                            print('  |cffaaaaaaDISPOSE:|r '..tostring(item.itemLink)..' (holder routing suspended)')
+                        else
+                            print('  |cffffbb55POSSIBLE:|r '..tostring(item.itemLink)..' (routing unchanged; do not dispose from preview)')
+                        end
+                    end
+                end
+                if #(report.possible or {})>12 then
+                    print('  '..(#report.possible-12)..' additional possible items not listed.')
+                end
+                if (outgoing or 0)>#(candidates or {}) then
+                    print('  '..(outgoing-#candidates)..' outgoing item(s) are not holder-only; normal upgrade/future routing remains protected.')
+                end
+                if stats and stats.startedAt and debugprofilestop then
+                    local wallMs=math.max(0,debugprofilestop()-stats.startedAt)
+                    print(string.format('|cff33ff99WBGR:|r Check Surplus: %.1f ms work over %d frames (largest processing slice %.1f ms; elapsed %.1f ms; skipped %d unrelated, reused %d demand checks).',
+                        stats.activeMs or 0,stats.frames or 0,stats.maxSliceMs or 0,wallMs,
+                        report.stockSkipped or 0,report.stockDemandReused or 0))
+                end
+                if report.provisional then
+                    print('|cffffaa00WBGR:|r Saved inventory has tracking gaps, incomplete coverage, or legacy scans.')
+                end
+                print('|cffffaa00WBGR:|r POSSIBLE is not disposal authorization. Only verified DISPOSE marks suspend holder routing; selling/disenchanting remains manual.')
+            end,
+            failed)
+        if not job then restore();failed(err or 'Cannot start Check Surplus');return end
+        WGRStorageCleanupTodoCheckJob=job
+    end
+
+    -- Choose an explicit DISPOSE binding for the To Do quick action.  The
+    -- Mail Router itself prepares from the selected binding *after* switching
+    -- to the Blizzard Send tab.  An earlier candidate scan can incorrectly
+    -- return zero, so do not require that scan if just one binding is set.
+    -- With two configured destinations, preserve the existing physical-copy
+    -- group selector, and refuse ambiguity instead of mailing the wrong type.
+    function WGRTodoChooseDisposalMailGroup(settings,selectGroup)
+        if not (settings and settings.enabled) then
+            return nil,nil,'Storage Cleanup is OFF.'
+        end
+        local groups={}
+        if settings.warboundRecipient and settings.warboundRecipient~='CURRENT' then
+            groups[#groups+1]={'WARBAND',settings.warboundRecipient}
+        end
+        if settings.boeRecipient and settings.boeRecipient~='CURRENT' then
+            groups[#groups+1]={'BOE',settings.boeRecipient}
+        end
+        if #groups==0 then
+            return nil,nil,'Choose a DISPOSE mail recipient in Storage Cleanup.'
+        end
+        if #groups==1 then return groups[1][1],groups[1][2] end
+        local binding,recipient
+        if selectGroup then binding,recipient=selectGroup() end
+        if binding and recipient then return binding,recipient end
+        return nil,nil,'Both disposal destinations are configured. Choose Warbound or BoE DISPOSE in Mail Router.'
+    end
+
+    -- Measure a row only after its final, wrapped text and controls exist.
+    -- It uses real FontString glyph height rather than hard-coded task-type
+    -- heights, so long translated messages and UI scaling are accommodated.
+    function WGRTodoMeasuredRowHeight(row,entry,checkAvailable)
+        local function textHeight(font,fallback)
+            if not font then return 0 end
+            local t=font.GetText and font:GetText()
+            if not t or t=='' then return 0 end
+            local h=font.GetStringHeight and font:GetStringHeight()
+            if type(h)~='number' or h<=0 then h=fallback end
+            return h
+        end
+        local titleH=textHeight(row.title,15)
+        local detailH=textHeight(row.detail,13)
+        local urgencyH=textHeight(row.urgency,13)
+        local textBottom=2+titleH+(detailH>0 and 4+detailH or 0)
+            +(urgencyH>0 and 4+urgencyH or 0)
+        local controlsBottom=0
+        if row.action:IsShown() then
+            controlsBottom=(entry.action=='SEND_PBK' and 6 or 4)+row.action:GetHeight()
+        end
+        if row.action2:IsShown() then
+            controlsBottom=controlsBottom+5+row.action2:GetHeight()
+        end
+        if checkAvailable and row.surplusCheck:IsShown() then
+            controlsBottom=controlsBottom+5+row.surplusCheck:GetHeight()
+        end
+        if row.dismiss:IsShown() then
+            controlsBottom=controlsBottom+6+row.dismiss:GetHeight()
+        end
+        -- Twelve pixels of consistent breathing room after the lower of
+        -- the text or action stacks, including the separator line.
+        return math.ceil(math.max(textBottom,controlsBottom)+12)
+    end
+
     local function CreateTodoRow(
         index
     )
@@ -7184,6 +7553,11 @@ local function WGRMailCreateTrackerFrame()
 
         action2:Hide()
 
+        local surplusCheck = CreateFrame("Button",nil,row,"UIPanelButtonTemplate")
+        surplusCheck:SetSize(118,23)
+        surplusCheck:SetText("Check Surplus")
+        surplusCheck:Hide()
+
         local actionHelp =
             row:CreateFontString(
                 nil,
@@ -7283,6 +7657,7 @@ local function WGRMailCreateTrackerFrame()
             action
         row.action2 =
             action2
+        row.surplusCheck = surplusCheck
         row.actionHelp =
             actionHelp
         row.dismiss =
@@ -7392,14 +7767,13 @@ local function WGRMailCreateTrackerFrame()
                         index
                     )
 
-                local rowHeight =
-                    entry.action == "SEND_PBK"
-                    and 104
-                    or 76
-
-                row:SetHeight(
-                    rowHeight
-                )
+                local cleanupOn=WGRStorageCleanupGetSettings
+                    and WGRStorageCleanupGetSettings().enabled==true
+                local checkAvailable=cleanupOn and
+                    (entry.action=="SEND_BAGS" or entry.action=="SEND_PBK")
+                -- Start with a valid size for glyph measurement; final row
+                -- height is computed below, after all text/buttons are set.
+                row:SetHeight(76)
 
                 row:ClearAllPoints()
                 row:SetPoint(
@@ -7409,10 +7783,6 @@ local function WGRMailCreateTrackerFrame()
                     0,
                     -todoOffset
                 )
-
-                todoOffset =
-                    todoOffset
-                    + rowHeight
 
                 row.title:SetText(
                     entry.title
@@ -7427,6 +7797,15 @@ local function WGRMailCreateTrackerFrame()
                     baseDetail
                 )
 
+                -- Reinitialize pooled To Do row positions so a former PBK
+                -- row does not retain bank-only button anchors in BAG mode.
+                row.action:SetSize(132,23)
+                row.action:ClearAllPoints()
+                row.action:SetPoint("TOPRIGHT",row,"TOPRIGHT",-2,-4)
+                row.surplusCheck:Hide()
+                row.surplusCheck:SetScript("OnClick",nil)
+                row.surplusCheck:SetScript("OnEnter",nil)
+                row.surplusCheck:SetScript("OnLeave",nil)
                 row.action2:Hide()
                 row.action2:SetScript(
                     "OnClick",
@@ -7459,7 +7838,14 @@ local function WGRMailCreateTrackerFrame()
                     or ""
                 )
 
-                if entry.kind
+                if entry.kind=='DISPOSE_GEAR' then
+                    -- Disposal remains fully manual. The only optional
+                    -- convenience is to prepare a mail draft for a configured
+                    -- recipient when an actual mailbox is open.
+                    row.action2:Hide()
+                elseif entry.kind=='DISPOSAL_MAIL_RETRIEVE' then
+                    row.urgency:SetTextColor(.85,.85,.85)
+                elseif entry.kind
                     == "MAIL_RETRIEVE"
                 then
                     local r, g, b =
@@ -7488,13 +7874,92 @@ local function WGRMailCreateTrackerFrame()
                     )
                 end
 
+                row.dismiss:Show()
                 row.action:Hide()
                 row.actionHelp:SetText(
                     ""
                 )
                 row.actionHelp:Hide()
 
-                if entry.kind
+                if entry.kind=='DISPOSE_GEAR' then
+                    row.actionHelp:Hide()
+                    row.action2:Hide()
+                    local isCurrent=currentName and entry.character and
+                        string.lower(tostring(currentName))==string.lower(tostring(entry.character))
+                    -- Keep To Do rendering cheap: don't enumerate Bags or
+                    -- run item eligibility scans until the user CLICKS.
+                    local settings=WGRStorageCleanupGetSettings and
+                        WGRStorageCleanupGetSettings()
+                    local configured=settings and ((settings.warboundRecipient and
+                        settings.warboundRecipient~='CURRENT') or
+                        (settings.boeRecipient and settings.boeRecipient~='CURRENT'))
+                    local bagTask=entry.disposeSource=='BAG'
+                    row.action:Show()
+                    row.action:SetText('Prepare Mail')
+                    row.action:SetEnabled((isCurrent and bagTask~=nil and configured and
+                        WGRMail and WGRMail.mailboxOpen and WGRMailPrepareDisposalDraft~=nil)
+                        and true or false)
+                    row.action:SetScript('OnEnter',nil)
+                    row.action:SetScript('OnLeave',nil)
+                    row.action:SetScript('OnClick',function()
+                        local nowSettings=WGRStorageCleanupGetSettings and
+                            WGRStorageCleanupGetSettings()
+                        local binding,target,reason=WGRTodoChooseDisposalMailGroup(
+                            nowSettings,WGRStorageCleanupNextDisposalMailGroup)
+                        if not binding then
+                            print('|cffffaa00WBGR:|r '..tostring(reason))
+                            if WGRMailOpenRouterManual and nowSettings and
+                                nowSettings.warboundRecipient~='CURRENT' and
+                                nowSettings.boeRecipient~='CURRENT' then
+                                WGRMailOpenRouterManual()
+                            end
+                            return
+                        end
+                        if not WGRMailPrepareDisposalDraft then
+                            print('|cffffaa00WBGR:|r Disposal mail preparation unavailable.')
+                            return
+                        end
+                        local ok,why=WGRMailPrepareDisposalDraft(target,binding)
+                        if not ok then print('|cffffaa00WBGR:|r '..tostring(why)) end
+                    end)
+                    if not (WGRMail and WGRMail.mailboxOpen) then
+                        row.detail:SetText(baseDetail..'\nOpen a mailbox to prepare disposal mail; use Storage Cleanup to move bank items.')
+                    elseif not configured then
+                        row.detail:SetText(baseDetail..'\nChoose a disposal recipient in Storage Cleanup, or move items to Bags.')
+                    else
+                        row.detail:SetText(baseDetail..'\nPrepare a disposal mail draft; review the recipient and press Send yourself.')
+                    end
+                elseif entry.kind=='DISPOSAL_MAIL_RETRIEVE' then
+                    row.action:Show()
+                    row.action2:Hide()
+                    row.action:SetText('Open Inbox')
+                    local isCurrent=currentName and entry.character and
+                        string.lower(tostring(currentName))==string.lower(tostring(entry.character))
+                    row.action:SetEnabled(not not (isCurrent and WGRMail and WGRMail.mailboxOpen))
+                    if not isCurrent then
+                        row.detail:SetText(baseDetail..'\nLog onto '..tostring(entry.character)..' and open the mailbox.')
+                    elseif not (WGRMail and WGRMail.mailboxOpen) then
+                        row.detail:SetText(baseDetail..'\nOpen a mailbox to retrieve the physical copies.')
+                    end
+                    row.action:SetScript('OnClick',function()
+                        if MailFrameTab_OnClick and MailFrameTab1 then
+                            MailFrameTab_OnClick(MailFrameTab1)
+                        elseif InboxFrame then InboxFrame:Show() end
+                    end)
+                    row.action2:Show()
+                    row.action2:SetText('Review Copies')
+                    row.action2:ClearAllPoints()
+                    row.action2:SetSize(132,21)
+                    row.action2:SetPoint('TOPRIGHT',row.action,'BOTTOMRIGHT',0,-5)
+                    row.action2:SetEnabled(isCurrent and cleanupOn and true or false)
+                    row.action2:SetScript('OnClick',function()
+                        if WGRDisposalMailReviewCurrentCopies then
+                            WGRDisposalMailReviewCurrentCopies() end
+                    end)
+                    row.dismiss:ClearAllPoints()
+                    row.dismiss:SetPoint('TOPRIGHT',row.action2,'BOTTOMRIGHT',0,-5)
+                    row.detail:SetText(row.detail:GetText()..'\nReview Copies offers explicit, confirmed recovery if automatic tracking fails. Dismiss hides only this reminder; the transfer ledger remains pending.')
+                elseif entry.kind
                     == "MAIL_RETRIEVE"
                 then
                     row.action:Show()
@@ -7909,6 +8374,30 @@ local function WGRMailCreateTrackerFrame()
                     )
                 end
 
+                if checkAvailable then
+                    row.surplusCheck:Show()
+                    row.surplusCheck:ClearAllPoints()
+                    row.surplusCheck:SetPoint("TOPRIGHT",
+                        entry.action=="SEND_PBK" and row.action2 or row.action,
+                        "BOTTOMRIGHT",0,-5)
+                    local canRun=currentName
+                        and tostring(currentName):lower()==tostring(entry.character or ''):lower()
+                        and (entry.action~='SEND_PBK'
+                            or (WGRGearFinderIsPersonalBankOpen
+                                and WGRGearFinderIsPersonalBankOpen()))
+                    row.surplusCheck:SetEnabled(canRun and true or false)
+                    row.surplusCheck:SetScript("OnClick",function() RunTodoSurplusPreview(entry,row.surplusCheck) end)
+                    row.surplusCheck:SetScript("OnEnter",function(self)
+                        GameTooltip:SetOwner(self,"ANCHOR_RIGHT")
+                        GameTooltip:AddLine("Check for Surplus (on demand)",1,0.82,0)
+                        GameTooltip:AddLine("Manually checks this source's holder-bound items. Only fully verified copies may be marked DISPOSE; provisional results remain routed. No selling, disenchanting or moving occurs.",1,1,1,true)
+                        GameTooltip:Show()
+                    end)
+                    row.surplusCheck:SetScript("OnLeave",function() GameTooltip:Hide() end)
+                    row.dismiss:ClearAllPoints()
+                    row.dismiss:SetPoint("TOPRIGHT",row.surplusCheck,"BOTTOMRIGHT",0,-5)
+                end
+
                 row.dismiss:SetScript(
                     "OnClick",
                     function()
@@ -7925,6 +8414,9 @@ local function WGRMailCreateTrackerFrame()
                     end
                 )
 
+                local measuredHeight=WGRTodoMeasuredRowHeight(row,entry,checkAvailable)
+                row:SetHeight(measuredHeight)
+                todoOffset=todoOffset+measuredHeight
                 row:Show()
             end
 
@@ -10789,6 +11281,21 @@ local function WGRMailCreateTrackerFrame()
             GameTooltip:Hide()
         end
     )
+    frame.warbandRosterRow.heldGearButton:RegisterForClicks(
+        "LeftButtonUp",
+        "RightButtonUp"
+    )
+    frame.warbandRosterRow.heldGearButton:SetScript(
+        "OnClick",
+        function()
+            GameTooltip:Hide()
+            WGRShowMainTab("GEAR_FINDER")
+
+            if frame.ShowGearSearchForLocation then
+                frame.ShowGearSearchForLocation("WBK")
+            end
+        end
+    )
 
     frame.UpdateRoster =
         function()
@@ -11149,6 +11656,11 @@ local function WGRMailCreateTrackerFrame()
                         -1
                     )
 
+                    row.heldGearButton:RegisterForClicks(
+                        "LeftButtonUp",
+                        "RightButtonUp"
+                    )
+
                     row.heldGearButton:Hide()
 
                     local classText =
@@ -11505,12 +12017,15 @@ local function WGRMailCreateTrackerFrame()
                         or ""
                     )
 
+                    row.heldGearButton.WGRCharacterName =
+                        characterName
+
                     row.heldGearButton:SetScript(
                         "OnEnter",
                         function(self)
                             WGRShowHeldGearTooltip(
                                 self,
-                                characterName
+                                self.WGRCharacterName
                             )
                         end
                     )
@@ -11519,6 +12034,27 @@ local function WGRMailCreateTrackerFrame()
                         "OnLeave",
                         function()
                             GameTooltip:Hide()
+                        end
+                    )
+
+                    row.heldGearButton:SetScript(
+                        "OnClick",
+                        function(self)
+                            local target =
+                                self.WGRCharacterName
+
+                            if not target or target == "" then
+                                return
+                            end
+
+                            GameTooltip:Hide()
+                            WGRShowMainTab("GEAR_FINDER")
+
+                            if frame.ShowGearSearchForCharacter then
+                                frame.ShowGearSearchForCharacter(
+                                    target
+                                )
+                            end
                         end
                     )
                 end
@@ -12409,8 +12945,16 @@ local function WGRMailCreateTrackerFrame()
 
     local activeSettingsTab = "ELIGIBLE"
 
-    local function WGRShowSettingsTab(key)
+    local function WGRShowSettingsTab(key, skipRemember)
         activeSettingsTab = key
+
+        if not skipRemember
+            and WarboundGearRouterDB
+            and WarboundGearRouterDB.interface
+        then
+            WarboundGearRouterDB.interface.lastSettingsTab =
+                key
+        end
 
         for panelKey, panel
             in pairs(settingsPanels)
@@ -13292,6 +13836,11 @@ local function WGRMailCreateTrackerFrame()
                     end
                 )
 
+                -- Ignored-item rows use the fixed 40px layout established by
+                -- WGRCreateIgnoredRow().  Do not run To Do row measurement here:
+                -- those controls do not exist on ignored rows and aborting this
+                -- refresh after row 1 hides every later ignored item.
+                row:SetHeight(40)
                 row:Show()
             end
 
@@ -14213,6 +14762,13 @@ local function WGRMailCreateTrackerFrame()
             if frame.WGRApplyBackgroundOpacity then
                 frame:WGRApplyBackgroundOpacity()
             end
+
+            if WGRMail
+                and WGRMail.frame
+                and WGRMail.frame.WGRApplyBackgroundOpacity
+            then
+                WGRMail.frame:WGRApplyBackgroundOpacity()
+            end
         end
     )
 
@@ -14895,14 +15451,6 @@ local function WGRMailCreateTrackerFrame()
             "UICheckButtonTemplate"
         )
 
-    mailReminderCheck:SetPoint(
-        "TOPLEFT",
-        minimapCheck,
-        "BOTTOMLEFT",
-        0,
-        -8
-    )
-
     local mailReminderLabel =
         interfacePanel:CreateFontString(
             nil,
@@ -14937,8 +15485,184 @@ local function WGRMailCreateTrackerFrame()
         end
     )
 
+    interfacePanel.WGRReturnLastPageCheck =
+        CreateFrame(
+            "CheckButton",
+            nil,
+            interfacePanel,
+            "UICheckButtonTemplate"
+        )
+
+    interfacePanel.WGRReturnLastPageCheck:SetPoint(
+        "TOPLEFT",
+        minimapCheck,
+        "BOTTOMLEFT",
+        0,
+        -8
+    )
+
+    interfacePanel.WGRReturnLastPageLabel =
+        interfacePanel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontHighlight"
+        )
+
+    interfacePanel.WGRReturnLastPageLabel:SetPoint(
+        "LEFT",
+        interfacePanel.WGRReturnLastPageCheck,
+        "RIGHT",
+        2,
+        0
+    )
+
+    interfacePanel.WGRReturnLastPageLabel:SetText(
+        "Return to the Last Page Viewed"
+    )
+
+    interfacePanel.WGRReturnLastPageCheck:SetChecked(
+        WarboundGearRouterDB.interface.returnToLastPage
+        == true
+    )
+
+    interfacePanel.WGRReturnLastPageCheck:SetScript(
+        "OnClick",
+        function(self)
+            WarboundGearRouterDB.interface.returnToLastPage =
+                self:GetChecked()
+                and true
+                or false
+        end
+    )
+
+    mailReminderCheck:SetPoint(
+        "TOPLEFT",
+        interfacePanel.WGRReturnLastPageCheck,
+        "BOTTOMLEFT",
+        0,
+        -8
+    )
+
+    interfacePanel.WGRMailRouterModeLabel =
+        interfacePanel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontHighlight"
+        )
+
+    interfacePanel.WGRMailRouterModeLabel:SetPoint(
+        "TOPLEFT",
+        mailReminderCheck,
+        "BOTTOMLEFT",
+        4,
+        -12
+    )
+
+    interfacePanel.WGRMailRouterModeLabel:SetText(
+        "Mail Router at Mailbox:"
+    )
+
+    interfacePanel.WGRMailRouterModeDropdown =
+        CreateFrame(
+            "Frame",
+            nil,
+            interfacePanel,
+            "UIDropDownMenuTemplate"
+        )
+
+    interfacePanel.WGRMailRouterModeDropdown:SetPoint(
+        "LEFT",
+        interfacePanel.WGRMailRouterModeLabel,
+        "RIGHT",
+        -7,
+        -1
+    )
+
+    UIDropDownMenu_SetWidth(
+        interfacePanel.WGRMailRouterModeDropdown,
+        155
+    )
+
+    interfacePanel.WGRMailRouterModeNote =
+        interfacePanel:CreateFontString(
+            nil,
+            "OVERLAY",
+            "GameFontHighlightSmall"
+        )
+
+    interfacePanel.WGRMailRouterModeNote:SetPoint(
+        "TOPLEFT",
+        interfacePanel.WGRMailRouterModeLabel,
+        "BOTTOMLEFT",
+        0,
+        -10
+    )
+
+    interfacePanel.WGRMailRouterModeNote:SetTextColor(
+        0.72,
+        0.72,
+        0.72
+    )
+
+    interfacePanel.WGRMailRouterModeNote:SetText(
+        "You can still open Mail Router from the To Do tab or with /wbgr mailrouter."
+    )
+
+    interfacePanel.WGRRefreshMailRouterMode =
+        function()
+            if not WarboundGearRouterDB.interface.mailRouterMailboxMode then
+                WarboundGearRouterDB.interface.mailRouterMailboxMode =
+                    WarboundGearRouterDB.interface.openMailRouterAutomatically == false
+                    and "BUTTON"
+                    or "AUTO"
+            end
+
+            UIDropDownMenu_SetText(
+                interfacePanel.WGRMailRouterModeDropdown,
+                WarboundGearRouterDB.interface.mailRouterMailboxMode == "BUTTON"
+                    and "Show Button"
+                    or (WarboundGearRouterDB.interface.mailRouterMailboxMode == "NONE"
+                        and "Do Nothing"
+                        or "Open Automatically")
+            )
+
+            interfacePanel.WGRMailRouterModeNote:SetShown(
+                WarboundGearRouterDB.interface.mailRouterMailboxMode == "NONE"
+            )
+        end
+
+    UIDropDownMenu_Initialize(
+        interfacePanel.WGRMailRouterModeDropdown,
+        function()
+            for _, entry in ipairs({
+                {"AUTO", "Open Automatically"},
+                {"BUTTON", "Show Button"},
+                {"NONE", "Do Nothing"},
+            }) do
+                local info = UIDropDownMenu_CreateInfo()
+                info.text = entry[2]
+                info.checked =
+                    WarboundGearRouterDB.interface.mailRouterMailboxMode == entry[1]
+                info.func =
+                    function()
+                        WarboundGearRouterDB.interface.mailRouterMailboxMode = entry[1]
+                        WarboundGearRouterDB.interface.openMailRouterAutomatically =
+                            entry[1] == "AUTO"
+                        interfacePanel.WGRRefreshMailRouterMode()
+                        if WGRMailUpdateMailboxRouterButton then
+                            WGRMailUpdateMailboxRouterButton()
+                        end
+                    end
+                UIDropDownMenu_AddButton(info)
+            end
+        end
+    )
+
+    interfacePanel.WGRRefreshMailRouterMode()
+
     WGRShowSettingsTab(
-        activeSettingsTab
+        activeSettingsTab,
+        true
     )
 
     -- ========================================================
@@ -15097,6 +15821,9 @@ local function WGRMailCreateTrackerFrame()
         aboutDescription
     )
 
+    -- Small, passive entry point on the Version row; never a startup prompt.
+    WGRCreateWhatsNewButton(aboutPage, versionValue)
+
     tabMail:SetScript(
         "OnClick",
         function()
@@ -15217,7 +15944,8 @@ local function WGRMailCreateTrackerFrame()
     WGRMailUpdateTrackerFrame()
 
     WGRShowMainTab(
-        "MAIL"
+        "MAIL",
+        true
     )
 
     return frame
@@ -15228,6 +15956,109 @@ function WGRIsMainWindowShown()
         WGRMailTracker.frame
         and WGRMailTracker.frame:IsShown()
         or false
+end
+
+local function WGRShowPreferredOpeningPage(
+    frame
+)
+    local interface =
+        WarboundGearRouterDB
+        and WarboundGearRouterDB.interface
+
+    if not interface
+        or interface.returnToLastPage ~= true
+    then
+        WGRShowMainTab(
+            "MAIL",
+            true
+        )
+        return
+    end
+
+    local mainTab =
+        interface.lastMainTab
+
+    if mainTab ~= "MAIL"
+        and mainTab ~= "GEAR_FINDER"
+        and mainTab ~= "ROSTER"
+        and mainTab ~= "SETTINGS"
+        and mainTab ~= "ABOUT"
+    then
+        mainTab =
+            "MAIL"
+    end
+
+    WGRShowMainTab(
+        mainTab,
+        true
+    )
+
+    if mainTab == "GEAR_FINDER"
+        and frame
+        and frame.ShowGearFinderView
+    then
+        local view =
+            interface.lastGearFinderView
+            or "RECOMMENDATIONS"
+
+        if view ~= "RECOMMENDATIONS"
+            and view ~= "GATHER"
+            and view ~= "SEARCH"
+            and view ~= "CLEANUP"
+        then
+            view =
+                "RECOMMENDATIONS"
+        end
+
+        frame.ShowGearFinderView(
+            view,
+            true
+        )
+    elseif mainTab == "SETTINGS"
+        and frame
+        and frame.ShowSettingsTab
+    then
+        local settingsTab =
+            interface.lastSettingsTab
+            or "ELIGIBLE"
+
+        if settingsTab ~= "ELIGIBLE"
+            and settingsTab ~= "ROUTING"
+            and settingsTab ~= "APPEARANCE"
+            and settingsTab ~= "INTERFACE"
+        then
+            settingsTab =
+                "ELIGIBLE"
+        end
+
+        frame.ShowSettingsTab(
+            settingsTab,
+            true
+        )
+    elseif mainTab == "ABOUT"
+        and frame
+        and frame.aboutPage
+        and frame.aboutPage.ShowSubtab
+    then
+        local aboutTab =
+            interface.lastAboutTab
+            or "GETTING_STARTED"
+
+        if aboutTab ~= "COMMANDS"
+            and aboutTab ~= "GEAR"
+            and aboutTab ~= "ROUTING_HELP"
+            and aboutTab ~= "GETTING_STARTED"
+            and aboutTab ~= "FAQ"
+        then
+            aboutTab =
+                "GETTING_STARTED"
+        end
+
+        frame.aboutPage.ShowSubtab(
+            aboutTab,
+            true
+        )
+    end
 end
 
 function WGRRefreshRosterIfOpen()
@@ -15254,13 +16085,19 @@ function WGRRefreshRosterIfOpen()
     end
 end
 
-function WGRMailShowTracker()
+function WGRMailShowTracker(forceTodo)
     local frame =
         WGRMailCreateTrackerFrame()
 
-    WGRShowMainTab(
-        "MAIL"
-    )
+    if forceTodo == true then
+        WGRShowMainTab(
+            "MAIL"
+        )
+    else
+        WGRShowPreferredOpeningPage(
+            frame
+        )
+    end
 
     frame:Show()
 end
@@ -15272,10 +16109,48 @@ function WGRToggleMainWindow()
     if frame:IsShown() then
         frame:Hide()
     else
-        WGRShowMainTab(
-            "MAIL"
+        WGRShowPreferredOpeningPage(
+            frame
         )
 
         frame:Show()
     end
+end
+
+function WGROpenSettingsWindow()
+    local frame =
+        WGRMailCreateTrackerFrame()
+
+    WGRShowMainTab(
+        "SETTINGS"
+    )
+
+    if frame
+        and frame.ShowSettingsTab
+    then
+        local interface =
+            WarboundGearRouterDB
+            and WarboundGearRouterDB.interface
+
+        local settingsTab =
+            interface
+            and interface.lastSettingsTab
+            or "ELIGIBLE"
+
+        if settingsTab ~= "ELIGIBLE"
+            and settingsTab ~= "ROUTING"
+            and settingsTab ~= "APPEARANCE"
+            and settingsTab ~= "INTERFACE"
+        then
+            settingsTab =
+                "ELIGIBLE"
+        end
+
+        frame.ShowSettingsTab(
+            settingsTab,
+            true
+        )
+    end
+
+    frame:Show()
 end

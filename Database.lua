@@ -432,6 +432,13 @@ function InitializeDatabase()
             backgroundOpacity = 50,
             routingPaused = false,
             mailReminderPopups = true,
+            returnToLastPage = false,
+            mailRouterMailboxMode = "AUTO",
+            openMailRouterAutomatically = true, -- legacy compatibility mirror
+            lastMainTab = "MAIL",
+            lastGearFinderView = "RECOMMENDATIONS",
+            lastSettingsTab = "ELIGIBLE",
+            lastAboutTab = "GETTING_STARTED",
             rosterViewSort = "PRIORITY",
             rosterSortDirections = {
                 PRIORITY = "ASC",
@@ -470,6 +477,48 @@ function InitializeDatabase()
 
         if WarboundGearRouterDB.interface.mailReminderPopups == nil then
             WarboundGearRouterDB.interface.mailReminderPopups = true
+        end
+
+        if WarboundGearRouterDB.interface.returnToLastPage == nil then
+            WarboundGearRouterDB.interface.returnToLastPage = false
+        end
+
+        if WarboundGearRouterDB.interface.openMailRouterAutomatically == nil then
+            WarboundGearRouterDB.interface.openMailRouterAutomatically = true
+        end
+
+        -- v0.71o: mailbox presentation is now one three-state preference.
+        -- Preserve v0.71m/n users who explicitly disabled auto-open by
+        -- migrating them to the manual-button mode instead of resetting them.
+        if WarboundGearRouterDB.interface.mailRouterMailboxMode ~= "AUTO"
+            and WarboundGearRouterDB.interface.mailRouterMailboxMode ~= "BUTTON"
+            and WarboundGearRouterDB.interface.mailRouterMailboxMode ~= "NONE"
+        then
+            WarboundGearRouterDB.interface.mailRouterMailboxMode =
+                WarboundGearRouterDB.interface.openMailRouterAutomatically == false
+                and "BUTTON"
+                or "AUTO"
+        end
+
+        -- Keep the old boolean as a compatibility mirror for older internal
+        -- diagnostics/builds. Runtime behavior uses mailRouterMailboxMode.
+        WarboundGearRouterDB.interface.openMailRouterAutomatically =
+            WarboundGearRouterDB.interface.mailRouterMailboxMode == "AUTO"
+
+        if not WarboundGearRouterDB.interface.lastMainTab then
+            WarboundGearRouterDB.interface.lastMainTab = "MAIL"
+        end
+
+        if not WarboundGearRouterDB.interface.lastGearFinderView then
+            WarboundGearRouterDB.interface.lastGearFinderView = "RECOMMENDATIONS"
+        end
+
+        if not WarboundGearRouterDB.interface.lastSettingsTab then
+            WarboundGearRouterDB.interface.lastSettingsTab = "ELIGIBLE"
+        end
+
+        if not WarboundGearRouterDB.interface.lastAboutTab then
+            WarboundGearRouterDB.interface.lastAboutTab = "GETTING_STARTED"
         end
 
         if not WarboundGearRouterDB.interface.rosterViewSort then
